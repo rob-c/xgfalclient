@@ -66,8 +66,13 @@ then sends ``root://h/p`` as the relative path ``p``, which a stock server
 refuses); ``PARALLEL_COPIES`` (a bulk copy runs one file at a time through
 the core); falling back from a pull to a stream for non-``root`` pairs
 (XrdCl's ``thirdParty=first``), which gfal2 does not do against a stock
-server either; delegating a proxy, for the pull or at login (``XrdSecGSIDELEGPROXY``), which
-xrdclient's GSI cannot (it refuses the server's ``kXGS_pxyreq``).
+server either; a delegated pull ("TPC lite", ``tpc.dlgon=1``, which XrdCl
+runs when ``proxy_delegation`` is on and the destination advertises
+``tpcdlg``), because xrdclient's third-party copy always sends
+``tpc.dlgon=0`` - a pull here is always the classic rendezvous. Delegating
+a proxy at login is xrdclient's: ``XrdSecGSIDELEGPROXY=1`` (which
+``gfal-copy`` exports, as upstream's does) makes it sign the server's proxy
+request, as XrdCl does.
 """
 
 from __future__ import annotations
@@ -709,7 +714,10 @@ class XRootDPlugin(Plugin):
         wanted = self.options.string(self.option_group, "XRD.WANTPROT", "")
         request = float(timeout if timeout else self.option_timeout())
         ca_path = self.context.ca_path()
-        key = (cred, token, insecure, wanted, request, ca_path)
+        # xrdclient reads it into Config.gsi_delegate, as XrdCl does at login;
+        # gfal-copy exports it. Part of the key, so a change is picked up.
+        delegate = os.environ.get("XrdSecGSIDELEGPROXY", "")  # noqa: SIM112 - XRootD spells it so
+        key = (cred, token, insecure, wanted, request, ca_path, delegate)
         with self._lock:
             found = self._configs.get(key)
         if found is not None:

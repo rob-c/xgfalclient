@@ -296,6 +296,15 @@ def test_insecure_timeouts_and_wantprot_reach_the_config(
     assert plugin._config("root://h//f", timeout=3).request_timeout == 3.0
 
 
+def test_gsi_delegation_follows_the_environment(
+    plugin: XRootDPlugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``XrdSecGSIDELEGPROXY`` (which gfal-copy exports) turns xrdclient's delegation on."""
+    assert plugin._config("root://h//f").gsi_delegate is False
+    monkeypatch.setenv("XrdSecGSIDELEGPROXY", "1")
+    assert plugin._config("root://h//f").gsi_delegate is True
+
+
 def test_a_separate_certificate_and_key_are_combined_once(
     ctx: xgfalclient.Gfal2Context, plugin: XRootDPlugin, pki: PKI
 ) -> None:

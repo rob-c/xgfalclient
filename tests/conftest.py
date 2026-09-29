@@ -43,6 +43,7 @@ _AMBIENT = (
     "XGFAL_GSSAPI_LIBRARY",
     "LS_COLORS",
     "LCG_GFAL_INFOSYS",
+    "XrdSecGSIDELEGPROXY",
 )
 
 #: Rebuilding a delegated proxy's chain from the TLS handshake needs the
