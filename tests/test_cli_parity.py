@@ -288,8 +288,6 @@ case("legacy-bringonline-none", ["legacy-bringonline"])
 #: Cases whose outputs differ for a reason outside the CLI (a plugin or the
 #: core behaving differently from gfal2), with the reason.
 KNOWN: dict[str, str] = {
-    "ls-a": "file plugin: '.' and '..' come first (os.scandir cannot report readdir's order)",
-    "ls-la": "file plugin: '.' and '..' come first (os.scandir cannot report readdir's order)",
     "ls-verbose": "library log messages are the library's own",
 }
 

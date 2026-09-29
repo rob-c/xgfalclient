@@ -355,7 +355,8 @@ def test_gsi_with_a_proxy_found_as_gfal2_finds_it(tmp_path: Path) -> None:
         "-e", "PYTHONPYCACHEPREFIX=/tmp/pyc",
         "-e", "X509_USER_PROXY=/pki/x509up_rfc",
         "-e", "X509_CERT_DIR=/pki/certificates",
-        "-v", f"{ROOT / 'src'}:/src/xgfalclient/src:ro",
+        # The package alone, so that ``import gfal2`` is the real one.
+        "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
         "-v", f"{_xrdclient_src()}:/src/xrdclient/src:ro",
         "-v", f"{tmp_path / 'pki'}:/pki-ro:ro",
         "-v", f"{io_dir}:/io",
@@ -376,6 +377,165 @@ def test_gsi_with_a_proxy_found_as_gfal2_finds_it(tmp_path: Path) -> None:
         _docker("rm", "-f", name, check=False)
     assert result["ours"] == result["gfal2"]
     assert result["ours"][0] == "ok"
+
+
+#: Two GSI servers for a delegated pull ("TPC lite"). The destination asks
+#: for a proxy at login (``-dlgpxy:1``), keeps it with the session
+#: (``-exppxy:=creds``) and hands it to the pull (``fcreds``); ``gsi`` without
+#: a ``?`` makes delegation compulsory, so a pull that works is one that
+#: delegated. The source knows nothing of TPC: in TPC lite it is only read,
+#: by the destination's ``xrdcp`` with the delegated proxy.
+LITE_SECURITY = """\
+xrootd.seclib libXrdSec.so
+sec.protocol gsi -certdir:/pki/certificates -cert:/pki/hostcert.pem -key:/pki/hostkey.pem \
+ -gridmap:/dev/null -gmapopt:10 -dlgpxy:{dlgpxy} -exppxy:=creds
+sec.protbind * only gsi
+"""
+LITE_SOURCE = "all.export /\noss.localroot /data/src\nall.role server\nxrd.port 1096\n"
+LITE_DESTINATION = (
+    "all.export /\noss.localroot /data/dst\nall.role server\nxrd.port 1095\n"
+    "ofs.tpc fcreds gsi =X509_USER_PROXY autorm pgm /usr/bin/xrdcp --server\n"
+)
+
+LITE_START = """\
+set -e
+cp -r /pki-ro /pki
+useradd -m xrd 2>/dev/null || true
+mkdir -p /data/src /data/dst /etc/xrd
+head -c 3145733 /dev/urandom > /data/src/src.bin
+chown -R xrd /pki /data
+chmod 600 /pki/hostkey.pem /pki/x509up_rfc
+cat > /etc/xrd/src.cfg <<'EOF'
+{source}EOF
+cat > /etc/xrd/dst.cfg <<'EOF'
+{destination}EOF
+# The user's own proxy stays out of the servers' environment: the pull has
+# the delegated one or nothing.
+for name in src dst; do
+  su xrd -s /bin/bash -c \
+    "env -u X509_USER_PROXY xrootd -b -n $name -l /tmp/$name.log -c /etc/xrd/$name.cfg"
+done
+"""
+
+LITE_DRIVER = r"""
+import hashlib, json, sys
+sys.path[:0] = ["/src/xgfalclient/src", "/src/xrdclient/src"]
+name, tag = sys.argv[1:3]
+mod = __import__(name)
+ctx = mod.creat_context()
+S = "root://localhost:1096//"
+D = "root://localhost:1095//" + tag + "_"
+out = {}
+
+
+def copy(label, src, dst, **kw):
+    events = []
+    p = ctx.transfer_parameters()
+    p.event_callback = lambda e: events.append(
+        [e.side, e.domain, e.stage, e.description]
+        if e.stage in ("TRANSFER:TYPE", "TRANSFER:EXIT") else [e.side, e.domain, e.stage])
+    for k, v in kw.items():
+        setattr(p, k, v)
+    try:
+        ctx.filecopy(p, src, dst)
+        result = "ok"
+    except mod.GError as e:
+        result = ["err", e.code, e.message]
+    mine = [e for e in events if e[1] == "xroot" and e[2].startswith("TRANSFER")]
+    out[label] = json.loads(json.dumps([result, mine]).replace(tag + "_", "T_"))
+
+
+def digest(path):
+    try:
+        return hashlib.md5(open(path, "rb").read()).hexdigest()
+    except OSError as e:
+        return str(e.errno)
+
+
+copy("lite", S + "src.bin", D + "lite.bin")
+out["lite intact"] = digest("/data/dst/" + tag + "_lite.bin") == digest("/data/src/src.bin")
+copy("lite exists", S + "src.bin", D + "lite.bin")
+copy("lite overwrite", S + "src.bin", D + "lite.bin", overwrite=True)
+copy("lite missing source", S + "nothere", D + "missing.bin")
+copy("undelegated", S + "src.bin", D + "plain.bin", proxy_delegation=False)
+json.dump(out, open("/io/lite_%s.json" % tag, "w"))
+"""
+
+
+#: Where a delegated pull deliberately differs from gfal2's, and why.
+KNOWN_LITE = {
+    # gfal-copy exports XrdSecGSIDELEGPROXY=1, and XrdSecgsi reads it once, at
+    # the process's first GSI login, so --no-delegation still hands the
+    # destination a proxy; XrdCl's own "0" for the job comes too late. The
+    # proxy is not delegated here when proxy_delegation is off.
+    "undelegated": "proxy_delegation=False delegates nothing, whatever the environment",
+}
+
+
+@pytest.mark.timeout(900)
+def test_a_delegated_pull_is_tpc_lite_as_in_gfal2(tmp_path: Path) -> None:
+    """``root`` to ``root`` with delegation, through gfal2 and through this package.
+
+    Each run is a process of its own, because XrdSecgsi reads
+    ``XrdSecGSIDELEGPROXY`` once per process. gfal2 runs as ``gfal-copy`` sets
+    it up (``XrdSecGSIDELEGPROXY=1``): without it, its bindings never delegate
+    - the source's login loads XrdSecgsi before XrdCl turns delegation on for
+    the destination's - and a destination that insists on delegation refuses
+    every pull. This package runs both with and without the variable, and a
+    pull does the same either way: the destination's login delegates
+    exactly when ``proxy_delegation`` says so, as XrdCl means it to.
+    """
+    from xgfalclient.testing.pki import create_pki
+
+    create_pki(tmp_path / "pki")
+    name = f"xgfal-xrootd-lite-{os.getpid()}"
+    io_dir = tmp_path / "io"
+    io_dir.mkdir()
+    (io_dir / "lite.py").write_text(LITE_DRIVER)
+    _docker(
+        "run", "-d", "--rm", "--name", name,
+        "-e", "PYTHONPYCACHEPREFIX=/tmp/pyc",
+        "-e", "X509_USER_PROXY=/pki/x509up_rfc",
+        "-e", "X509_CERT_DIR=/pki/certificates",
+        "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
+        "-v", f"{_xrdclient_src()}:/src/xrdclient/src:ro",
+        "-v", f"{tmp_path / 'pki'}:/pki-ro:ro",
+        "-v", f"{io_dir}:/io",
+        IMAGE, "sleep", "infinity",
+    )  # fmt: skip
+    runs = {
+        "theirs": ("gfal2", "1"),
+        "ours": ("xgfalclient", "1"),
+        "ours_noenv": ("xgfalclient", ""),
+    }
+    try:
+        start = LITE_START.format(
+            source=LITE_SOURCE + LITE_SECURITY.format(dlgpxy=0),
+            destination=LITE_DESTINATION + LITE_SECURITY.format(dlgpxy=1),
+        )
+        _docker("exec", name, "bash", "-c", start)
+        time.sleep(2)
+        for tag, (client, delegate) in runs.items():
+            env = ["-e", f"XrdSecGSIDELEGPROXY={delegate}"] if delegate else []
+            _docker(
+                "exec", "-u", "xrd", *env, name, "python3", "/io/lite.py", client, tag, timeout=600
+            )
+        found = {tag: json.loads((io_dir / f"lite_{tag}.json").read_text()) for tag in runs}
+        log = _docker("exec", name, "bash", "-c", "cat /tmp/*.log /tmp/*/*.log", check=False)
+    finally:
+        _docker("rm", "-f", name, check=False)
+    theirs, ours = found["theirs"], found["ours"]
+    report = json.dumps(found, indent=1)
+    assert ours["lite"][0] == "ok", log
+    assert ours["lite intact"] is True
+    assert theirs["lite intact"] is True, report
+    assert found["ours_noenv"] == ours, report
+    unexpected = {k for k in set(ours) | set(theirs) if ours.get(k) != theirs.get(k)} - set(
+        KNOWN_LITE
+    )
+    assert not unexpected, report
+    # Not delegated, the pull is refused by a destination that insists.
+    assert "no delegated credentials for tpc (destination)" in ours["undelegated"][0][2]
 
 
 if __name__ == "__main__":

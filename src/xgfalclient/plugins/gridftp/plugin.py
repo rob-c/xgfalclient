@@ -875,7 +875,8 @@ class GridFTPPlugin(Plugin):
             self.unlink(url)
             code = 0
         except GError as exc:
-            code = exc.code
+            # Already gone counts as cleaned, as gfal2's plugins report it.
+            code = 0 if exc.code == errno.ENOENT else exc.code
         transfer.event(ev.CLEANUP, str(code), ev.DESTINATION)
 
     def _delete_existing(self, transfer: Any, url: str) -> bool:

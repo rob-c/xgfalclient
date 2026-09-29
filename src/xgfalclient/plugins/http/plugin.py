@@ -181,6 +181,10 @@ class HTTPPlugin(Plugin):
     priority = 100
     event_domain = "http_plugin"
     narrates_transfer = True
+    # gfal2's http plugin checks checksums, the existing destination and its
+    # parent itself, inside PREPARE; a download keeps the core's steps (_copy).
+    copy_manages_destination = True
+    copy_manages_checksums = True
 
     def __init__(self, context: Gfal2Context) -> None:
         super().__init__(context)

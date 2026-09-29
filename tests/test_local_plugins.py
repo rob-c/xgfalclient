@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import logging
 import os
@@ -17,7 +18,7 @@ import pytest
 
 import xgfalclient
 from conftest import file_url
-from xgfalclient import GError, Gfal2Context, checksum_mode, plugins
+from xgfalclient import GError, Gfal2Context, _libc, checksum_mode, plugins
 from xgfalclient.plugin import O_CREAT, O_RDWR, O_WRONLY, Plugin, PluginFile
 from xgfalclient.plugins import file as file_plugin
 from xgfalclient.plugins import mock as mock_module
@@ -103,16 +104,140 @@ def test_file_listing_includes_dot_entries(ctx: Gfal2Context, data_dir: Path) ->
 
 
 def test_file_listing_tolerates_vanishing_entries(ctx: Gfal2Context, data_dir: Path) -> None:
+    plugin = ctx.plugin("file:///", "opendir")
+    assert isinstance(plugin, FilePlugin)
+    entries = list(plugin._entries(str(data_dir), [("gone", 8)]))
+    assert entries == [("gone", None, 8)]
+
+
+def test_file_listing_keeps_readdirs_order(ctx: Gfal2Context, tmp_path: Path) -> None:
+    """``.`` and ``..`` stay where readdir puts them, through listdir, opendir and readpp."""
+    assert _libc.READER is not None  # the platforms the suite runs on have a known layout
+    for name in ("m", "b", "z", "a", ".h"):
+        (tmp_path / name).touch()
+    base = file_url(tmp_path)
+    raw = [name for name, _ in _libc.READER.entries(str(tmp_path))]
+    assert sorted(raw) == [".", "..", ".h", "a", "b", "m", "z"]
+    assert [name for name in raw if name not in (".", "..")] == os.listdir(tmp_path)
+    assert ctx.listdir(base) == raw
+    assert [entry.d_name for entry in ctx.opendir(base)] == raw
+    directory = ctx.opendir(base)
+    names = []
+    while True:
+        dirent, _ = directory.readpp()
+        if dirent is None:
+            break
+        names.append(dirent.d_name)
+    assert names == raw
+    with pytest.raises(GError) as caught:
+        ctx.opendir(base + "/nope")
+    assert caught.value.code == errno.ENOENT
+
+
+def test_file_listing_falls_back_to_scandir(
+    ctx: Gfal2Context, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (data_dir / "sub").mkdir()
+    monkeypatch.setattr(file_plugin._libc, "READER", None)
+    base = file_url(data_dir)
+    assert ctx.listdir(base) == [".", "..", *os.listdir(data_dir)]
+    entries = {e.d_name: e.d_type for e in ctx.opendir(base)}
+    assert entries == {".": 4, "..": 4, "hello.txt": 8, "sub": 4}
+
     class Gone:
         name = "gone"
 
         def stat(self, follow_symlinks: bool = True) -> os.stat_result:
             raise FileNotFoundError(errno.ENOENT, "gone")
 
-    plugin = ctx.plugin("file:///", "opendir")
-    assert isinstance(plugin, FilePlugin)
-    entries = list(plugin._entries(str(data_dir), [Gone()]))  # type: ignore[list-item]
-    assert entries[-1] == ("gone", None, 0)
+    monkeypatch.setattr(file_plugin.os, "scandir", lambda path: iter([Gone()]))
+    assert file_plugin._scandir(str(data_dir))[-1] == ("gone", 0)
+
+
+def test_libc_layouts() -> None:
+    def having(*names: str) -> Any:
+        return lambda name: name in names
+
+    linux = _libc.layout("linux", 4, having("readdir64"))
+    assert linux == _libc.Layout(18, 19, "opendir", "readdir64")
+    assert _libc.layout("linux", 8, having()) == _libc.Layout(18, 19, "opendir", "readdir")
+    assert _libc.layout("linux", 4, having()) is None  # 32-bit readdir without readdir64
+    intel = _libc.layout("darwin", 8, having("readdir$INODE64"))
+    assert intel == _libc.Layout(20, 21, "opendir$INODE64", "readdir$INODE64")
+    assert _libc.layout("darwin", 8, having()) == _libc.Layout(20, 21, "opendir", "readdir")
+    assert _libc.layout("win32", 8, having("readdir")) is None
+
+
+class _FakeLibc:
+    """opendir/readdir/closedir over ``struct dirent`` records built in memory."""
+
+    def __init__(self, records: list[bytes], fail_at: int | None = None) -> None:
+        self.buffers = [ctypes.create_string_buffer(record, 300) for record in records]
+        self.fail_at = fail_at
+        self.closed: list[int] = []
+        self.position = 0
+
+        def opendir(path: bytes) -> int | None:
+            if path == b"/missing":
+                ctypes.set_errno(errno.ENOENT)
+                return None
+            return 42
+
+        def readdir(stream: int) -> int | None:
+            if self.position == self.fail_at:
+                ctypes.set_errno(errno.EIO)
+                return None
+            if self.position == len(self.buffers):
+                return None
+            self.position += 1
+            return ctypes.addressof(self.buffers[self.position - 1])
+
+        def closedir(stream: int) -> int:
+            self.closed.append(stream)
+            return 0
+
+        self.opendir, self.readdir64, self.closedir = opendir, readdir, closedir
+
+
+def _dirent64(name: bytes, kind: int) -> bytes:
+    return bytes(8) + bytes(8) + bytes(2) + bytes([kind]) + name + b"\0"
+
+
+def test_libc_reader_reads_a_layout() -> None:
+    shape = _libc.layout("linux", 8, lambda name: True)
+    assert shape is not None
+    lib = _FakeLibc([_dirent64(b"b", 8), _dirent64(b"..", 4), _dirent64(b"\xff", 10)])
+    reader = _libc.Reader(lib, shape)
+    assert reader.entries("/d") == [("b", 8), ("..", 4), (os.fsdecode(b"\xff"), 10)]
+    assert lib.closed == [42]
+    with pytest.raises(FileNotFoundError):
+        reader.entries("/missing")
+    assert lib.closed == [42]  # nothing opened, nothing closed
+    failing = _FakeLibc([_dirent64(b"a", 8), _dirent64(b"b", 8)], fail_at=1)
+    with pytest.raises(OSError) as caught:
+        _libc.Reader(failing, shape).entries("/d")
+    assert caught.value.errno == errno.EIO and failing.closed == [42]
+
+
+def test_libc_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _libc.load("linux", 8, lambda: None) is None
+    assert _libc.load("win32", 8, lambda: _FakeLibc([])) is None
+    reader = _libc.load("linux", 8, lambda: _FakeLibc([]))
+    assert reader is not None and reader.entries("/d") == []
+
+    class Partial:  # readdir64 without closedir
+        def readdir64(self) -> None: ...
+
+        def opendir(self) -> None: ...
+
+    assert _libc.load("linux", 8, Partial) is None
+    assert _libc._open() is not None
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("no libc")
+
+    monkeypatch.setattr(_libc.ctypes, "CDLL", refuse)
+    assert _libc._open() is None
 
 
 def test_file_listing_reports_each_entrys_own_type(ctx: Gfal2Context, data_dir: Path) -> None:
@@ -370,6 +495,14 @@ def test_file_reads_a_fifo_in_order(tmp_path: Path) -> None:
     assert caught.value.code == errno.ESPIPE
     handle.close()
     writer.join(10)
+    got: list[bytes] = []
+    reader = threading.Thread(target=lambda: got.append(fifo.read_bytes()), daemon=True)
+    reader.start()
+    handle = LocalFile("file://x", str(fifo), os.O_WRONLY, 0)
+    assert handle.pwrite(b"xyz", 100) == 3  # in order: the offset means nothing to a pipe
+    handle.close()
+    reader.join(10)
+    assert got == [b"xyz"]
 
 
 def test_file_checksum_names_are_not_trimmed(ctx: Gfal2Context, data_dir: Path) -> None:

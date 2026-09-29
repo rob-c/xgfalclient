@@ -686,7 +686,9 @@ def test_failed_copy_leaves_an_untouched_destination(ctx: Gfal2Context, tmp_path
     assert "CLEANUP" not in [e.stage for e in events]
 
 
-def test_cleanup_spares_sinks_and_reports_failures(ctx: Gfal2Context, tmp_path: Path) -> None:
+def test_cleanup_spares_sinks_and_reports_failures(
+    ctx: Gfal2Context, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     events: list[xgfalclient.GfaltEvent] = []
     params = TransferParameters()
     params.event_callback = events.append
@@ -700,11 +702,21 @@ def test_cleanup_spares_sinks_and_reports_failures(ctx: Gfal2Context, tmp_path: 
     transfer.owns_destination = True
     _cleanup(transfer, plugin_copy=False)  # nothing there: nothing to do
     assert not events
-    _cleanup(transfer, plugin_copy=True)  # a plugin's is narrated, failure and all
-    assert [(e.stage, e.description) for e in events] == [("CLEANUP", str(errno.ENOENT))]
+    _cleanup(transfer, plugin_copy=True)  # a plugin's is narrated; already gone is 0, as in gfal2
+    assert [(e.stage, e.description) for e in events] == [("CLEANUP", "0")]
+    (tmp_path / "full").mkdir()
+    (tmp_path / "full" / "f").write_bytes(b"")
+    with pytest.raises(GError) as caught:
+        ctx.unlink(file_url(tmp_path / "full"))
+    transfer = Transfer(ctx, params, "a", file_url(tmp_path / "full"))
+    transfer.owns_destination = True
+    with caplog.at_level(logging.WARNING, logger="gfal2"):
+        _cleanup(transfer, plugin_copy=True)  # any other failure is its errno, and a warning
+    assert (events[-1].stage, events[-1].description) == ("CLEANUP", str(caught.value.code))
+    assert caplog.messages == [f"When trying to clean the destination: {caught.value.message}"]
     transfer.callback_error = ValueError("boom")  # the callback is broken: stay quiet
     _cleanup(transfer, plugin_copy=True)
-    assert len(events) == 1
+    assert len(events) == 2
 
 
 def test_list_items_are_markup_escaped(ctx: Gfal2Context, tmp_path: Path) -> None:

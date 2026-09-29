@@ -10,6 +10,11 @@ event stream narrates it::
     CHECKSUM:ENTER / EXIT       (dest)        verify the copy
     CLEANUP                     (dest)        remove a failed destination (plugin copies)
 
+A plugin may do the checksum and destination steps itself, in its own order
+and words, as gfal2's gridftp, srm, xrootd and http plugins do (the http
+plugin's come between ``PREPARE:ENTER`` and ``PREPARE:EXIT``), reusing the
+helpers here where gfal2's words are the core's.
+
 Every event is also logged at INFO on the ``gfal2`` logger, as gfal2 logs
 it. An exception raised by ``event_callback`` or ``monitor_callback``
 aborts the copy and comes out of ``filecopy`` as it was raised - the only
@@ -64,6 +69,7 @@ from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from . import events as ev
+from ._log import LOGGER
 from .checksum import checksums_match, format_adler32, normalise_name
 from .enums import checksum_mode
 from .errors import GError
@@ -266,14 +272,19 @@ def _checksum_algorithm(transfer: Transfer, plugin: Plugin | None) -> str:
     return plugin.checksum_type() if plugin is not None else "ADLER32"
 
 
-def _compute_checksum(context: Gfal2Context, url: str, algorithm: str, side: str) -> str:
-    try:
-        value = context.checksum(url, algorithm)
-    except GError as exc:
-        raise GError(f"Could not get the {side} checksum: {exc.message}", exc.code) from exc
+def _checksum_value(context: Gfal2Context, url: str, algorithm: str) -> str:
+    """``url``'s checksum, an ADLER32 always as eight hex digits, so that it compares."""
+    value = context.checksum(url, algorithm)
     if normalise_name(algorithm) == "adler32":
         value = format_adler32(value)
     return value
+
+
+def _compute_checksum(context: Gfal2Context, url: str, algorithm: str, side: str) -> str:
+    try:
+        return _checksum_value(context, url, algorithm)
+    except GError as exc:
+        raise GError(f"Could not get the {side} checksum: {exc.message}", exc.code) from exc
 
 
 def _verify_source(transfer: Transfer, algorithm: str) -> None:
@@ -341,8 +352,10 @@ def _cleanup(transfer: Transfer, plugin_copy: bool) -> None:
     """Remove a destination this failed copy wrote.
 
     A plugin copy's clean-up is narrated as ``CLEANUP``, as gfal2's plugins
-    narrate theirs; the streamed copy's is silent, but first makes sure the
-    destination is not a device or FIFO it was only writing into.
+    narrate theirs: ``0`` when the destination is gone, whether this removed
+    it or it was never there, else the errno of the failed removal. The
+    streamed copy's is silent, but first makes sure the destination is not a
+    device or FIFO it was only writing into.
     """
     if not (transfer.params.transfer_cleanup and transfer.owns_destination):
         return
@@ -353,11 +366,13 @@ def _cleanup(transfer: Transfer, plugin_copy: bool) -> None:
                 return  # /dev/null or a FIFO: written into, never ours to remove
         except GError:
             return  # nothing there to remove
+    code = 0
     try:
         context.unlink(transfer.destination)
-        code = 0
     except GError as exc:
-        code = exc.code
+        if exc.code != errno.ENOENT:
+            LOGGER.warning("When trying to clean the destination: %s", exc.message)
+            code = exc.code
     if plugin_copy and transfer.callback_error is None:
         transfer.event(ev.CLEANUP, str(code), side=ev.DESTINATION)
 

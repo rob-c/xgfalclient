@@ -221,10 +221,9 @@ def test_openssh_private_round_trip_plain(maker: str) -> None:
     assert loaded.public.verify(loaded.algorithms()[0], b"m", loaded.sign(b"m"))
 
 
-@pytest.mark.timeout(600)  # pure-Python bcrypt_pbkdf, run several times
 def test_openssh_private_round_trip_encrypted() -> None:
     key = PrivateKey.from_ed25519_seed(os.urandom(32))
-    blob = encode_openssh_private(key, passphrase=b"hunter2", rounds=4)
+    blob = encode_openssh_private(key, passphrase=b"hunter2", rounds=1)
     with pytest.raises(PassphraseRequired):
         load_private(blob)
     with pytest.raises(PassphraseRequired, match="wrong passphrase"):

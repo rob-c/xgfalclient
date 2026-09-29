@@ -39,9 +39,14 @@ checked against it:
   make the destination's path and a download the local one, whatever
   ``create_parent`` says. Checksums are XrdCl's ``checkSumMode``: no
   ``CHECKSUM`` events, and a mismatch is ``EILSEQ`` (``[ERROR] CheckSum
-  error``). A pull from a source that cannot be opened, with
-  ``proxy_delegation`` on, is XrdCl's "Destination does not support
-  delegation" unless the destination advertises ``tpcdlg``. A download runs
+  error``). A pull is XrdCl's third-party job step by step (see
+  :class:`_Rendezvous`): with ``proxy_delegation`` on (gfal2 sets XrdCl's
+  ``delegate`` from it for ``root`` to ``root``) the destination's login
+  delegates the proxy and its open says ``tpc.dlgon=1``, and a destination
+  that advertises ``tpcdlg`` pulls with that proxy ("TPC lite") - no key,
+  and a source this client cannot open itself is no obstacle. Otherwise it
+  is the classic rendezvous, and a source that cannot be opened is
+  "Destination does not support delegation.". A download runs
   on xrdclient's bulk data plane, pipelined over ``nbstreams`` connections
   (two by default) and landed straight in the file, which is where this is
   an order of magnitude faster than gfal2; an upload is one handle, because
@@ -59,20 +64,30 @@ copy carries its real ``errno``: gfal2 passes XrdCl's ``kXR_*`` number on
 (3018 for an existing file), fails to see ``EEXIST`` in it, and deletes the
 local file it has just refused to overwrite; here the file is kept and
 nothing is cleaned. The ``CLEANUP`` after a failed download is ``0`` for a
-file that was never made, where gfal2 reports 3011.
+file that was never made, where gfal2 reports 3011. A classic pull whose
+close fails names the end that failed it; XrdCl's ``RunTPC`` names the
+other one. A pull's destination login delegates exactly when
+``proxy_delegation`` says so, as XrdCl intends when it sets
+``XrdSecGSIDELEGPROXY`` for the job; in gfal2 that comes too late, since
+XrdSecgsi reads the variable once, at the process's first GSI login (the
+source's), so its bindings delegate only when the variable was exported
+beforehand, and then even with ``proxy_delegation`` off (``gfal-copy
+--no-delegation`` still hands the destination a proxy).
 
 Not done, deliberately: ``[XROOTD PLUGIN] NORMALIZE_PATH=false`` (gfal2
 then sends ``root://h/p`` as the relative path ``p``, which a stock server
 refuses); ``PARALLEL_COPIES`` (a bulk copy runs one file at a time through
 the core); falling back from a pull to a stream for non-``root`` pairs
 (XrdCl's ``thirdParty=first``), which gfal2 does not do against a stock
-server either; a delegated pull ("TPC lite", ``tpc.dlgon=1``, which XrdCl
-runs when ``proxy_delegation`` is on and the destination advertises
-``tpcdlg``), because xrdclient's third-party copy always sends
-``tpc.dlgon=0`` - a pull here is always the classic rendezvous. Delegating
-a proxy at login is xrdclient's: ``XrdSecGSIDELEGPROXY=1`` (which
-``gfal-copy`` exports, as upstream's does) makes it sign the server's proxy
-request, as XrdCl does.
+server either; ``ofs.tpc cancel`` to the destination of a cancelled pull
+(the pull is abandoned where it stands, and the clean-up removes what it
+made); ``tpc.str``, which XrdCl sends only for ``XRD_SUBSTREAMSPERCHANNEL``
+above 1. XrdCl sets ``XrdSecGSIDELEGPROXY`` process-wide for a pull, so
+that every later login in the process follows the last pull's setting;
+here only the pull's destination login does, and everything else follows
+the environment (``gfal-copy`` exports ``XrdSecGSIDELEGPROXY=1``, as
+upstream's does, which xrdclient honours by signing the server's proxy
+request at login, as XrdCl does).
 """
 
 from __future__ import annotations
@@ -1264,46 +1279,36 @@ class XRootDPlugin(Plugin):
         return self._file_url(url, **({"svcClass": spacetoken} if spacetoken else {}))
 
     def _third_party(self, transfer: Transfer, *, delegate: bool) -> None:
-        """Destination pulls from source, as XrdCl's third-party job has it.
+        """Destination pulls from source: XrdCl's ``ThirdPartyCopyJob``, step by step.
 
-        The destination's path is made as the pull's open makes it, whatever
-        ``create_parent`` says: when the open finds no parent, the parent is
-        made and the pull asked once more. A source that cannot be opened
-        is, when delegation is on, a job XrdCl would hand to a destination
-        that pulls with the delegated proxy ("TPC lite"), which a stock one
-        cannot, and gfal2 says so rather than why the source failed.
+        See :class:`_Rendezvous` for the steps. The destination's path is
+        made as the pull's open makes it, whatever ``create_parent`` says:
+        when the open finds no parent, the parent is made and the job run
+        once more.
         """
         params = transfer.params
-        source = self._copy_url(transfer.source, params.src_spacetoken)
-        target = self._copy_url(transfer.destination, params.dst_spacetoken)
-        config = self._config(transfer.destination)
+        job = _Rendezvous(
+            self._copy_url(transfer.source, params.src_spacetoken),
+            self._copy_url(transfer.destination, params.dst_spacetoken),
+            self._config(transfer.source),
+            # XrdCl sets XrdSecGSIDELEGPROXY to match before this login.
+            self._config(transfer.destination).evolve(gsi_delegate=delegate),
+            delegate=delegate,
+            overwrite=bool(params.overwrite),
+        )
         try:
+            size = self._pull(transfer, job)
+        except _CopyError as exc:
+            if not exc.no_parent:
+                raise
             try:
-                result = self._pull(transfer, source, target, config)
-            except _import().errors.ServerError as exc:
-                if exc.path != target.path or exc.code != 3011:
-                    raise
-                try:
-                    self.mkdir_rec(parent(transfer.destination), 0o755)
-                except GError:
-                    raise exc from None
-                result = self._pull(transfer, source, target, config)
-        except _import().errors.ServerError as exc:
-            if exc.path == target.path:
-                raise _CopyError(describe(exc), "destination") from exc
-            if delegate and exc.path == source.path and not self._delegates(transfer.destination):
-                failure = Failure(
-                    errno.ENOTSUP,
-                    "[ERROR] Operation not supported",
-                    "Destination does not support delegation.",
-                )
-                raise _CopyError(failure, "") from exc
-            raise
-        transfer.progress(int(result.size), force=True)
+                self.mkdir_rec(parent(transfer.destination), 0o755)
+            except GError:
+                raise exc from None
+            size = self._pull(transfer, job)
+        transfer.progress(size, force=True)
 
-    def _pull(
-        self, transfer: Transfer, source: XRootDURL, target: XRootDURL, config: Config
-    ) -> Any:
+    def _pull(self, transfer: Transfer, job: _Rendezvous) -> int:
         """The rendezvous, in a worker; this thread watches the clock.
 
         The rendezvous blocks until the destination has the file, so it runs
@@ -1313,21 +1318,11 @@ class XRootDPlugin(Plugin):
         """
         params = transfer.params
         outcome: list[Any] = []
+        timeout = transfer.remaining()
 
         def pull() -> None:
             try:
-                outcome.append(
-                    _import().third_party(
-                        source,
-                        target,
-                        config=config,
-                        overwrite=bool(params.overwrite),
-                        # XrdCl's pull opens the destination without it, its
-                        # upload with it: the server says "create" or "pcreate".
-                        posc=False,
-                        timeout=transfer.remaining() or None,
-                    )
-                )
+                outcome.append(job.run(timeout))
             except BaseException as exc:  # handed to the waiting thread
                 outcome.append(exc)
 
@@ -1344,21 +1339,7 @@ class XRootDPlugin(Plugin):
         result = outcome.pop()
         if isinstance(result, BaseException):
             raise result
-        return result
-
-    def _delegates(self, url: str) -> bool:
-        """``XrdCl::Utils::CheckTPCLite``: whether the server takes a delegated pull.
-
-        ``kXR_Qconfig`` of ``tpc tpcdlg`` answers each name on a line, and a
-        name echoed back is one the server has not set.
-        """
-        try:
-            with self._fs(url) as (fs, _):
-                answer = bytes(fs.query(7, "tpc tpcdlg"))
-        except Exception:
-            return False
-        lines = answer.split(b"\x00", 1)[0].decode("utf-8", "replace").split("\n")
-        return len(lines) > 1 and lines[1] not in ("", "tpcdlg") and not lines[1].startswith("0")
+        return int(result)
 
     def _tpc_progress(self, transfer: Transfer) -> None:
         """How much the destination holds, as the progress of a pull."""
@@ -1479,12 +1460,238 @@ class XRootDPlugin(Plugin):
 
 
 class _CopyError(Exception):
-    """A copy's failure worded as XrdCl words it, and the end it happened at."""
+    """A copy's failure worded as XrdCl words it, and the end it happened at.
 
-    def __init__(self, failure: Failure, end: str) -> None:
+    ``no_parent`` marks a pull's destination refusing its open for want of
+    a parent directory, which :meth:`XRootDPlugin._third_party` repairs.
+    """
+
+    def __init__(self, failure: Failure, end: str, *, no_parent: bool = False) -> None:
         super().__init__(failure.to_str)
         self.failure = failure
         self.end = end
+        self.no_parent = no_parent
+
+
+def _unsupported(text: str) -> _CopyError:
+    """XrdCl's ``errNotSupported`` with its own words, and no end named."""
+    return _CopyError(Failure(errno.ENOTSUP, "[ERROR] Operation not supported", text), "")
+
+
+class _Rendezvous:
+    """XrdCl's ``ThirdPartyCopyJob`` (XRootD 5.9): ``CanDo``, then ``RunTPC`` or ``RunLite``.
+
+    1. The source is opened with ``tpc.stage=placement`` and closed, which
+       finds its data server (``tpcSource``) and size. Without delegation a
+       failure here is the job's; with it the source is left to the
+       destination to reach with the delegated proxy (TPC lite *only*).
+    2. The destination is opened (``kXR_open_updt`` and ``kXR_new``, or
+       ``kXR_delete`` for ``overwrite``) with ``cgiC2Dst``'s CGI: the key, the
+       source, ``tpc.dlgon`` saying whether the client delegates, and, when
+       it does, the source's CGI as ``tpc.scgi``. With delegation on the
+       login delegates the proxy (XrdCl sets ``XrdSecGSIDELEGPROXY=1`` for
+       it, ``0`` without), so a destination configured with
+       ``ofs.tpc fcreds`` holds a proxy of its own to pull with.
+    3. ``kXR_Qconfig`` ``tpc tpcdlg`` at the destination (``CheckTPCLite``):
+       no TPC is "Destination does not support third-party-copy."; TPC and
+       ``tpcdlg`` set, with delegation on, is TPC lite; anything else is the
+       classic copy, which a source that could not be opened cannot have
+       ("Destination does not support delegation.") and which needs the
+       source to answer ``tpc`` (``CheckTPC``).
+    4. Classic: ``kXR_sync`` arms the pull, the source is opened with the
+       key and ``tpc.dst`` (``cgiC2Src``), and a second ``kXR_sync`` blocks
+       until the destination has the file. Lite: the two syncs, and the
+       source is not contacted at all.
+
+    Failures carry XrdCl's side: ``(destination)`` for the destination's
+    open, first sync and close, ``(source)`` for the source's keyed open and
+    close, and nothing for the pull itself (the second sync).
+    """
+
+    def __init__(
+        self,
+        source: XRootDURL,
+        target: XRootDURL,
+        source_config: Config,
+        target_config: Config,
+        *,
+        delegate: bool,
+        overwrite: bool,
+    ) -> None:
+        self.source = source
+        self.target = target
+        self.source_config = source_config
+        self.target_config = target_config
+        self.delegate = delegate
+        self.overwrite = overwrite
+
+    def run(self, timeout: float | None) -> int:
+        """The whole job; the size of the source, as far as the job knew it."""
+        xrd = _import()
+        source, target = self.source, self.target
+        source_config, target_config = self.source_config, self.target_config
+        if timeout:
+            source_config = source_config.evolve(request_timeout=timeout)
+            target_config = target_config.evolve(request_timeout=timeout)
+        size, where = self._place(source_config)
+        origin = where or source  # tpcSource
+        key = uuid.uuid4().hex[:24]
+        fields = {
+            "tpc.key": key,
+            "tpc.src": _host_id(origin),
+            "tpc.lfn": origin.path,
+            "tpc.dlg": _host_id(source),
+            "tpc.spr": source.scheme,
+            "tpc.tpr": target.scheme,
+            "tpc.dlgon": "1" if self.delegate else "0",
+        }
+        if where is not None:
+            fields["oss.asize"] = str(size)
+        fields["tpc.stage"] = "copy"
+        scgi = "\t".join(sorted(f for f in source.cgi.split("&") if not f.startswith("xrdcl.")))
+        if scgi and self.delegate:
+            fields["tpc.scgi"] = scgi
+        pull = xrd.File(_opaque(target, fields), target_config)
+        try:
+            pull.open(_UPDATE | (_DELETE if self.overwrite else _NEW), 0o644)
+        except Exception as exc:
+            raise _refused(exc) from exc
+        landed = _landed(target, pull.endpoint)
+        lite = _tpc_lite(_ask_config(landed, "tpc tpcdlg", target_config))
+        if lite is None:
+            _quietly(pull.close)
+            raise _unsupported("Destination does not support third-party-copy.")
+        lite = lite and self.delegate
+        if where is None and not lite:
+            _quietly(pull.close)
+            raise _unsupported("Destination does not support delegation.")
+        if not lite and not _tpc(_ask_config(origin, "tpc", source_config)):
+            _quietly(pull.close)
+            raise _unsupported("Source does not support third-party-copy")
+        _step(pull.sync, "destination", pull)
+        ends = [(pull, "destination")]
+        if not lite:
+            keyed = xrd.File(
+                _opaque(origin, {"tpc.key": key, "tpc.dst": landed.host, "tpc.stage": "copy"}),
+                source_config,
+            )
+            _step(lambda: keyed.open(_READ), "source", pull)
+            ends.insert(0, (keyed, "source"))
+        _step(pull.sync, "", *(handle for handle, _ in ends))
+        failures = [_closed(handle, end) for handle, end in ends]
+        for failure in failures:
+            if failure is not None:
+                raise failure
+        return max(size, 0)
+
+    def _place(self, config: Config) -> tuple[int, XRootDURL | None]:
+        """The size and landing place of the source, or ``None`` for one that cannot be opened."""
+        placed = _import().File(_opaque(self.source, {"tpc.stage": "placement"}), config)
+        try:
+            placed.open(_READ)
+            size = int(placed.size)
+        except Exception as exc:
+            if not self.delegate:
+                raise _CopyError(describe(exc), "") from exc
+            return -1, None
+        _quietly(placed.close)
+        return size, _landed(self.source, placed.endpoint)
+
+
+def _opaque(url: XRootDURL, fields: dict[str, str]) -> XRootDURL:
+    """``url`` with ``fields`` set in its CGI, as XrdCl writes them: verbatim.
+
+    The fields already there keep their bytes; XrdCl merges its own over
+    them, so the new values win.
+    """
+    kept = url.cgi_except(fields)
+    added = "&".join(f"{name}={value}" for name, value in fields.items())
+    parsed = _import().parse(f"root://h//?{kept}&{added}" if kept else f"root://h//?{added}")
+    return url.evolve(query=parsed.query, _raw_query=parsed.cgi)
+
+
+def _host_id(url: XRootDURL) -> str:
+    """``XrdCl::URL::GetHostId``: ``[user@]host:port``, an IPv6 host bracketed."""
+    user = f"{url.username}@" if url.username else ""
+    host = f"[{url.host}]" if ":" in url.host else url.host
+    return f"{user}{host}:{url.port}"
+
+
+def _landed(url: XRootDURL, endpoint: str) -> XRootDURL:
+    """``url`` on the server an open ended up at (XrdCl's ``LastURL``)."""
+    host, _, port = endpoint.rpartition(":")
+    return url.evolve(host=host.strip("[]"), port=int(port))
+
+
+def _ask_config(url: XRootDURL, names: str, config: Config) -> str | None:
+    """A ``kXR_Qconfig`` answer up to its first NUL, or ``None`` if the query failed."""
+    fs = _import().FileSystem(url.without_query().with_path("/"), config)
+    try:
+        answer = bytes(fs.query(7, names))
+    except Exception:
+        return None
+    finally:
+        fs.close()
+    return answer.split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+
+def _atoi(text: str) -> int:
+    """C's ``atoi`` after XrdCl's ``isdigit`` of the first character: leading digits, or 0."""
+    count = len(text) - len(text.lstrip("0123456789"))
+    return int(text[:count]) if count else 0
+
+
+def _tpc_lite(answer: str | None) -> bool | None:
+    """``XrdCl::Utils::CheckTPCLite``: no TPC (``None``), TPC (``False``), or TPC lite.
+
+    The server answers each name on its line, echoing a name it has no value
+    for; ``tpcdlg`` is set to the protocol whose credentials it forwards.
+    """
+    lines = [line for line in (answer or "").split("\n") if line]
+    if not lines or not _atoi(lines[0]):
+        return None
+    return len(lines) > 1 and lines[1] != "tpcdlg"
+
+
+def _tpc(answer: str | None) -> bool:
+    """``XrdCl::Utils::CheckTPC``, including its refusal of a one-character answer."""
+    return answer is not None and len(answer) != 1 and _atoi(answer) != 0
+
+
+def _refused(exc: Exception) -> _CopyError:
+    """The destination's open failing, as XrdCl reports it."""
+    code, text = (
+        (exc.code, exc.message) if isinstance(exc, _import().errors.ServerError) else (0, "")
+    )
+    if code == 3005 and "tpc not supported" in text:
+        return _unsupported("Destination does not support third-party-copy.")
+    return _CopyError(describe(exc), "destination", no_parent=code == 3011)
+
+
+def _step(action: Callable[[], object], end: str, *handles: File) -> None:
+    """One step of the rendezvous; on failure the open handles are closed, unheard."""
+    try:
+        action()
+    except Exception as exc:
+        for handle in handles:
+            _quietly(handle.close)
+        raise _CopyError(describe(exc), end) from exc
+
+
+def _closed(handle: File, end: str) -> _CopyError | None:
+    try:
+        handle.close()
+    except Exception as exc:
+        return _CopyError(describe(exc), end)
+    return None
+
+
+def _quietly(action: Callable[[], object]) -> None:
+    """A close whose outcome XrdCl ignores."""
+    try:
+        action()
+    except Exception:
+        pass
 
 
 class _Verification:

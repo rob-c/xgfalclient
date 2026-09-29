@@ -1,9 +1,14 @@
 """Copies the http plugin claims: uploads, parallel downloads, and third-party copies.
 
 **HTTP destinations** go through gfal2's ``gfal_http_copy``, event for
-event: ``PREPARE:ENTER``/``EXIT``, ``TRANSFER:ENTER``, one ``TRANSFER:TYPE``
-per attempt, and ``TRANSFER:EXIT`` - with the pair on success, the error on
-failure. The modes are ``3rd pull`` (the destination fetches), ``3rd push``
+event and word for word. Between ``PREPARE:ENTER`` and ``PREPARE:EXIT`` come
+the source checksum (skipped, with a warning, when the source cannot compute
+that algorithm), the existing destination (``DESTINATION EXISTS ...``, or
+deleted: ``OVERWRITE``) and the parent directory (``create_parent``); none
+of them in ``strict_copy`` mode. Then ``TRANSFER:ENTER``, one
+``TRANSFER:TYPE`` per attempt, and ``TRANSFER:EXIT`` - with the pair on
+success, the error on failure; then the destination checksum, then
+``EVICT``. The modes are ``3rd pull`` (the destination fetches), ``3rd push``
 (the source sends) and ``streamed`` (the bytes flow through this process),
 tried in that order from the first one chosen:
 
@@ -45,15 +50,16 @@ to download large files as ranged ``GET``\\ s over several pooled
 connections at once, each writing its bytes straight into place with
 ``os.pwrite``. ``params.nbstreams`` sets the number of streams when it is
 positive; over TLS the default is two, since every TLS record costs a trip
-through the GIL. Its events are the core's.
+through the GIL. Its steps, words and events (in the core's domain) are the
+core's streamed copy's, as gfal2 leaves the pair to its core.
 
-Where this differs from gfal2, deliberately: the source and destination
-checksums and the overwrite check are the core's (so they come before
-``PREPARE:ENTER`` rather than inside it, and are worded as the core words
-them); a copy whose deadline has passed tries no further mode; and a
-``copy_mode`` query argument does not also switch fallback off for every
-later copy in the context, as gfal2's (which writes it into the options)
-does.
+Where this differs from gfal2, deliberately: a destination that fails its
+checksum check is removed (``CLEANUP``), as the core removes one; with no
+checksum algorithm set, the plugin's ``COPY_CHECKSUM_TYPE`` is used (gfal2
+asks the endpoints for an algorithm named ``""``, and fails); a copy whose
+deadline has passed tries no further mode; and a ``copy_mode`` query
+argument does not also switch fallback off for every later copy in the
+context, as gfal2's (which writes it into the options) does.
 """
 
 from __future__ import annotations
@@ -68,11 +74,21 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ... import events as ev
+from ... import transfer as core
+from ...checksum import checksums_match
 from ...errors import GError
 from ...plugin import O_CREAT, O_TRUNC, O_WRONLY, PluginFile
 from ...transfer import Transfer, pump
-from ...url import parse, scheme_of
-from ._client import BLOCK, FileBody, Response, config_group, wire_scheme, wire_url
+from ...url import parent, parse, scheme_of
+from ._client import (
+    BLOCK,
+    FileBody,
+    Response,
+    config_group,
+    status_error,
+    wire_scheme,
+    wire_url,
+)
 from ._delegation import delegate
 from ._io import HTTPReadFile, HTTPWriteFile
 from ._token import se_token
@@ -122,15 +138,148 @@ def local_path(url: str) -> str:
 
 def copy(plugin: HTTPPlugin, transfer: Transfer) -> None:
     if scheme_of(transfer.destination) == "file":
-        transfer.event(ev.TRANSFER_ENTER, transfer.pair)
+        local_copy(plugin, transfer)
+    else:
+        http_copy(plugin, transfer)
+
+
+def local_copy(plugin: HTTPPlugin, transfer: Transfer) -> None:
+    """HTTP to ``file://``: the core's copy, step for step and event for event, moved faster."""
+    transfer.domain = ev.DOMAIN_LOCAL
+    strict = transfer.params.strict_copy
+    algorithm = core._checksum_algorithm(transfer, plugin)
+    if not strict:
+        core._verify_source(transfer, algorithm)
+        core._prepare_destination(transfer)
+    transfer.event(ev.TRANSFER_ENTER, transfer.pair)
+    transfer.owns_destination = not strict
+    try:
         download(plugin, transfer)
         transfer.event(ev.TRANSFER_EXIT, transfer.pair)
+        if not strict:
+            core._verify_destination(transfer, algorithm)
+    except Exception:
+        core._cleanup(transfer, False)  # quietly, as the core's streamed copy cleans
+        raise
+    finally:
+        transfer.owns_destination = False  # cleaned here: not the core's to remove
+
+
+def http_copy(plugin: HTTPPlugin, transfer: Transfer) -> None:
+    """gfal2's ``gfal_http_copy``: prepare, the modes, the destination checksum, eviction."""
+    params = transfer.params
+    transfer.event(ev.PREPARE_ENTER, transfer.pair)
+    checks = 0 if params.strict_copy else int(transfer.checksum_mode)
+    algorithm = transfer.checksum_algorithm or plugin.checksum_type()
+    if checks & _CHECKSUM_SOURCE:
+        _source_checksum(transfer, algorithm)
+    if not params.strict_copy:
+        _overwrite(transfer)
+        _make_parent(transfer)
+    transfer.event(ev.PREPARE_EXIT, transfer.pair)
+    run_modes(plugin, transfer)
+    if checks & _CHECKSUM_TARGET:
+        transfer.owns_destination = True
+        try:
+            _destination_checksum(transfer, algorithm)
+        except Exception:
+            core._cleanup(transfer, True)  # deliberately: gfal2 keeps a bad copy
+            raise
+        finally:
+            transfer.owns_destination = False
+    if params.evict:
+        _evict(plugin, transfer)
+
+
+# ---------------------------------------------------------------------------
+# Preparing, and checking the result
+# ---------------------------------------------------------------------------
+
+
+def _source_checksum(transfer: Transfer, algorithm: str) -> None:
+    """The source's checksum, against the user's; skipped if the source cannot compute it."""
+    transfer.event(ev.CHECKSUM_ENTER, side=ev.SOURCE)
+    try:
+        value = core._checksum_value(transfer.context, transfer.source, algorithm)
+    except GError as exc:
+        if exc.code not in (errno.ENOSYS, errno.ENOTSUP):
+            raise GError(f"SOURCE CHECKSUM {exc.message}", exc.code) from None
+        _log.warning("Checksum type %s not supported by source. Skip source check.", algorithm)
     else:
-        transfer.event(ev.PREPARE_ENTER, transfer.pair)
-        transfer.event(ev.PREPARE_EXIT, transfer.pair)
-        run_modes(plugin, transfer)
-        if transfer.params.evict:
-            _evict(plugin, transfer)
+        transfer.source_checksum = value
+        user = transfer.user_checksum
+        if user and not checksums_match(value, user):
+            raise GError(
+                f"SOURCE CHECKSUM MISMATCH Source and user-defined {algorithm} do not match "
+                f"({value} != {user})",
+                errno.EIO,
+            )
+    transfer.event(ev.CHECKSUM_EXIT, side=ev.SOURCE)
+
+
+def _destination_checksum(transfer: Transfer, algorithm: str) -> None:
+    """The destination's checksum, against the source's, else against the user's."""
+    transfer.event(ev.CHECKSUM_ENTER, side=ev.DESTINATION)
+    try:
+        value = core._checksum_value(transfer.context, transfer.destination, algorithm)
+    except GError as exc:
+        raise GError(f"DESTINATION CHECKSUM {exc.message}", exc.code) from None
+    source, user = transfer.source_checksum, transfer.user_checksum
+    if source:
+        if not checksums_match(source, value):
+            raise GError(
+                f"DESTINATION CHECKSUM MISMATCH Source and destination {algorithm} do not match "
+                f"({source} != {value})",
+                errno.EIO,
+            )
+    elif user and not checksums_match(user, value):
+        raise GError(
+            f"DESTINATION CHECKSUM MISMATCH User-defined and destination {algorithm} do not "
+            f"match ({user} != {value})",
+            errno.EIO,
+        )
+    transfer.event(ev.CHECKSUM_EXIT, side=ev.DESTINATION)
+
+
+def _exists(transfer: Transfer, url: str, prefix: str) -> bool:
+    """gfal2's ``gfal_http_exists``, a failure worded as its two empty prefixes leave it."""
+    try:
+        transfer.context.stat(url)
+    except GError as exc:
+        if exc.code == errno.ENOENT:
+            return False
+        raise GError(f"{prefix}   {exc.message}", exc.code) from None
+    return True
+
+
+def _overwrite(transfer: Transfer) -> None:
+    """Refuse an existing destination, or delete it when ``overwrite`` is set."""
+    url = transfer.destination
+    if not _exists(transfer, url, "DESTINATION OVERWRITE"):
+        return
+    if not transfer.params.overwrite:
+        raise GError(
+            "DESTINATION EXISTS The destination file exists and overwrite is not enabled",
+            errno.EEXIST,
+        )
+    try:
+        transfer.context.unlink(url)
+    except GError as exc:
+        raise GError(f"DESTINATION OVERWRITE {exc.message}", exc.code) from None
+    transfer.event(ev.OVERWRITE, f"Deleted {url}", side=ev.DESTINATION)
+
+
+def _make_parent(transfer: Transfer) -> None:
+    """Create the destination's parent, when asked and it is not there."""
+    if not transfer.params.create_parent:
+        return
+    up = parent(transfer.destination)
+    if _exists(transfer, up, "DESTINATION MAKE_PARENT"):
+        return
+    try:
+        transfer.context.mkdir_rec(up, 0o755)
+    except GError as exc:
+        raise GError(f"DESTINATION MAKE_PARENT {exc.message}", exc.code) from None
 
 
 def _deadline_timeout(transfer: Transfer, fallback: float) -> float:
@@ -341,7 +490,8 @@ def _destination(exc: GError) -> GError:
 def _upload_headers(transfer: Transfer) -> dict[str, str]:
     """``Content-MD5`` with the user's value as typed, when the target is checked by MD5."""
     if (
-        int(transfer.checksum_mode) & _CHECKSUM_TARGET
+        not transfer.params.strict_copy
+        and int(transfer.checksum_mode) & _CHECKSUM_TARGET
         and transfer.checksum_algorithm.lower() == "md5"
         and transfer.user_checksum
     ):
@@ -620,19 +770,17 @@ def third_party(plugin: HTTPPlugin, transfer: Transfer, mode: str) -> None:
 
 
 def _copy_refused(response: Response) -> GError:
-    """davix's words for a ``COPY`` the active endpoint turned down."""
+    """davix's error for a ``COPY`` the active endpoint turned down.
+
+    davix's request layer fails any status from 400 on before its copy
+    module looks at the code, so what gfal2 shows is the generic
+    ``copy HTTP <status> : <phrase> `` with davix's errno for it; the copy
+    module's own "Could not COPY" words are only reached by a 3xx that
+    carries no ``Location``.
+    """
     status = response.status
-    if status == 404:
-        return GError("Could not COPY. File not found", errno.ENOENT)
-    if status == 403:
-        return GError("Could not COPY. Permission denied.", errno.EPERM)
-    if status == 501:
-        return GError("Could not COPY. The source service does not support it", errno.ENOSYS)
-    if status >= 405:
-        return GError("Could not COPY. The source service does not allow it", errno.ENOSYS)
-    if status == 400:
-        text = response.body().decode("utf-8", "replace")
-        return GError(f"Could not COPY. The server rejected the request: {text}", errno.EIO)
+    if status >= 400:
+        return status_error(status, prefix="copy ")
     return GError(f"Could not COPY. Unknown error code: {status}", errno.EIO)
 
 

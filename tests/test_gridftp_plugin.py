@@ -1166,6 +1166,11 @@ def test_third_party_checksums(gctx: Ctx, gsi_pair: tuple[GridFTPServer, GridFTP
     events = Events()
     assert code_of(lambda: copy(mode.both, "", events))[0] == errno.EIO
     assert ("GSIFTP", "CLEANUP", str(errno.EACCES)) in events.stages()
+    (root_of(two) / "dst").unlink()  # left by the refused DELE above
+    two.faults["DELE"] = "550 No such file or directory"  # already gone counts as cleaned
+    events = Events()
+    assert code_of(lambda: copy(mode.both, "", events))[0] == errno.EIO
+    assert ("GSIFTP", "CLEANUP", "0") in events.stages()
     del two.faults["DELE"]
     events = Events()
     assert code_of(lambda: copy(mode.both, "", events, transfer_cleanup=False))[0] == errno.EIO

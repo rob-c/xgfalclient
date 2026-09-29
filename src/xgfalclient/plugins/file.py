@@ -4,10 +4,15 @@ Only ``file:///absolute/path`` is accepted; gfal2 refuses a host part
 (``file://localhost/...``) and so does this. Errors are worded as that
 plugin words them (``errno reported by local system call ...``), and the
 checksum types are the three it supports - ADLER32, MD5 and CRC32, the last
-printed in decimal, as gfal2 prints it. Directory listings include ``.`` and
-``..`` because ``readdir`` does, and their stats follow symbolic links, as
-gfal2's (a ``stat`` per entry) do: a link shows as what it points to, and a
-dangling link fails the long listing with ``ENOENT``, as it does in gfal2.
+printed in decimal, as gfal2 prints it. Directories are read with libc's
+``opendir``/``readdir`` (:mod:`xgfalclient._libc`), as gfal2 reads them, so
+``listdir``, ``opendir`` and ``gfal-ls`` give every entry in ``readdir``'s
+order - ``.`` and ``..`` included, wherever the filesystem puts them - with
+``readdir``'s own ``d_type``. Where that layout isn't known (see that module)
+:func:`os.scandir` stands in and ``.`` and ``..`` come first. Entry stats
+follow symbolic links, as gfal2's (a ``stat`` per entry) do: a link shows as
+what it points to, and a dangling link fails the long listing with
+``ENOENT``, as it does in gfal2.
 
 Files ``ctx.open`` creates are ``0744`` before the umask, the mode gfal2's
 ``open`` passes; a FIFO or other unseekable file is read and written in
@@ -24,9 +29,10 @@ import zlib
 from collections.abc import Callable, Iterator
 from typing import Any, TypeVar
 
+from .. import _libc
 from ..errors import GError, from_oserror
 from ..plugin import DirEntry, Plugin, PluginFile
-from ..types import DT_UNKNOWN, Stat, dtype_for_mode
+from ..types import DT_DIR, DT_UNKNOWN, Stat, dtype_for_mode
 from ..url import scheme_of
 
 __all__ = ["FilePlugin", "LocalFile", "local_path"]
@@ -168,28 +174,21 @@ class FilePlugin(Plugin):
 
     def opendir(self, url: str) -> Iterator[DirEntry]:
         path = local_path(url)
-        entries = list(_os(os.scandir, path))
-        return self._entries(path, entries)
+        return self._entries(path, _os(_read, path))
 
-    def _entries(self, path: str, entries: list[os.DirEntry[str]]) -> Iterator[DirEntry]:
-        yield ".", self.stat("file://" + path)
-        yield "..", self.stat("file://" + os.path.join(path, ".."))
-        for entry in entries:
+    def _entries(self, path: str, listing: list[tuple[str, int]]) -> Iterator[DirEntry]:
+        for name, kind in listing:
             # d_type is the entry's own, as readdir reports it: a link is DT_LNK
             # although its stat (followed, as gfal2's) describes the target.
             try:
-                kind = dtype_for_mode(entry.stat(follow_symlinks=False).st_mode)
-            except OSError:
-                kind = DT_UNKNOWN  # vanished since the listing was taken
-            try:
-                yield entry.name, Stat.from_os(entry.stat()), kind
+                yield name, Stat.from_os(os.stat(os.path.join(path, name))), kind
             except OSError:
                 # Dangling, looping, or vanished: a long listing stats it
                 # again and fails as gfal2's does.
-                yield entry.name, None, kind
+                yield name, None, kind
 
     def listdir(self, url: str) -> list[str]:
-        return [".", "..", *(entry.name for entry in _os(os.scandir, local_path(url)))]
+        return [name for name, _ in _os(_read, local_path(url))]
 
     # -- I/O ---------------------------------------------------------------------
 
@@ -238,6 +237,26 @@ class FilePlugin(Plugin):
             ) from exc
         finally:
             os.close(fd)
+
+
+def _read(path: str) -> list[tuple[str, int]]:
+    """``(name, d_type)`` for each entry of ``path``, in ``readdir``'s order."""
+    reader = _libc.READER
+    if reader is not None:
+        return reader.entries(path)
+    return _scandir(path)
+
+
+def _scandir(path: str) -> list[tuple[str, int]]:
+    """Where libc can't be read: ``.`` and ``..`` first, then :func:`os.scandir`'s order."""
+    found = [(".", DT_DIR), ("..", DT_DIR)]
+    for entry in os.scandir(path):
+        try:
+            kind = dtype_for_mode(entry.stat(follow_symlinks=False).st_mode)
+        except OSError:
+            kind = DT_UNKNOWN  # vanished since the listing was taken
+        found.append((entry.name, kind))
+    return found
 
 
 def _digest(kind: str, fd: int, offset: int, length: int) -> str:

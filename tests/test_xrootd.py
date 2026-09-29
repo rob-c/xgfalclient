@@ -1507,18 +1507,35 @@ class Puller:
     source fake instead, optionally slowly, and optionally not at all.
     """
 
-    def __init__(self, source: FakeServer, target: FakeServer, delay: float = 0.0) -> None:
+    def __init__(
+        self,
+        source: FakeServer,
+        target: FakeServer,
+        delay: float = 0.0,
+        *,
+        lite: bool = False,
+        refuse: str = "",
+    ) -> None:
         self.source = source
         self.delay = delay
+        self.refuse = refuse
         self.syncs: dict[bytes, int] = {}
         target.handlers[c.kXR_sync] = self.sync
+        # What a stock xrootd with ``ofs.tpc`` answers; ``tpcdlg`` is the
+        # protocol whose credentials it forwards when set (``fcreds``).
+        _tpc(source, target, lite=lite)
 
     def sync(self, conn: Any, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
         handle = params[:4]
         self.syncs[handle] = self.syncs.get(handle, 0) + 1
         path = conn.handles[handle]
+        if self.syncs[handle] == 2 and self.refuse:
+            yield error(sid, 3007, self.refuse)
+            return
         if self.syncs[handle] == 2:
-            opened = [raw for raw in conn.s.opened if raw.startswith(path + "?tpc.key")][-1]
+            opened = [
+                raw for raw in conn.s.opened if raw.startswith(path + "?") and "tpc.key=" in raw
+            ][-1]
             lfn = opened.split("tpc.lfn=")[1].split("&")[0]
             data = self.source.contents(lfn)
             half = len(data) // 2
@@ -1526,6 +1543,11 @@ class Puller:
             time.sleep(self.delay)
             conn.s.files[path] = bytearray(data)
         yield frame(sid, c.kXR_ok)
+
+
+def _tpc(source: FakeServer, target: FakeServer, *, lite: bool = False) -> None:
+    source.config_values["tpc"] = "1\n"
+    target.config_values["tpc tpcdlg"] = "1\ngsi\n" if lite else "1\ntpcdlg\n"
 
 
 @pytest.fixture
@@ -1591,14 +1613,152 @@ def test_progress_is_quiet_until_the_destination_exists(
     assert transfer.transferred == 0
 
 
+@pytest.mark.parametrize(
+    ("answer", "lite"),
+    [
+        (None, None),  # the query failed
+        ("", None),
+        ("tpc\ntpcdlg", None),  # names echoed: nothing configured
+        ("0\ntpcdlg", None),
+        ("+1\ngsi", None),  # XRDTPC for an encrypting server: XrdCl misreads it
+        ("1", False),
+        ("1\n", False),
+        ("1\ntpcdlg\n", False),
+        ("1\ngsi\n", True),
+        ("\n1\n0", True),  # empty lines dropped; any value but the echo
+    ],
+)
+def test_check_tpc_lite_reads_the_answer_as_xrdcl_does(answer: str | None, lite: bool) -> None:
+    assert xrootd._tpc_lite(answer) is lite
+
+
+@pytest.mark.parametrize(
+    ("answer", "tpc"),
+    [(None, False), ("1", False), ("1\n", True), ("12", True), ("tpc\n", False), ("0\n", False)],
+)
+def test_check_tpc_reads_the_answer_as_xrdcl_does(answer: str | None, tpc: bool) -> None:
+    assert xrootd._tpc(answer) is tpc  # a lone "1" too: XrdCl's length check
+
+
+def test_host_ids_and_landing_places() -> None:
+    parse = xrdclient.parse
+    assert xrootd._host_id(parse("root://u@h:1095//p")) == "u@h:1095"
+    assert xrootd._host_id(parse("root://[::1]:1094//p")) == "[::1]:1094"
+    landed = xrootd._landed(parse("root://u@h//p?a=1"), "[::1]:2000")
+    assert (landed.host, landed.port, landed.username, landed.cgi) == ("::1", 2000, "u", "a=1")
+
+
+def test_cgi_is_merged_verbatim() -> None:
+    url = xrdclient.parse("root://h//p?authz=a%20b&tpc.stage=x")
+    merged = xrootd._opaque(url, {"tpc.stage": "copy", "tpc.scgi": "a=1\tb=2"})
+    assert merged.path_with_cgi == "/p?authz=a%20b&tpc.stage=copy&tpc.scgi=a=1\tb=2"
+    assert xrootd._opaque(url.without_query(), {"k": "v"}).path_with_cgi == "/p?k=v"
+
+
+class Logins:
+    """Every xrdclient ``File`` the plugin makes: its URL and whether it delegates."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.made: list[tuple[str, bool]] = []
+        made, real = self.made, xrdclient.File
+
+        class Recording(real):  # type: ignore[misc, valid-type]
+            def __init__(self, url: Any, config: Any = None, **kwargs: Any) -> None:
+                made.append((str(url), config.gsi_delegate))
+                super().__init__(url, config, **kwargs)
+
+        monkeypatch.setattr(xrdclient, "File", Recording)
+
+    def to(self, server: FakeServer) -> list[bool]:
+        return [delegates for url, delegates in self.made if url.startswith(_url(server)[:-1])]
+
+
+def _opened(server: FakeServer, marker: str) -> list[str]:
+    return [raw for raw in server.opened if marker in raw]
+
+
+def test_a_delegated_pull_is_tpc_lite(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    target: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logins = Logins(monkeypatch)
+    Puller(server, target, lite=True)
+    params = ctx.transfer_parameters()
+    seen = _events(params)
+    ctx.filecopy(params, _url(server) + "/data/a.txt", _url(target) + "/pulled")
+    assert target.contents("/pulled") == HELLO
+    (opened,) = _opened(target, "tpc.key=")
+    host = _url(server)[len("root://") : -1]
+    assert f"tpc.src={host}&tpc.lfn=/data/a.txt&tpc.dlg={host}" in opened
+    assert "tpc.spr=root&tpc.tpr=root&tpc.dlgon=1&oss.asize=12&tpc.stage=copy" in opened
+    assert "tpc.scgi" not in opened  # the source has no CGI to forward
+    # The source is opened for placement only: the destination needs no key.
+    assert server.opened == ["/data/a.txt?tpc.stage=placement"]
+    # Only the destination's login delegates, as XrdCl enables it for that.
+    assert logins.to(target) == [True] and logins.to(server) == [False]
+    assert (2, "xroot", "TRANSFER:TYPE", "3rd pull") in seen
+
+
+def test_without_delegation_the_pull_is_classic(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    target: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XrdSecGSIDELEGPROXY", "1")
+    logins = Logins(monkeypatch)
+    Puller(server, target, lite=True)
+    params = ctx.transfer_parameters()
+    params.proxy_delegation = False
+    ctx.filecopy(params, _url(server) + "/data/a.txt?authz=t", _url(target) + "/pulled")
+    assert target.contents("/pulled") == HELLO
+    (opened,) = _opened(target, "tpc.key=")
+    assert "tpc.dlgon=0" in opened and "tpc.scgi" not in opened
+    key = opened.split("tpc.key=")[1].split("&")[0]
+    assert len(key) == 24
+    (keyed,) = _opened(server, "tpc.key=")
+    assert keyed == f"/data/a.txt?authz=t&tpc.key={key}&tpc.dst=127.0.0.1&tpc.stage=copy"
+    # XrdCl sets XrdSecGSIDELEGPROXY=0 for the destination; the source keeps the environment.
+    assert logins.to(target) == [False] and logins.to(server) == [True, True]
+
+
+def test_a_delegated_pull_to_a_destination_without_tpcdlg_is_classic(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    Puller(server, target)
+    source = _url(server) + "/data/a.txt?authz=t&xrdcl.requuid=1&b=2"
+    ctx.filecopy(ctx.transfer_parameters(), source, _url(target) + "/pulled")
+    assert target.contents("/pulled") == HELLO
+    (opened,) = _opened(target, "tpc.key=")
+    assert "tpc.dlgon=1" in opened
+    assert opened.endswith("&tpc.scgi=authz=t\tb=2")  # sorted, xrdcl.* left out
+    assert len(_opened(server, "tpc.key=")) == 1
+
+
+def test_a_delegated_pull_of_a_source_this_client_cannot_open(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    Puller(server, target, lite=True)
+    _reply(server, c.kXR_open, 3010, "not for you")
+    ctx.filecopy(ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert target.contents("/p") == HELLO  # the destination reached it with the proxy
+    (opened,) = _opened(target, "tpc.key=")
+    host = _url(server)[len("root://") : -1]
+    assert f"tpc.src={host}&tpc.lfn=/data/a.txt&tpc.dlg={host}" in opened
+    assert "oss.asize" not in opened  # the size is unknown
+
+
 def test_a_pull_from_a_missing_source(
     ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
 ) -> None:
+    _tpc(server, target)
     params = ctx.transfer_parameters()
     seen = _events(params)
     failure = _gerror(ctx.filecopy, params, _url(server) + "/nothing", _url(target) + "/x")
     # With delegation on, XrdCl leaves the source to a destination that can
-    # pull with the delegated proxy; a stock one cannot, and that is the news.
+    # pull with the delegated proxy; one without tpcdlg cannot, and that is the news.
     assert failure.code == errno.ENOTSUP
     assert failure.message == (
         "Error on XrdCl::CopyProcess::Run(): [ERROR] Operation not supported: "
@@ -1614,23 +1774,84 @@ def test_a_pull_from_a_missing_source(
     )
 
 
-@pytest.mark.parametrize(
-    ("answer", "delegates"),
-    [("1\n1", True), ("1\ntpcdlg", False), ("1\n0", False), ("1\n", False), ("1", False)],
-)
-def test_whether_a_destination_takes_a_delegated_pull(
-    plugin: XRootDPlugin, target: FakeServer, answer: str, delegates: bool
+def _unsupported(text: str) -> str:
+    return f"Error on XrdCl::CopyProcess::Run(): [ERROR] Operation not supported: {text}"
+
+
+@pytest.mark.parametrize("answer", ["tpc\ntpcdlg", None])
+def test_a_destination_without_tpc(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer, answer: str | None
 ) -> None:
-    target.config_values["tpc tpcdlg"] = answer
-    assert plugin._delegates(_url(target) + "/x") is delegates
-    _reply(target, c.kXR_query, 3000)
-    assert plugin._delegates(_url(target) + "/x") is False
+    _tpc(server, target)
+    if answer is None:
+        _reply(target, c.kXR_query, 3000)
+    else:
+        target.config_values["tpc tpcdlg"] = answer
+    params = ctx.transfer_parameters()
+    params.transfer_cleanup = False
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/x")
+    assert failure.code == errno.ENOTSUP
+    assert failure.message == _unsupported("Destination does not support third-party-copy.")
+
+
+def test_a_source_without_tpc(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    _tpc(server, target)
+    server.config_values["tpc"] = "tpc\n"
+    failure = _gerror(
+        ctx.filecopy, ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/x"
+    )
+    assert failure.code == errno.ENOTSUP
+    assert failure.message == _unsupported("Source does not support third-party-copy")
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("tpc not supported", _unsupported("Destination does not support third-party-copy.")),
+        (
+            "disk on fire",
+            "Error on XrdCl::CopyProcess::Run(): [ERROR] Server responded with an error: "
+            "[3005] disk on fire (destination)\n",
+        ),
+    ],
+)
+def test_a_destination_that_refuses_the_pulls_open(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    target: FakeServer,
+    message: str,
+    expected: str,
+) -> None:
+    _tpc(server, target)
+    _reply(target, c.kXR_open, 3005, message)
+    failure = _gerror(
+        ctx.filecopy, ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/x"
+    )
+    assert failure.message == expected
+
+
+def test_a_destination_that_cannot_be_reached(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer
+) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server.config_values["tpc"] = "1\n"
+    params = ctx.transfer_parameters()
+    params.transfer_cleanup = False
+    failure = _gerror(
+        ctx.filecopy, params, _url(server) + "/data/a.txt", f"root://127.0.0.1:{port}//x"
+    )
+    assert failure.code == errno.ECONNREFUSED
+    assert failure.message.endswith("(destination)")
 
 
 def test_a_pull_the_destination_fails_is_its_answer(
     ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
 ) -> None:
-    _reply(target, c.kXR_sync, 3007, "pull failed")
+    Puller(server, target, refuse="pull failed")
     failure = _gerror(
         ctx.filecopy, ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/x"
     )
@@ -1638,14 +1859,45 @@ def test_a_pull_the_destination_fails_is_its_answer(
     assert failure.message.endswith("[3007] pull failed\n")  # no side named, as in XrdCl
 
 
-def test_a_destination_that_delegates_hears_about_the_source(
+def test_a_pull_the_destination_cannot_arm(
     ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
 ) -> None:
-    target.config_values["tpc tpcdlg"] = "1\ngsi"
+    _tpc(server, target)
+    _reply(target, c.kXR_sync, 3007, "no rendezvous")
     failure = _gerror(
-        ctx.filecopy, ctx.transfer_parameters(), _url(server) + "/nothing", _url(target) + "/x"
+        ctx.filecopy, ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/x"
     )
-    assert failure.code == errno.ENOENT  # this client cannot delegate: the source is the news
+    assert failure.message.endswith("[3007] no rendezvous (destination)\n")
+
+
+def test_a_source_that_refuses_the_key(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    Puller(server, target)
+    placement = server.handlers.get(c.kXR_open) or xrdclient.testing.server._HANDLERS[c.kXR_open]
+
+    def open_(conn: Any, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
+        if b"tpc.key=" in body:
+            return iter([error(sid, 3010, "bad key")])
+        return placement(conn, sid, params, body)  # type: ignore[no-any-return]
+
+    server.handlers[c.kXR_open] = open_
+    failure = _gerror(
+        ctx.filecopy, ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/x"
+    )
+    assert failure.message.endswith("[3010] bad key (source)\n")
+
+
+@pytest.mark.parametrize("end", ["source", "destination"])
+def test_a_pull_whose_close_fails(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer, end: str
+) -> None:
+    Puller(server, target)
+    _reply(server if end == "source" else target, c.kXR_close, 3007, "close failed")
+    params = ctx.transfer_parameters()
+    params.transfer_cleanup = False
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/x")
+    assert failure.message.endswith(f"[3007] close failed ({end})\n")
 
 
 def test_a_pull_can_be_cancelled(
@@ -1740,6 +1992,10 @@ def test_a_pull_onto_an_existing_file_is_the_destinations_answer(
     )
     assert target.contents("/there") == b"old"
     assert not [event for event in seen if event[2] == "CLEANUP"]
+    Puller(server, target)
+    params.overwrite = True  # kXR_delete: the destination replaces it
+    ctx.filecopy(params, _url(server) + "/data/a.txt", _url(target) + "/there")
+    assert target.contents("/there") == HELLO
 
 
 def test_an_upload_onto_an_existing_file(

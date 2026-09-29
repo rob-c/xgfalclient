@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import socket
 from pathlib import Path
@@ -132,7 +133,14 @@ def test_download_single_stream(
     events = Events()
     hctx.filecopy(params(events), dav.url("/data/f"), file_url(tmp_path / "down"))
     assert (tmp_path / "down").read_bytes() == b"d" * 5000
-    assert "TRANSFER:TYPE streamed" in events.stages()
+    # gfal2 leaves this pair to its core: the core's events, in the core's domain.
+    pair = f"{dav.url('/data/f')} => {file_url(tmp_path / 'down')}"
+    assert events.stages(xgfalclient.events.DOMAIN_LOCAL) == [
+        f"TRANSFER:ENTER {pair}",
+        "TRANSFER:TYPE streamed",
+        f"TRANSFER:EXIT {pair}",
+    ]
+    assert not events.stages()
 
 
 def test_parallel_download(
@@ -394,6 +402,264 @@ def test_content_md5_on_streamed_puts(
     )
 
 
+# -- preparing and verifying: gfal2's order and words -------------------------------------
+
+ABC_ADLER32 = "024d0127"
+
+
+def _checked(
+    mode: object, value: str = "", algorithm: str = "ADLER32", **values: object
+) -> tuple[xgfalclient.TransferParameters, Events]:
+    """Parameters that check ``mode`` with the user's ``value``, and their events."""
+    events = Events()
+    made = params(events, **values)
+    made.set_checksum(mode, algorithm, value)
+    return made, events
+
+
+def test_checksums_inside_prepare(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
+) -> None:
+    write(dav, "/data/src", b"abc")
+    copy, events = _checked(checksum_mode.both)
+    source, destination = dav.url("/data/src"), dav2.url("/data/dst")
+    hctx.filecopy(copy, source, destination)
+    pair = f"{source} => {destination}"
+    assert events.stages() == [
+        f"PREPARE:ENTER {pair}",
+        "CHECKSUM:ENTER",
+        "CHECKSUM:EXIT",
+        f"PREPARE:EXIT {pair}",
+        f"TRANSFER:ENTER {pair}",
+        "TRANSFER:TYPE 3rd pull",
+        f"TRANSFER:EXIT {pair}",
+        "CHECKSUM:ENTER",
+        "CHECKSUM:EXIT",
+    ]
+    assert [side for side, _, stage, _ in events.seen if stage.startswith("CHECKSUM")] == [
+        0,
+        0,
+        1,
+        1,
+    ]
+    for mode in (checksum_mode.source, checksum_mode.target, checksum_mode.both):
+        copy, events = _checked(mode, ABC_ADLER32, overwrite=True)
+        hctx.filecopy(copy, source, destination)  # the user's value agrees
+        assert events.stages()[-1] == (
+            "CHECKSUM:EXIT" if mode != checksum_mode.source else f"TRANSFER:EXIT {pair}"
+        )
+
+
+def test_source_checksum_failures(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
+) -> None:
+    write(dav, "/data/src", b"abc")
+    source, destination = dav.url("/data/src"), dav2.url("/data/dst")
+    copy, events = _checked(checksum_mode.source, "12345678")
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(copy, source, destination)
+    assert (caught.value.code, caught.value.message) == (
+        errno.EIO,
+        "SOURCE CHECKSUM MISMATCH Source and user-defined ADLER32 do not match "
+        f"({ABC_ADLER32} != 12345678)",
+    )
+    assert events.stages() == [f"PREPARE:ENTER {source} => {destination}", "CHECKSUM:ENTER"]
+    assert not dav2.local("/data/dst").exists()
+    copy, events = _checked(checksum_mode.both)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(copy, dav.url("/data/nope"), destination)
+    assert (caught.value.code, caught.value.message) == (
+        errno.ENOENT,
+        "SOURCE CHECKSUM HTTP 404 : File not found ",
+    )
+
+
+def test_source_that_cannot_checksum_is_skipped(
+    hctx: xgfalclient.Gfal2Context,
+    dav: WebDAVServer,
+    dav2: WebDAVServer,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    write(dav, "/data/src", b"abc")
+    source, destination = dav.url("/data/src"), dav2.url("/data/dst")
+    real = transfer_module._checksum_value
+
+    def value(context: xgfalclient.Gfal2Context, url: str, algorithm: str) -> str:
+        if url == source:
+            raise GError("checksum calculation not supported", errno.ENOSYS)
+        return real(context, url, algorithm)
+
+    monkeypatch.setattr(transfer_module, "_checksum_value", value)
+    copy, events = _checked(checksum_mode.both)
+    with caplog.at_level(logging.WARNING, logger="gfal2"):
+        hctx.filecopy(copy, source, destination)  # nothing to compare the destination with
+    assert "Checksum type ADLER32 not supported by source. Skip source check." in caplog.messages
+    assert events.stages().count("CHECKSUM:EXIT") == 2
+    copy, events = _checked(checksum_mode.both, "12345678", overwrite=True)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(copy, source, destination)  # but with the user's value
+    assert caught.value.message == (
+        "DESTINATION CHECKSUM MISMATCH User-defined and destination ADLER32 do not match "
+        f"(12345678 != {ABC_ADLER32})"
+    )
+
+
+def test_destination_checksum_failures_clean_up(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
+) -> None:
+    write(dav, "/data/src", b"abc")
+    source, destination = dav.url("/data/src"), dav2.url("/data/dst")
+    copy, events = _checked(checksum_mode.target, "12345678")
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(copy, source, destination)
+    assert (caught.value.code, caught.value.message) == (
+        errno.EIO,
+        "DESTINATION CHECKSUM MISMATCH User-defined and destination ADLER32 do not match "
+        f"(12345678 != {ABC_ADLER32})",
+    )
+    # No CHECKSUM:EXIT, as in gfal2; the bad copy goes, unlike in gfal2.
+    assert events.stages()[-2:] == ["CHECKSUM:ENTER", "CLEANUP 0"]
+    assert not dav2.local("/data/dst").exists()
+    copy, events = _checked(checksum_mode.both)
+    dav2.fault("HEAD", "/data/dst", status=200, headers={"Digest": "adler32=00000001"})
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(copy, source, destination)
+    assert caught.value.message == (
+        "DESTINATION CHECKSUM MISMATCH Source and destination ADLER32 do not match "
+        f"({ABC_ADLER32} != 00000001)"
+    )
+    copy, events = _checked(checksum_mode.target, ABC_ADLER32)
+    dav2.fault("HEAD", "/data/dst", status=403)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(copy, source, destination)
+    assert (caught.value.code, caught.value.message) == (
+        errno.EPERM,
+        "DESTINATION CHECKSUM HTTP 403 : Permission refused ",
+    )
+    assert events.stages()[-1] == "CLEANUP 0" and not dav2.local("/data/dst").exists()
+
+
+def test_existing_destination(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
+) -> None:
+    write(dav, "/data/src", b"abc")
+    write(dav2, "/data/dst", b"old")
+    source, destination = dav.url("/data/src"), dav2.url("/data/dst")
+    pair = f"{source} => {destination}"
+    events = Events()
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(params(events), source, destination)
+    assert (caught.value.code, caught.value.message) == (
+        errno.EEXIST,
+        "DESTINATION EXISTS The destination file exists and overwrite is not enabled",
+    )
+    assert events.stages() == [f"PREPARE:ENTER {pair}"]
+    assert dav2.local("/data/dst").read_bytes() == b"old"
+    dav2.fault("DELETE", "/data/dst", status=403)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(params(overwrite=True), source, destination)
+    assert (caught.value.code, caught.value.message) == (
+        errno.EPERM,
+        "DESTINATION OVERWRITE DavPosix::unlink  HTTP 403 : Permission refused ",
+    )
+    dav2.fault("PROPFIND", "/data/dst", status=500)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(params(overwrite=True), source, destination)
+    assert caught.value.message == (
+        "DESTINATION OVERWRITE   Result HTTP 500 : Unexpected server error: 500  after 1 attempts"
+    )
+    events = Events()
+    hctx.filecopy(params(events, overwrite=True), source, destination)
+    assert events.stages()[:3] == [
+        f"PREPARE:ENTER {pair}",
+        f"OVERWRITE Deleted {destination}",
+        f"PREPARE:EXIT {pair}",
+    ]
+    assert dav2.local("/data/dst").read_bytes() == b"abc"
+
+
+def test_create_parent(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
+) -> None:
+    write(dav, "/data/src", b"abc")
+    source = dav.url("/data/src")
+    hctx.filecopy(params(create_parent=True), source, dav2.url("/data/sub/dst"))
+    assert dav2.local("/data/sub/dst").read_bytes() == b"abc"
+    assert "MKCOL" in dav2.methods()
+    dav2.clear()
+    hctx.filecopy(params(create_parent=True), source, dav2.url("/data/sub/two"))
+    assert "MKCOL" not in dav2.methods()  # it is there already
+    dav2.fault("MKCOL", status=403)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(params(create_parent=True), source, dav2.url("/data/new/dst"))
+    assert caught.value.message.startswith("DESTINATION MAKE_PARENT ")
+    assert caught.value.code == errno.EPERM
+    dav2.fault("PROPFIND", "/data/new/dst", status=404)
+    dav2.fault("PROPFIND", "/data/new", status=403)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(params(create_parent=True), source, dav2.url("/data/new/dst"))
+    assert caught.value.message == "DESTINATION MAKE_PARENT   HTTP 403 : Permission refused "
+
+
+def test_strict_copy_prepares_nothing(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer, tmp_path: Path
+) -> None:
+    write(dav, "/data/src", b"abc")
+    write(dav2, "/data/dst", b"old")
+    copy, events = _checked(checksum_mode.both, "900150983cd24fb0d6963f7d28e17f72", "md5")
+    copy.strict_copy = True
+    hctx.filecopy(copy, dav.url("/data/src"), dav2.url("/data/dst"))
+    assert "PROPFIND" not in dav2.methods() and not dav.methods().count("HEAD")
+    assert not [s for s in events.stages() if s.startswith(("CHECKSUM", "OVERWRITE"))]
+    source = tmp_path / "up"
+    source.write_bytes(b"abc")
+    hctx.filecopy(copy, file_url(source), dav2.url("/data/dst"))
+    assert dav2.requests[-1].header("Content-MD5") is None  # gfal2 checks nothing in strict mode
+
+
+def test_evict_comes_after_the_destination_checksum(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
+) -> None:
+    write(dav, "/data/src", b"abc")
+    copy, events = _checked(checksum_mode.both, evict=True)
+    hctx.filecopy(copy, dav.url("/data/src"), dav2.url("/data/dst"))
+    assert events.stages()[-3:] == ["CHECKSUM:ENTER", "CHECKSUM:EXIT", "EVICT -1"]
+
+
+def test_download_is_the_cores_copy(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_path: Path
+) -> None:
+    write(dav, "/data/f", b"abc")
+    target = tmp_path / "down"
+    local = xgfalclient.events.DOMAIN_LOCAL
+    copy, events = _checked(checksum_mode.both)
+    hctx.filecopy(copy, dav.url("/data/f"), file_url(target))
+    assert [s.split(" ")[0] for s in events.stages(local)] == [
+        "CHECKSUM:ENTER",
+        "CHECKSUM:EXIT",
+        "TRANSFER:ENTER",
+        "TRANSFER:TYPE",
+        "TRANSFER:EXIT",
+        "CHECKSUM:ENTER",
+        "CHECKSUM:EXIT",
+    ]
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(dav.url("/data/f"), file_url(target))
+    assert caught.value.message == "The file exists and overwrite is not set"
+    copy, events = _checked(checksum_mode.target, "12345678", overwrite=True)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(copy, dav.url("/data/f"), file_url(target))
+    assert caught.value.message.startswith("DESTINATION CHECKSUM MISMATCH User defined")
+    assert not target.exists()  # removed, quietly, as the core removes a streamed copy's
+    assert not [s for s in events.stages(local) if s.startswith("CLEANUP")]
+    copy, events = _checked(checksum_mode.target, "12345678")
+    copy.strict_copy = True
+    hctx.filecopy(copy, dav.url("/data/f"), file_url(target))  # strict: nothing checked
+    assert target.read_bytes() == b"abc"
+    assert not [s for s in events.stages(local) if s.startswith("CHECKSUM")]
+
+
 def _plugin(context: xgfalclient.Gfal2Context):  # type: ignore[no-untyped-def]
     return context.plugin("davs://h/", "copy")
 
@@ -516,14 +782,14 @@ def test_tpc_failures(
         "Last attempt: Transfer failure: HTTP 500 : the remote side refused"
     )
     dav2.tpc = "normal"
-    # davix's words and errno for a COPY the active end turns down.
+    # davix's words and errno for a COPY the active end turns down, as gfal2
+    # 2.23.5 reports them (observed side by side against this server).
     refusals = [
-        (404, errno.ENOENT, "Could not COPY. File not found"),
-        (403, errno.EPERM, "Could not COPY. Permission denied."),
-        (501, errno.ENOSYS, "Could not COPY. The source service does not support it"),
-        (412, errno.ENOSYS, "Could not COPY. The source service does not allow it"),
-        (400, errno.EIO, "Could not COPY. The server rejected the request: bad copy"),
-        (401, errno.EIO, "Could not COPY. Unknown error code: 401"),
+        (400, errno.EHOSTDOWN, "copy HTTP 400 : Server Error "),
+        (403, errno.EPERM, "copy HTTP 403 : Permission refused "),
+        (404, errno.ENOENT, "copy HTTP 404 : File not found "),
+        (405, errno.EPERM, "copy HTTP 405 : Method Not Allowed, Permission refused "),
+        (300, errno.EIO, "Could not COPY. Unknown error code: 300"),
     ]
     for status, code, words in refusals:
         dav2.fault("COPY", status=status, body=b"bad copy")
