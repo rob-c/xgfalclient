@@ -70,6 +70,13 @@ TLS itself is the standard `ssl` module.
 Kerberos (for `kdcap://` and friends) goes through the system
 `libgssapi_krb5` via `ctypes`, or the `gssapi` package when installed.
 
+`s3://` is signed with the `[S3]` (or per-host `[S3:<HOST>]`) keys, as davix
+does, and `gcloud://` with the service-account JSON from `[GCLOUD]
+JSON_AUTH_FILE` or `JSON_AUTH_STRING`.
+`sftp://` uses the user's own SSH setup - keys, agent and `~/.ssh/config`
+through the system `ssh`, or public keys and a password from the credential
+store through the built-in SSH-2 client.
+
 ## Configuration
 
 The stock gfal2 defaults are built in, and `$GFAL_CONFIG_DIR` (or an existing

@@ -9,9 +9,11 @@ A drop-in for the ``gfal2`` Python bindings, with no C library underneath::
     ctx.filecopy(ctx.transfer_parameters(), "file:///tmp/f", "davs://se.example.org/store/f")
 
 The protocols are plugins, as in gfal2: ``http``/``https``/``dav``/``davs``
-(WebDAV, HTTP third-party copy, the WLCG tape REST API, S3), ``gsiftp``
-(GridFTP with GSI), ``srm`` (SRM v2.2), ``root``/``roots`` (through
-``xrdclient``, itself pure Python), ``file`` and ``mock``.
+(WebDAV, HTTP third-party copy, the WLCG tape REST API), ``s3``/``s3s`` and
+``gcloud``/``gclouds`` (object stores), ``root``/``roots`` (XRootD, through
+``xrdclient``, itself pure Python), ``gsiftp``/``ftp`` (GridFTP with GSI),
+``srm`` (SRM v2.2), ``sftp``, ``dcap``/``gsidcap``/``kdcap`` (dCache),
+``lfc`` (the LCG File Catalog), ``file`` and ``mock``.
 
 Code that must keep saying ``import gfal2`` can call :func:`install_as_gfal2`
 once at start-up.
