@@ -209,7 +209,7 @@ def fake(context: Gfal2Context) -> Fake:
 
 
 def test_plugins_sorted_by_priority(fctx: Gfal2Context) -> None:
-    assert fctx.get_plugin_names() == ["fake-0.1.0", "minimal-0.1.0"]
+    assert fctx.get_plugin_names() == ["fake-2.23.5", "minimal-2.23.5"]
     assert isinstance(fctx.plugin("fake://h/f", "stat"), Fake)
 
 
@@ -424,8 +424,12 @@ def test_file_finaliser(fctx: Gfal2Context, caplog: pytest.LogCaptureFixture) ->
 
     broken = fctx.open("fake://h/f", "r")
     broken._file = Bad("fake://h/f", {})
-    with caplog.at_level(logging.DEBUG, logger="xgfalclient"):
-        broken.__del__()
+    xgfalclient.set_verbose(xgfalclient.verbose_level.debug)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="gfal2"):
+            broken.__del__()
+    finally:
+        xgfalclient.set_verbose(xgfalclient.verbose_level.verbose)
     assert "finaliser" in caplog.text
     half = xgfalclient.FileType.__new__(xgfalclient.FileType)
     half.__del__()  # never got a file: nothing to close
@@ -570,7 +574,7 @@ def test_lifecycle(caplog: pytest.LogCaptureFixture) -> None:
 
     with Gfal2Context(options=Options(load_system=False), load_plugins=False) as context:
         context.add_plugin(Unclosable)
-        assert "fake-0.1.0" in repr(context)
+        assert "fake-2.23.5" in repr(context)
         assert context.cancel() == 0
         assert context._cancel_generation == 1
     assert context._freed

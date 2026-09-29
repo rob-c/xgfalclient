@@ -62,7 +62,7 @@ __all__ = [
     "MAX_POOL",
 ]
 
-_log = logging.getLogger("xgfalclient.plugins.lfc")
+_log = logging.getLogger("gfal2")
 
 #: Connections idle longer than this are closed rather than reused; the
 #: server gives up on a session after 60 seconds.

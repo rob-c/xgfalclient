@@ -67,7 +67,7 @@ if TYPE_CHECKING:
 
 __all__ = ["HTTPPlugin"]
 
-_log = logging.getLogger("xgfalclient.plugins.http")
+_log = logging.getLogger("gfal2")
 
 
 def _result(exc: GError, prefix: str = "") -> GError:

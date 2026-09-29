@@ -24,7 +24,8 @@ from __future__ import annotations
 import logging
 import sys
 
-from ._version import __version__
+from . import _log
+from ._version import GFAL2_VERSION, __version__
 from .context import DirectoryType, FileType, Gfal2Context, creat_context
 from .creds import Credential
 from .enums import checksum_mode, event_side, verbose_level
@@ -58,19 +59,16 @@ __all__ = [
 ]
 
 NullHandler = logging.NullHandler
-logging.getLogger("xgfalclient").addHandler(logging.NullHandler())
-
-#: gfal2 verbosity to the ``logging`` level that shows the same messages.
-_LEVELS = {8: logging.ERROR, 16: logging.WARNING, 64: logging.INFO, 128: logging.DEBUG}
 
 
 def get_version() -> str:
-    return __version__
+    """The gfal2 release this reproduces, as ``gfal2.get_version()`` reports."""
+    return GFAL2_VERSION
 
 
 def set_verbose(level: int) -> int:
-    """Set how much the ``xgfalclient`` logger lets through."""
-    logging.getLogger("xgfalclient").setLevel(_LEVELS.get(int(level), logging.DEBUG))
+    """Set how much gfal2 logs to the ``gfal2`` logger; its level is left alone."""
+    _log.set_threshold(_log.LEVELS.get(int(level), logging.DEBUG))
     return 0
 
 

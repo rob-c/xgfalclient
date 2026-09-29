@@ -102,7 +102,7 @@ def test_emit_survives_a_broken_callback(caplog: pytest.LogCaptureFixture) -> No
         raise ValueError("boom")
 
     params.event_callback = broken
-    with caplog.at_level(logging.ERROR, logger="xgfalclient.transfer"):
+    with caplog.at_level(logging.ERROR, logger="gfal2"):
         emit(params, "d", "s")
     assert "event_callback raised" in caplog.text
 
@@ -183,7 +183,7 @@ def test_progress_throttles_monitor(
         raise RuntimeError("boom")
 
     params.monitor_callback = broken
-    with caplog.at_level(logging.ERROR, logger="xgfalclient.transfer"):
+    with caplog.at_level(logging.ERROR, logger="gfal2"):
         transfer.progress(400, force=True)
     assert "monitor_callback raised" in caplog.text
 

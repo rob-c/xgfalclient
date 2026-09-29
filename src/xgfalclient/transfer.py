@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 
 __all__ = ["TransferParameters", "Transfer", "emit", "run_copy", "run_bulk", "pump", "stream"]
 
-_log = logging.getLogger("xgfalclient.transfer")
+_log = logging.getLogger("gfal2")
 
 EventCallback = Callable[[ev.GfaltEvent], Any]
 MonitorCallback = Callable[[str, str, int, int, int, int], Any]

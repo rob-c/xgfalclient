@@ -35,6 +35,7 @@ import traceback
 from collections.abc import Sequence
 from typing import IO, TYPE_CHECKING, Any, Callable, Optional, Union
 
+from .. import _log
 from ..errors import GError
 
 if TYPE_CHECKING:
@@ -323,8 +324,7 @@ class _Logging:
 
         level = min(3, max(0, verbose))
         self.value = logging.ERROR - level * 10
-        self.library = logging.getLogger("xgfalclient")
-        self.library_level = self.library.level
+        self.library_threshold = _log.threshold()
         set_verbose(verbose_level.verbose if level < 3 else verbose_level.debug)
         self.file: IO[str] | None = open(log_file, "w+") if log_file else None  # noqa: SIM115
         stream = self.file if self.file is not None else sys.stdout
@@ -339,7 +339,7 @@ class _Logging:
     def close(self) -> None:
         self.root.removeHandler(self.handler)
         self.root.setLevel(self.root_level)
-        self.library.setLevel(self.library_level)
+        _log.set_threshold(self.library_threshold)
         if self.file is not None:
             self.file.close()
 

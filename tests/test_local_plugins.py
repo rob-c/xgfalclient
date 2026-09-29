@@ -428,7 +428,7 @@ def test_registry_loads_what_it_can(
         ],
     )
     monkeypatch.setattr(plugins, "_MISSING", {})
-    with caplog.at_level(logging.WARNING, logger="xgfalclient.plugins"):
+    with caplog.at_level(logging.WARNING, logger="gfal2"):
         found = plugins.plugin_classes(extra={})
     assert found == [ThirdParty]
     assert "not a Plugin subclass" in caplog.text
@@ -461,7 +461,7 @@ def test_plugins_load_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
     assert context._copy_plugin("third://a", "file:///b") is None  # loads "third"
     assert [p.name for p in context.plugins] == ["third"]
     assert context._pending == []
-    assert context.get_plugin_names() == [f"third-{xgfalclient.__version__}"]
+    assert context.get_plugin_names() == ["third-2.23.5"]
     empty = Gfal2Context(load_plugins=False)
     assert empty.get_plugin_names() == []
     monkeypatch.setattr(
@@ -525,7 +525,7 @@ def test_registry_entry_points_in_both_shapes(monkeypatch: pytest.MonkeyPatch) -
     assert not context._entry_points_pending and "third" in [p.name for p in context.plugins]
     context._find("other://h/x", "stat")  # already looked up once
     later = Gfal2Context()
-    assert f"third-{xgfalclient.__version__}" in later.get_plugin_names()
+    assert "third-2.23.5" in later.get_plugin_names()
     assert later.get_plugin_names() == later.get_plugin_names()
 
 
@@ -533,14 +533,30 @@ def test_registry_entry_points_in_both_shapes(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_package_functions(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert xgfalclient.get_version() == xgfalclient.__version__
-    assert xgfalclient.set_verbose(xgfalclient.verbose_level.debug) == 0
-    assert logging.getLogger("xgfalclient").level == logging.DEBUG
-    xgfalclient.set_verbose(xgfalclient.verbose_level.normal)
-    assert logging.getLogger("xgfalclient").level == logging.ERROR
-    xgfalclient.set_verbose(12345)
-    assert logging.getLogger("xgfalclient").level == logging.DEBUG
-    logging.getLogger("xgfalclient").setLevel(logging.NOTSET)
+    assert xgfalclient.get_version() == "2.23.5"  # gfal2's, which callers gate on
+    gfal2 = logging.getLogger("gfal2")
+    assert any(isinstance(h, logging.NullHandler) for h in gfal2.handlers)
+    level = gfal2.level
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    gfal2.addHandler(handler)
+    gfal2.setLevel(logging.DEBUG)  # the application's choice; gfal2's threshold still applies
+    try:
+        gfal2.debug("hidden")
+        assert xgfalclient.set_verbose(xgfalclient.verbose_level.debug) == 0
+        gfal2.debug("shown")
+        xgfalclient.set_verbose(xgfalclient.verbose_level.normal)
+        gfal2.warning("hidden")
+        gfal2.error("shown")
+        xgfalclient.set_verbose(12345)
+        gfal2.debug("shown")
+        assert gfal2.level == logging.DEBUG  # set_verbose never touches the logger's level
+    finally:
+        gfal2.setLevel(level)
+        gfal2.removeHandler(handler)
+        xgfalclient.set_verbose(xgfalclient.verbose_level.verbose)
+    assert [r.getMessage() for r in records] == ["shown"] * 3
     credential = xgfalclient.cred_new("BEARER", "t")
     context = xgfalclient.creat_context()
     assert xgfalclient.cred_set(context, "https://se/", credential) == 0
@@ -585,7 +601,7 @@ def test_plugin_base_helpers(ctx: Gfal2Context) -> None:
         option_group = "BARE PLUGIN"
 
     plugin: Any = Bare(ctx)
-    assert plugin.label == f"bare-{xgfalclient.__version__}"
+    assert plugin.label == "bare-2.23.5"
     assert plugin.available() is None
     assert plugin.handles("bare://x", "stat") is False
     assert not Bare.implements("stat") and not Bare.implements("no_such_operation")

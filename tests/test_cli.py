@@ -104,9 +104,9 @@ def test_version(run: Run) -> None:
     code, out, _ = run("ls", "-V")
     assert code == 0
     lines = out.splitlines()
-    assert lines[0] == f"gfal2-util version 1.9.1 (gfal2 {xgfalclient.__version__})"
-    assert "\tfile-" + xgfalclient.__version__ in lines
-    assert "\tmock-" + xgfalclient.__version__ in lines
+    assert lines[0] == "gfal2-util version 1.9.1 (gfal2 2.23.5)"
+    assert "\tfile-2.23.5" in lines
+    assert "\tmock-2.23.5" in lines
 
 
 def test_usage_error(run: Run) -> None:
@@ -208,10 +208,10 @@ def test_cert_sets_environment(run: Run, tree: Path, monkeypatch: pytest.MonkeyP
 
 def test_verbose_logging_to_stdout_and_file(run: Run, tree: Path) -> None:
     root = logging.getLogger()
-    before = (list(root.handlers), root.level, logging.getLogger("xgfalclient").level)
+    before = (list(root.handlers), root.level, xgfalclient._log.threshold())
     code, _out, _ = run("stat", "-vvvv", url(tree / "nope"))
     assert code == errno.ENOENT
-    after = (list(root.handlers), root.level, logging.getLogger("xgfalclient").level)
+    after = (list(root.handlers), root.level, xgfalclient._log.threshold())
     assert after == before
     log = tree / "gfal.log"
     code, _, _ = run("ls", "-vv", "--log-file", str(log), url(tree / "a.txt"))

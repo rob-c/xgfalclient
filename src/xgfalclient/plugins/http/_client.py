@@ -78,7 +78,7 @@ __all__ = [
     "wire_url",
 ]
 
-_log = logging.getLogger("xgfalclient.plugins.http")
+_log = logging.getLogger("gfal2")
 
 #: Socket I/O size for bodies: gfal2's ``COPY_BUFFERSIZE``.
 BLOCK = 4 << 20

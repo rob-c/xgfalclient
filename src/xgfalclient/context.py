@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 __all__ = ["Gfal2Context", "FileType", "DirectoryType", "creat_context"]
 
-_log = logging.getLogger("xgfalclient")
+_log = logging.getLogger("gfal2")
 
 _OPEN_FLAGS = {
     "r": O_RDONLY,

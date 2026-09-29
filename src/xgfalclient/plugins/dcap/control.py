@@ -35,7 +35,7 @@ from .tunnel import TokenLink, Tunnel
 
 __all__ = ["ControlConnection", "Door", "socket_error", "UID", "GID", "MAX_IDLE"]
 
-_log = logging.getLogger("xgfalclient.plugins.dcap")
+_log = logging.getLogger("gfal2")
 
 #: Identity libdcap reports in ``hello`` and on every request (``-uid=``).
 UID: int = getattr(os, "getuid", lambda: 0)()

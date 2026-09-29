@@ -36,7 +36,7 @@ from .protocol import Reply, check_path, reply_error
 
 __all__ = ["Control", "connect_error", "MAX_LINE"]
 
-_log = logging.getLogger("xgfalclient.plugins.gridftp")
+_log = logging.getLogger("gfal2")
 
 #: A reply line longer than this is not an FTP server talking.
 MAX_LINE = 1 << 20

@@ -36,7 +36,7 @@ __all__ = [
     "plugin_classes",
 ]
 
-_log = logging.getLogger("xgfalclient.plugins")
+_log = logging.getLogger("gfal2")
 
 ENTRY_POINT_GROUP = "xgfalclient.plugins"
 

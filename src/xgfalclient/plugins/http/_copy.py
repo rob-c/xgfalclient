@@ -67,7 +67,7 @@ if TYPE_CHECKING:
 
 __all__ = ["PULL", "PUSH", "STREAMED", "copy", "copy_modes"]
 
-_log = logging.getLogger("xgfalclient.plugins.http")
+_log = logging.getLogger("gfal2")
 
 PULL = "3rd pull"
 PUSH = "3rd push"

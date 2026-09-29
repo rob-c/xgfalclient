@@ -206,7 +206,7 @@ class Plugin:
 
     def __init__(self, context: Gfal2Context) -> None:
         self.context = context
-        self.log = logging.getLogger(f"xgfalclient.plugins.{self.name}")
+        self.log = logging.getLogger("gfal2")
 
     # -- identity and dispatch ---------------------------------------------------
 
@@ -217,9 +217,9 @@ class Plugin:
 
     @property
     def version(self) -> str:
-        from ._version import __version__
+        from ._version import GFAL2_VERSION
 
-        return __version__
+        return GFAL2_VERSION
 
     @property
     def label(self) -> str:
