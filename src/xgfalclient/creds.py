@@ -36,6 +36,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from . import _log
 from ._compat import SLOTS
 from .errors import GError
 from .options import Options
@@ -160,26 +161,40 @@ def _trimmed(env: Mapping[str, str], name: str) -> str | None:
 
 
 def seed_options(options: Options, environ: Mapping[str, str] | None = None) -> None:
-    """Write the environment's credential into ``options``, as ``gfal2_context_new`` does."""
+    """Write the environment's credential into ``options``, as ``gfal2_context_new`` does.
+
+    Each outcome is logged in gfal2's words (``gfal_initCredentialLocation``).
+    """
     env = os.environ if environ is None else environ
     token = _trimmed(env, "BEARER_TOKEN")
     if token:
         options.set_string("BEARER", "TOKEN", token)
+        _log.LOGGER.debug("Using BEARER token credentials from the env")
         return
     found = _environment_x509(env)
-    if found is not None:
-        options.set_string("X509", "CERT", found.cert)
-        options.set_string("X509", "KEY", found.key)
+    if found is None:
+        _log.LOGGER.debug("Could not find the credentials in any of the known locations")
+        return
+    where, credential = found
+    options.set_string("X509", "CERT", credential.cert)
+    options.set_string("X509", "KEY", credential.key)
+    _log.LOGGER.debug("Using credentials from %s", where)
+    _log.LOGGER.debug("Certificate: %s", credential.cert)
+    _log.LOGGER.debug("Private key: %s", credential.key)
 
 
-def _environment_x509(env: Mapping[str, str]) -> X509Credential | None:
-    """gfal2's search, which trusts the variables without looking at the files."""
-    proxy = _trimmed(env, "X509_USER_PROXY") or _existing(f"/tmp/x509up_u{_uid()}")
+def _environment_x509(env: Mapping[str, str]) -> tuple[str, X509Credential] | None:
+    """gfal2's search, which trusts the variables without looking at the files;
+    with gfal2's name for where the credential was found."""
+    proxy = _trimmed(env, "X509_USER_PROXY")
     if proxy:
-        return X509Credential(proxy, proxy)
+        return "X509_USER_PROXY", X509Credential(proxy, proxy)
+    proxy = _existing(f"/tmp/x509up_u{_uid()}")
+    if proxy:
+        return "default proxy location", X509Credential(proxy, proxy)
     cert, key = _trimmed(env, "X509_USER_CERT"), _trimmed(env, "X509_USER_KEY")
     if cert and key:
-        return X509Credential(cert, key)
+        return "X509_USER_CERT and X509_USER_KEY", X509Credential(cert, key)
     home = _trimmed(env, "HOME")
     if home:
         pair = X509Credential(
@@ -187,7 +202,7 @@ def _environment_x509(env: Mapping[str, str]) -> X509Credential | None:
             os.path.join(home, ".globus", "userkey.pem"),
         )
         if os.access(pair.cert, os.R_OK) and os.access(pair.key, os.R_OK):
-            return pair
+            return "default certificate location", pair
     return None
 
 

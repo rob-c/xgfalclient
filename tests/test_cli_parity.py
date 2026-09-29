@@ -288,7 +288,11 @@ case("legacy-bringonline-none", ["legacy-bringonline"])
 #: Cases whose outputs differ for a reason outside the CLI (a plugin or the
 #: core behaving differently from gfal2), with the reason.
 KNOWN: dict[str, str] = {
-    "ls-verbose": "library log messages are the library's own",
+    # The config-directory and credential lines match gfal2's; what follows
+    # them describes gfal2's C internals - scanning /usr/lib64/gfal2-plugins,
+    # dlopen()ing every .so up front, davix's set-up - where we load only the
+    # Python module a URL needs, and log that instead.
+    "ls-verbose": "gfal2 logs loading its C plugins and davix; we log the modules we load",
 }
 
 # The driver, run with the image's python3 (3.9).

@@ -27,13 +27,13 @@ does not.)
 from __future__ import annotations
 
 import errno
-import glob
 import os
 import re
 import stat
 import threading
 from collections.abc import Iterable, Mapping
 
+from . import _log
 from .errors import GError
 
 __all__ = [
@@ -89,6 +89,16 @@ _INT_MIN, _INT_MAX = -(2**31), 2**31 - 1
 _BLANKS = " \t\n\v\f\r"
 
 #: The configuration a stock gfal2 2.23 installation ships with.
+#: gfal2's default configuration directory, spelt as it logs it (with the slash).
+DEFAULT_CONFIG_DIR = "/etc/gfal2.d/"
+
+
+def is_config_name(name: str) -> bool:
+    """gfal2's ``is_config_dir``: the first ``.conf`` in the name ends it."""
+    at = name.find(".conf")
+    return at >= 0 and at + len(".conf") == len(name)
+
+
 DEFAULTS = """
 [CORE]
 RESOLVE_DNS=false
@@ -195,15 +205,36 @@ class Options:
         self._groups: dict[str, dict[str, str]] = {}
         self.merge(parse_ini(DEFAULTS, "<defaults>"))
         if load_system:
-            for path in self.system_files():
+            for path in self.system_files(announce=True):
+                _log.LOGGER.debug(" try to load configuration file %s ...", path)
                 self.load_file(path)
 
     @staticmethod
-    def system_files(environ: Mapping[str, str] | None = None) -> list[str]:
-        """The ``*.conf`` files gfal2 itself would read, in load order."""
+    def system_files(environ: Mapping[str, str] | None = None, announce: bool = False) -> list[str]:
+        """The ``*.conf`` files gfal2 itself would read, in load order.
+
+        That order is the directory's (``readdir``'s), not sorted: a key set
+        in two files takes the value of the one read last. With ``announce``
+        the directory chosen is logged in gfal2's words.
+        """
         env = os.environ if environ is None else environ
-        directory = env.get("GFAL_CONFIG_DIR") or "/etc/gfal2.d"
-        return sorted(glob.glob(os.path.join(directory, "*.conf")))
+        configured = env.get("GFAL_CONFIG_DIR")
+        if configured:
+            directory = configured
+            message = " GFAL_CONFIG_DIR env var found, try to load configuration from %s"
+        else:
+            directory = DEFAULT_CONFIG_DIR
+            message = (
+                " no GFAL_CONFIG_DIR env var found, "
+                "try to load configuration from default directory %s"
+            )
+        if announce:
+            _log.LOGGER.debug(message, directory)
+        try:
+            names = os.listdir(directory)
+        except OSError:  # gfal2 fails outright; the built-in defaults stand in
+            return []
+        return [f"{directory}/{name}" for name in names if is_config_name(name)]
 
     # -- bulk ----------------------------------------------------------------
 

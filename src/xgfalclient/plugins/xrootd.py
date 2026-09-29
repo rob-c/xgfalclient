@@ -46,7 +46,15 @@ checked against it:
   that advertises ``tpcdlg`` pulls with that proxy ("TPC lite") - no key,
   and a source this client cannot open itself is no obstacle. Otherwise it
   is the classic rendezvous, and a source that cannot be opened is
-  "Destination does not support delegation.". A download runs
+  "Destination does not support delegation.". A pull that must stop -
+  ``cancel()``, the copy's timeout, a callback that raised - sends the
+  destination XrdCl's ``ofs.tpc cancel`` on the pull's handle (see
+  :class:`_Pull`), waits for its answer and closes the handles: a
+  cancelled pull fails with that answer (``ECANCELED``, "destination file
+  prematurely closed"), one out of time as XrdCl's expired sync
+  (``[ERROR] Operation expired``), and the clean-up then finds nothing
+  busy to remove. ``XRD_SUBSTREAMSPERCHANNEL`` above 1 asks the
+  destination for that many streams less one (``tpc.str``). A download runs
   on xrdclient's bulk data plane, pipelined over ``nbstreams`` connections
   (two by default) and landed straight in the file, which is where this is
   an order of magnitude faster than gfal2; an upload is one handle, because
@@ -64,7 +72,10 @@ copy carries its real ``errno``: gfal2 passes XrdCl's ``kXR_*`` number on
 (3018 for an existing file), fails to see ``EEXIST`` in it, and deletes the
 local file it has just refused to overwrite; here the file is kept and
 nothing is cleaned. The ``CLEANUP`` after a failed download is ``0`` for a
-file that was never made, where gfal2 reports 3011. A classic pull whose
+file that was never made, where gfal2 reports 3011. A pull out of time
+stops at the copy's deadline with the same cancel a cancelled one sends;
+XrdCl lets its sync expire (on a timer that ticks every 15 seconds) and
+closes the destination, which the server takes the same way. A classic pull whose
 close fails names the end that failed it; XrdCl's ``RunTPC`` names the
 other one. A pull's destination login delegates exactly when
 ``proxy_delegation`` says so, as XrdCl intends when it sets
@@ -79,10 +90,7 @@ then sends ``root://h/p`` as the relative path ``p``, which a stock server
 refuses); ``PARALLEL_COPIES`` (a bulk copy runs one file at a time through
 the core); falling back from a pull to a stream for non-``root`` pairs
 (XrdCl's ``thirdParty=first``), which gfal2 does not do against a stock
-server either; ``ofs.tpc cancel`` to the destination of a cancelled pull
-(the pull is abandoned where it stands, and the clean-up removes what it
-made); ``tpc.str``, which XrdCl sends only for ``XRD_SUBSTREAMSPERCHANNEL``
-above 1. XrdCl sets ``XrdSecGSIDELEGPROXY`` process-wide for a pull, so
+server either. XrdCl sets ``XrdSecGSIDELEGPROXY`` process-wide for a pull, so
 that every later login in the process follows the last pull's setting;
 here only the pull's destination login does, and everything else follows
 the environment (``gfal-copy`` exports ``XrdSecGSIDELEGPROXY=1``, as
@@ -236,6 +244,11 @@ _POSC = 0x1000
 #: often it asks the destination how far the pull has got, in seconds.
 TPC_POLL = 0.05
 TPC_PROGRESS = 1.0
+#: How long a stopped pull waits for the destination to answer its cancel.
+TPC_CANCEL_WAIT = 60.0
+#: What XrdCl's ``Fcntl`` sends a pull's destination to stop it: the string
+#: with its NUL, which ``XrdOfsFile::fctl`` insists on.
+TPC_CANCEL = b"ofs.tpc cancel\x00"
 
 
 #: How many idle :class:`~xrdclient.FileSystem` objects to keep per endpoint and
@@ -1235,12 +1248,17 @@ class XRootDPlugin(Plugin):
 
         A local device or FIFO is a sink the copy wrote into, not a file it
         made, and is left alone (gfal2 would try to unlink ``/dev/null``).
+        A ``root://`` destination is removed by this plugin itself, as gfal2
+        calls ``gfal_xrootd_unlinkG`` - not through the context, which
+        refuses new operations while a ``cancel()`` drains, and so would leave
+        a cancelled copy's destination behind.
         """
         destination = transfer.destination
-        if not is_root(destination) and _is_sink(local_path(destination)):
+        remote = is_root(destination)
+        if not remote and _is_sink(local_path(destination)):
             return
         try:
-            self.context.unlink(destination)
+            (self.unlink if remote else self.context.unlink)(destination)
             status = 0
         except GError as exc:
             status = 0 if exc.code == errno.ENOENT else exc.code
@@ -1312,17 +1330,24 @@ class XRootDPlugin(Plugin):
         """The rendezvous, in a worker; this thread watches the clock.
 
         The rendezvous blocks until the destination has the file, so it runs
-        in a worker while this thread keeps ``transfer.check()`` honest -
-        a cancelled or timed-out copy returns at once - and, when someone is
-        listening, reports progress from the size the destination has so far.
+        in a worker while this thread keeps ``transfer.check()`` honest and,
+        when someone is listening, reports progress from the size the
+        destination has so far. A copy that must stop - cancelled, out of
+        time, or a callback that raised - stops the destination's pull as
+        XrdCl's progress handler does (see :class:`_Pull`), and fails the way
+        gfal2's does: a cancelled pull with the destination's answer to the
+        cancel (``ECANCELED``, "destination file prematurely closed"), one out
+        of time as XrdCl's expired ``kXR_sync`` (``[ERROR] Operation
+        expired``), and a callback's exception as it was.
         """
         params = transfer.params
         outcome: list[Any] = []
         timeout = transfer.remaining()
+        stop = threading.Event()
 
         def pull() -> None:
             try:
-                outcome.append(job.run(timeout))
+                outcome.append(job.run(timeout, stop))
             except BaseException as exc:  # handed to the waiting thread
                 outcome.append(exc)
 
@@ -1332,7 +1357,14 @@ class XRootDPlugin(Plugin):
         asked = time.monotonic()
         while worker.is_alive():
             worker.join(TPC_POLL)
-            transfer.check()
+            try:
+                transfer.check()
+            except Exception as exc:
+                stop.set()
+                # The destination answers a cancel at once; one that does
+                # not is left to it, as before XrdCl learned to cancel.
+                worker.join(TPC_CANCEL_WAIT)
+                raise _stopped(exc, outcome) from None
             if watching and worker.is_alive() and time.monotonic() - asked >= TPC_PROGRESS:
                 asked = time.monotonic()
                 self._tpc_progress(transfer)
@@ -1525,8 +1557,11 @@ class _Rendezvous:
         self.delegate = delegate
         self.overwrite = overwrite
 
-    def run(self, timeout: float | None) -> int:
-        """The whole job; the size of the source, as far as the job knew it."""
+    def run(self, timeout: float | None, stop: threading.Event) -> int:
+        """The whole job; the size of the source, as far as the job knew it.
+
+        ``stop`` set calls the pull off once it is under way (see :class:`_Pull`).
+        """
         xrd = _import()
         source, target = self.source, self.target
         source_config, target_config = self.source_config, self.target_config
@@ -1540,6 +1575,7 @@ class _Rendezvous:
             "tpc.key": key,
             "tpc.src": _host_id(origin),
             "tpc.lfn": origin.path,
+            **_streams(os.environ.get("XRD_SUBSTREAMSPERCHANNEL", "")),
             "tpc.dlg": _host_id(source),
             "tpc.spr": source.scheme,
             "tpc.tpr": target.scheme,
@@ -1577,7 +1613,7 @@ class _Rendezvous:
             )
             _step(lambda: keyed.open(_READ), "source", pull)
             ends.insert(0, (keyed, "source"))
-        _step(pull.sync, "", *(handle for handle, _ in ends))
+        _step(lambda: _Pull(pull, stop).run(), "", *(handle for handle, _ in ends))
         failures = [_closed(handle, end) for handle, end in ends]
         for failure in failures:
             if failure is not None:
@@ -1596,6 +1632,144 @@ class _Rendezvous:
             return -1, None
         _quietly(placed.close)
         return size, _landed(self.source, placed.endpoint)
+
+
+class _Pull:
+    """The pull itself - the destination's second ``kXR_sync`` - which can be called off.
+
+    The destination defers its answer (``kXR_waitresp``) until it has the
+    file, and xrdclient holds a connection's lock for as long as a request
+    waits, so an ``Fcntl`` from another thread would wait for the very pull
+    it means to stop. The handle's connection is borrowed instead, the way
+    :class:`_Upload` borrows it: the sync is framed on a leased stream id,
+    and the socket is watched a moment at a time. When ``stop`` is set,
+    this sends what XrdCl's ``RunTPC``/``RunLite`` send when their progress
+    handler's ``ShouldCancel`` says so (gfal2's says so once the context is
+    cancelled): ``File::Fcntl("ofs.tpc cancel")``, a ``kXR_query`` of type
+    ``kXR_Qopaqug`` on the pull's handle. ``XrdOfsFile::fctl`` then kills
+    the pull and answers the waiting sync ``ECANCELED`` ("destination file
+    prematurely closed"); XrdCl waits for that answer, and so does this,
+    which is the pull's failure. The fctl's own answer is ignored, as XrdCl
+    only logs it. Either way the rendezvous then closes the handles.
+
+    Anything but those answers on the wire, or a connection that cannot be
+    settled, marks the session broken so that nobody reuses it.
+    """
+
+    def __init__(self, handle: File, stop: threading.Event) -> None:
+        self.handle = handle
+        self.stop = stop
+        self.session: Any = handle.session
+        self.wire: Any = self.session.transport
+
+    @staticmethod
+    def usable(handle: File) -> bool:
+        """Whether this connection can be borrowed so: the API is there."""
+        session: Any = handle.session
+        machine = getattr(session, "machine", None)
+        return all(
+            hasattr(machine, name) for name in ("lease_sids", "release_sids", "frame_for")
+        ) and all(hasattr(session, name) for name in ("bulk", "transport", "mark_broken"))
+
+    def run(self) -> None:
+        if not _Pull.usable(self.handle):
+            self.handle.sync()  # an older xrdclient: a pull that cannot be stopped
+            return
+        machine = self.session.machine
+        with self.session.bulk(self.handle.handle, chunk=1, depth=1):
+            leased = machine.lease_sids(2)
+            try:
+                failure = self._await(*leased)
+            except BaseException:
+                # A reply may still be in transit: keep the ids leased and the
+                # connection out of anyone else's hands.
+                self.session.mark_broken()
+                raise
+            machine.release_sids(leased)
+        if failure is not None:
+            raise failure
+
+    def _await(self, sync: int, cancel: int) -> Exception | None:
+        """Send the sync, and the cancel when asked; the sync's failure, if it failed."""
+        requests = importlib.import_module("xrdclient.proto.requests")
+        fhandle = self.handle.handle
+        self._send(requests.Sync(fhandle), sync)
+        owed = {sync}
+        asked = False
+        failure: Exception | None = None
+        while owed:
+            if self.stop.is_set() and not asked:
+                asked = True
+                owed.add(cancel)
+                self._send(requests.Query(_KXR_QOPAQUG, TPC_CANCEL, fhandle=fhandle), cancel)
+            answer = self._next()
+            if answer is None:
+                continue
+            sid, status, body = answer
+            if sid not in owed or status not in (_KXR_OK, _KXR_ERROR, _KXR_WAITRESP):
+                raise _import().errors.ProtocolError(
+                    f"unexpected reply to a third-party copy: stream {sid}, status {status}"
+                )
+            if status == _KXR_WAITRESP:
+                continue  # the answer comes later, as a kXR_asynresp
+            owed.discard(sid)
+            if sid == sync and status == _KXR_ERROR:
+                code = int.from_bytes(body[:4], "big")
+                message = body[4:].rstrip(b"\x00").decode("utf-8", "replace")
+                failure = _import().errors.ServerError(code, message, path=self.handle.url.path)
+        return failure
+
+    def _send(self, request: Any, sid: int) -> None:
+        self.wire.send(self.session.machine.frame_for(request, sid))
+
+    def _next(self) -> tuple[int, int, bytes] | None:
+        """The next answer, a deferred one unwrapped; ``None`` if none began in ``TPC_POLL``."""
+        header = bytearray(_RESPONSE_HEADER.size)
+        self.wire.settimeout(TPC_POLL)
+        try:
+            got = self.wire.receive_into(memoryview(header))
+        except _import().errors.TimeoutError:
+            return None
+        finally:
+            self.wire.settimeout(self.session.config.request_timeout)
+        if not got:
+            raise _import().errors.ConnectionError("the server closed the connection")
+        header[got:] = _receive(self.wire, len(header) - got)
+        sid, status, length = _RESPONSE_HEADER.unpack(header)
+        body = bytes(_receive(self.wire, length))
+        if status != _KXR_ATTN:
+            return sid, status, body
+        if int.from_bytes(body[:4], "big") != _KXR_ASYNRESP:
+            return None  # a notice, which nothing here waits for
+        sid, status, _ = _RESPONSE_HEADER.unpack(body[8:16])
+        return sid, status, body[16:]
+
+
+def _stopped(exc: Exception, outcome: list[Any]) -> Exception:
+    """The failure of a pull stopped by ``exc``, as gfal2 reports it (see ``_pull``)."""
+    if not isinstance(exc, GError):
+        return exc  # a callback's own exception
+    if exc.code == errno.ETIMEDOUT:
+        return _CopyError(Failure(errno.ETIMEDOUT, "[ERROR] Operation expired", ""), "")
+    answered = outcome[-1] if outcome else None
+    return answered if isinstance(answered, _CopyError) else exc
+
+
+def _streams(value: str) -> dict[str, str]:
+    """``tpc.str``: XrdCl's ``SubStreamsPerChannel`` less the control stream, when any are left.
+
+    XrdCl reads it from ``XRD_SUBSTREAMSPERCHANNEL`` with ``strtol`` (base 0)
+    and ignores a value that is not all number; gfal2's ``nbstreams`` goes
+    to a job property the third-party job never reads.
+    """
+    try:
+        count = int(value, 0)
+    except ValueError:
+        try:
+            count = int(value, 8)  # strtol's octal "010"
+        except ValueError:
+            count = 1
+    return {"tpc.str": str(count - 1)} if count > 1 else {}
 
 
 def _opaque(url: XRootDURL, fields: dict[str, str]) -> XRootDURL:
@@ -1755,6 +1929,7 @@ _WRITE_HEADER = struct.Struct(">HH4sqB3xI")
 #: A response header: stream id, status, body length.
 _RESPONSE_HEADER = struct.Struct(">HHI")
 _KXR_WRITE, _KXR_OK, _KXR_ERROR, _KXR_WAIT = 3019, 0, 4003, 4005
+_KXR_ATTN, _KXR_WAITRESP, _KXR_ASYNRESP, _KXR_QOPAQUG = 4001, 4006, 5008, 64
 
 
 class _Upload:
@@ -1927,15 +2102,20 @@ class _Upload:
         self.transfer.progress(self.done)
 
     def _receive(self, size: int) -> bytearray:
-        buffer = bytearray(size)
-        view = memoryview(buffer)
-        got = 0
-        while got < size:
-            count = self.wire.receive_into(view[got:])
-            if not count:
-                raise _import().errors.ConnectionError("the server closed the connection")
-            got += count
-        return buffer
+        return _receive(self.wire, size)
+
+
+def _receive(wire: Any, size: int) -> bytearray:
+    """Exactly ``size`` bytes off a borrowed connection."""
+    buffer = bytearray(size)
+    view = memoryview(buffer)
+    got = 0
+    while got < size:
+        count = wire.receive_into(view[got:])
+        if not count:
+            raise _import().errors.ConnectionError("the server closed the connection")
+        got += count
+    return buffer
 
 
 def _close_idle(

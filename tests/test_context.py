@@ -919,3 +919,24 @@ def test_copy_plugin_selection(fctx: Gfal2Context) -> None:
     assert fctx._copy_plugin("cp://a", "cp://b") is plugin
     assert fctx._copy_plugin("fake://a", "cp://b") is None
     assert Plugin.copy_check(plugin, "a", "b") is False
+
+
+def test_plugin_loading_is_logged_as_gfal2_logs_it(caplog: pytest.LogCaptureFixture) -> None:
+    xgfalclient.set_verbose(xgfalclient.verbose_level.debug)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="gfal2"):
+            context = xgfalclient.creat_context()
+            context.stat("file:///")
+            context.stat("mock://h/f?size=1")
+            context.free()
+    finally:
+        xgfalclient.set_verbose(xgfalclient.verbose_level.verbose)
+    lines = [r.getMessage() for r in caplog.records if "plugin" in r.getMessage()]
+    assert lines == [
+        "[gfal_module_load] plugin xgfalclient.plugins.file loaded with success ",
+        " gfal_plugin loaded successfully : xgfalclient.plugins.file",
+        " plugin priority order: file-2.23.5 -> ",
+        "[gfal_module_load] plugin xgfalclient.plugins.mock loaded with success ",
+        " gfal_plugin loaded successfully : xgfalclient.plugins.mock",
+        " plugin priority order: mock-2.23.5 -> file-2.23.5 -> ",
+    ]

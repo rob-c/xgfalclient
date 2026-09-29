@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 from pathlib import Path
 
 import pytest
 
+import xgfalclient
 from xgfalclient import GError
 from xgfalclient import options as options_module
 from xgfalclient.options import (
@@ -223,13 +225,45 @@ def test_load_file_open_failures(
     )
 
 
-def test_system_files_follow_gfal_config_dir(tmp_path: Path) -> None:
+def test_system_files_follow_gfal_config_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     (tmp_path / "b.conf").write_text("[CORE]\nNAMESPACE_TIMEOUT=5\n")
     (tmp_path / "a.conf").write_text("[CORE]\nNAMESPACE_TIMEOUT=4\n")
     (tmp_path / "ignored.txt").write_text("[CORE]\nNAMESPACE_TIMEOUT=1\n")
+    (tmp_path / "x.conf.conf").write_text("[CORE]\nNAMESPACE_TIMEOUT=1\n")
     env = {"GFAL_CONFIG_DIR": str(tmp_path)}
-    assert [Path(p).name for p in Options.system_files(env)] == ["a.conf", "b.conf"]
-    assert Options.system_files({}) == Options.system_files({"GFAL_CONFIG_DIR": "/etc/gfal2.d"})
+    # gfal2 reads them in the directory's order, not sorted.
+    order = [name for name in os.listdir(tmp_path) if name in ("a.conf", "b.conf")]
+    assert Options.system_files(env) == [f"{tmp_path}/{name}" for name in order]
+    monkeypatch.setattr(options_module, "DEFAULT_CONFIG_DIR", str(tmp_path) + "/")
+    assert Options.system_files({}) == [f"{tmp_path}//{name}" for name in order]
+    assert Options.system_files({"GFAL_CONFIG_DIR": str(tmp_path / "missing")}) == []
+    # Announced in gfal2's words.
+    xgfalclient.set_verbose(xgfalclient.verbose_level.debug)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="gfal2"):
+            Options.system_files(env, announce=True)
+            Options.system_files({}, announce=True)
+            monkeypatch.setenv("GFAL_CONFIG_DIR", str(tmp_path))
+            Options()
+    finally:
+        xgfalclient.set_verbose(xgfalclient.verbose_level.verbose)
+    assert [r.getMessage() for r in caplog.records] == [
+        f" GFAL_CONFIG_DIR env var found, try to load configuration from {tmp_path}",
+        " no GFAL_CONFIG_DIR env var found, try to load configuration from default "
+        f"directory {tmp_path}/",
+        f" GFAL_CONFIG_DIR env var found, try to load configuration from {tmp_path}",
+        *(f" try to load configuration file {tmp_path}/{name} ..." for name in order),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "wanted"),
+    [("a.conf", True), (".conf", True), ("a.conf.conf", False), ("a.confx", False), ("a", False)],
+)
+def test_config_names_as_gfal2_matches_them(name: str, wanted: bool) -> None:
+    assert options_module.is_config_name(name) is wanted
 
 
 def test_system_configuration_is_layered(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

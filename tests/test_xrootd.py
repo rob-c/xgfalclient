@@ -14,6 +14,7 @@ import json
 import os
 import socket
 import stat as _stat
+import struct
 import threading
 import time
 import urllib.parse
@@ -1504,7 +1505,13 @@ class Puller:
 
     The destination's second ``kXR_sync`` on a handle opened with ``tpc.src``
     is the moment a real server pulls; this one copies the bytes out of the
-    source fake instead, optionally slowly, and optionally not at all.
+    source fake instead, optionally slowly, and optionally not at all. A slow
+    pull is answered as xrootd answers it: ``kXR_waitresp`` at once, and the
+    real answer later as a ``kXR_asynresp`` - or, when the client sends
+    ``ofs.tpc cancel`` first (and the fake ``cancels``), ``ECANCELED`` as
+    ``XrdOfsFile::fctl`` has it. ``ending`` makes that later answer
+    something else: a notice first, a reply on a stream nobody asked on,
+    a status no sync gets, or the connection dropped.
     """
 
     def __init__(
@@ -1515,12 +1522,21 @@ class Puller:
         *,
         lite: bool = False,
         refuse: str = "",
+        cancels: bool = True,
+        ending: str = "",
     ) -> None:
         self.source = source
         self.delay = delay
         self.refuse = refuse
+        self.ending = ending
         self.syncs: dict[bytes, int] = {}
+        #: What each ``kXR_Qopaqug`` carried, in order.
+        self.fctls: list[bytes] = []
+        self.lock = threading.Lock()
+        self.pending: dict[str, tuple[Any, int, threading.Event]] = {}
         target.handlers[c.kXR_sync] = self.sync
+        if cancels:
+            target.fctl = self.fctl
         # What a stock xrootd with ``ofs.tpc`` answers; ``tpcdlg`` is the
         # protocol whose credentials it forwards when set (``fcreds``).
         _tpc(source, target, lite=lite)
@@ -1538,11 +1554,52 @@ class Puller:
             ][-1]
             lfn = opened.split("tpc.lfn=")[1].split("&")[0]
             data = self.source.contents(lfn)
-            half = len(data) // 2
-            conn.s.files[path] = bytearray(data[:half])
-            time.sleep(self.delay)
+            conn.s.files[path] = bytearray(data[: len(data) // 2])
+            if self.delay:
+                cancelled = threading.Event()
+                self.pending[path] = (conn, sid, cancelled)
+                yield frame(sid, c.kXR_waitresp, struct.pack(">i", 1800))
+                threading.Thread(
+                    target=self.finish, args=(path, data, cancelled), daemon=True
+                ).start()
+                return
             conn.s.files[path] = bytearray(data)
         yield frame(sid, c.kXR_ok)
+
+    def finish(self, path: str, data: bytes, cancelled: threading.Event) -> None:
+        cancelled.wait(self.delay)
+        with self.lock:
+            if path not in self.pending:
+                return  # cancelled, and answered so
+            conn, sid, _ = self.pending.pop(path)
+            conn.s.files[path] = bytearray(data)
+            if self.ending == "hangup":
+                conn.sock.shutdown(socket.SHUT_RDWR)
+                return
+            if self.ending == "notice":
+                notice = struct.pack(">ii", c.kXR_asyncms, 0) + b"hello\x00"
+                conn._send(frame(0, c.kXR_attn, notice))
+            sid, status = {"stray": (sid + 7, c.kXR_ok), "oksofar": (sid, c.kXR_oksofar)}.get(
+                self.ending, (sid, c.kXR_ok)
+            )
+            conn._send(_deferred(sid, status))
+
+    def fctl(self, path: str, body: bytes) -> bytes:
+        """``XrdOfsFile::fctl``: the pull is killed, and its sync told so first."""
+        self.fctls.append(body)
+        with self.lock:
+            if path not in self.pending:
+                return b""  # xrootd says ESRCH, which XrdCl ignores as it ignores this
+            conn, sid, cancelled = self.pending.pop(path)
+            cancelled.set()
+            message = b"destination file prematurely closed\x00"
+            conn._send(_deferred(sid, c.kXR_error, struct.pack(">i", 3017) + message))
+        return b""
+
+
+def _deferred(sid: int, status: int, body: bytes = b"") -> bytes:
+    """A ``kXR_asynresp``: the answer to a request the server said ``kXR_waitresp`` to."""
+    return frame(0, c.kXR_attn, struct.pack(">ii", c.kXR_asynresp, 0) + frame(sid, status, body))
 
 
 def _tpc(source: FakeServer, target: FakeServer, *, lite: bool = False) -> None:
@@ -1900,21 +1957,170 @@ def test_a_pull_whose_close_fails(
     assert failure.message.endswith(f"[3007] close failed ({end})\n")
 
 
-def test_a_pull_can_be_cancelled(
+CANCELLED = "[ERROR] Server responded with an error: [3017] destination file prematurely closed\n"
+
+
+def test_a_cancelled_pull_is_stopped_at_the_destination(
     ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
 ) -> None:
-    Puller(server, target, delay=2.0)
+    """XrdCl's ``Fcntl("ofs.tpc cancel")``, and the destination's answer is gfal2's error."""
+    puller = Puller(server, target, delay=5.0)
     params = ctx.transfer_parameters()
-    params.transfer_cleanup = False
     timer = threading.Timer(0.3, ctx.cancel)
     timer.start()
     started = time.monotonic()
     seen = _events(params)
     failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/p")
     timer.join()
+    assert time.monotonic() - started < 2.0
+    assert puller.fctls == [b"ofs.tpc cancel\x00"]  # with its NUL, as XrdOfsFile::fctl wants
     assert failure.code == errno.ECANCELED
-    assert (2, "xroot", "TRANSFER:EXIT", "Job finished, Transfer canceled") in seen
-    assert time.monotonic() - started < 1.5
+    assert failure.message == f"Error on XrdCl::CopyProcess::Run(): {CANCELLED}"
+    assert (2, "xroot", "TRANSFER:EXIT", f"Job finished, {CANCELLED}") in seen
+    assert (1, "xroot", "CLEANUP", "0") in seen, seen[-3:]  # the handles are closed
+    assert "/p" not in target.files
+
+
+def test_a_pull_out_of_time_is_stopped_and_expired(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    puller = Puller(server, target, delay=5.0)
+    params = ctx.transfer_parameters()
+    params.timeout = 1
+    params.transfer_cleanup = False
+    seen = _events(params)
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert puller.fctls == [b"ofs.tpc cancel\x00"]
+    assert failure.code == errno.ETIMEDOUT  # XrdCl's sync expiring, as gfal2 reports it
+    assert failure.message == "Error on XrdCl::CopyProcess::Run(): [ERROR] Operation expired"
+    assert (2, "xroot", "TRANSFER:EXIT", "Job finished, [ERROR] Operation expired") in seen
+    assert target.contents("/p") == HELLO[:6]  # stopped half way
+
+
+def test_a_callback_that_raises_stops_the_pull(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    target: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(xrootd, "TPC_PROGRESS", 0.0)
+    monkeypatch.setattr(xgfalclient.transfer, "MONITOR_INTERVAL", 0.0)
+    puller = Puller(server, target, delay=5.0)
+    params = ctx.transfer_parameters()
+
+    def broken(*args: Any) -> None:
+        raise RuntimeError("stop")
+
+    params.monitor_callback = broken
+    with pytest.raises(RuntimeError, match="stop"):
+        ctx.filecopy(params, _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert puller.fctls == [b"ofs.tpc cancel\x00"]
+
+
+def test_a_destination_that_ignores_the_cancel_is_left_to_it(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    target: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stock storage refuses the fctl (XrdCl ignores that), and the pull goes on."""
+    monkeypatch.setattr(xrootd, "TPC_CANCEL_WAIT", 0.2)
+    Puller(server, target, delay=1.5, cancels=False)
+    params = ctx.transfer_parameters()
+    params.transfer_cleanup = False
+    threading.Timer(0.3, ctx.cancel).start()
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert (failure.code, failure.message) == (errno.ECANCELED, "Transfer canceled")
+    time.sleep(1.5)
+    assert target.contents("/p") == HELLO  # nobody stopped it
+
+
+def test_a_pull_that_finishes_as_it_is_cancelled_is_still_cancelled(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    Puller(server, target, delay=0.6, cancels=False)
+    params = ctx.transfer_parameters()
+    params.transfer_cleanup = False
+    threading.Timer(0.2, ctx.cancel).start()
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert (failure.code, failure.message) == (errno.ECANCELED, "Transfer canceled")
+
+
+def test_a_notice_during_a_pull_is_passed_over(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    Puller(server, target, delay=0.2, ending="notice")
+    ctx.filecopy(ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert target.contents("/p") == HELLO
+
+
+@pytest.mark.parametrize(
+    ("ending", "code"),
+    [("stray", errno.EPROTO), ("oksofar", errno.EPROTO), ("hangup", errno.ECONNRESET)],
+)
+def test_a_pull_answered_nonsense_breaks_the_connection(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer, ending: str, code: int
+) -> None:
+    Puller(server, target, delay=0.2, ending=ending)
+    params = ctx.transfer_parameters()
+    params.transfer_cleanup = False
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert failure.code == code
+
+
+def test_a_pull_on_an_older_xrdclient_cannot_be_stopped(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    target: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(xrootd._Pull, "usable", staticmethod(lambda handle: False))
+    puller = Puller(server, target, delay=0.2)
+    ctx.filecopy(ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert target.contents("/p") == HELLO
+    assert puller.fctls == []
+
+
+def test_a_pull_borrows_only_a_connection_with_the_api() -> None:
+    machine = SimpleNamespace(lease_sids=1, release_sids=1, frame_for=1)
+    session = SimpleNamespace(machine=machine, bulk=1, transport=1, mark_broken=1)
+    assert xrootd._Pull.usable(SimpleNamespace(session=session))
+    older = SimpleNamespace(
+        machine=SimpleNamespace(lease_sids=1, release_sids=1), bulk=1, transport=1, mark_broken=1
+    )
+    assert not xrootd._Pull.usable(SimpleNamespace(session=older))
+    unmarked = SimpleNamespace(machine=machine, bulk=1, transport=1)
+    assert not xrootd._Pull.usable(SimpleNamespace(session=unmarked))
+
+
+@pytest.mark.parametrize(
+    ("value", "cgi"),
+    [
+        ("", {}),
+        ("1", {}),
+        ("0", {}),
+        ("4", {"tpc.str": "3"}),
+        ("0x3", {"tpc.str": "2"}),
+        ("010", {"tpc.str": "7"}),  # strtol's octal
+        ("08", {}),
+        ("two", {}),
+    ],
+)
+def test_substreams_become_tpc_str_as_xrdcl_counts_them(value: str, cgi: dict[str, str]) -> None:
+    assert xrootd._streams(value) == cgi
+
+
+def test_a_pull_asks_for_substreams_when_xrdcl_would(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    target: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XRD_SUBSTREAMSPERCHANNEL", "3")
+    Puller(server, target)
+    ctx.filecopy(ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/p")
+    (opened,) = _opened(target, "tpc.key=")
+    assert "&tpc.lfn=/data/a.txt&tpc.str=2&tpc.dlg=" in opened
 
 
 def test_a_pull_is_narrated_as_xrdcls_copy_job(

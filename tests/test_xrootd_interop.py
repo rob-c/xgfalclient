@@ -538,6 +538,105 @@ def test_a_delegated_pull_is_tpc_lite_as_in_gfal2(tmp_path: Path) -> None:
     assert "no delegated credentials for tpc (destination)" in ours["undelegated"][0][2]
 
 
+#: A destination whose pull crawls (``xrdcp --xrate``), so that a copy can be
+#: stopped while the destination is still pulling.
+SLOW_CONFIG = """\
+all.export /
+oss.localroot /data
+all.role server
+ofs.tpc pgm /usr/bin/xrdcp --server --xrate 1m
+xrd.port 1094
+xrootd.trace fs
+"""
+
+SLOW_DRIVER = r"""
+import json, os, sys, threading, time
+sys.path[:0] = ["/src/xgfalclient/src", "/src/xrdclient/src"]
+name, tag = sys.argv[1:3]
+mod = __import__(name)
+out = {}
+
+
+def copy(label, cancel=False, timeout=0):
+    ctx = mod.creat_context()
+    events = []
+    p = ctx.transfer_parameters()
+    p.event_callback = lambda e: events.append([e.side, e.domain, e.stage, e.description])
+    p.timeout = timeout
+    if cancel:
+        threading.Timer(3, ctx.cancel).start()
+    dst = "%s_%s.bin" % (tag, label)
+    try:
+        ctx.filecopy(p, "root://localhost:1094//big.bin", "root://127.0.0.1:1094//" + dst)
+        result = "ok"
+    except mod.GError as e:
+        result = ["err", e.code, e.message]
+    time.sleep(3)  # a pull left running would still be writing
+    mine = [e for e in events if e[1] == "xroot"]
+    out[label] = json.loads(json.dumps(
+        [result, mine, os.path.exists("/data/" + dst)]).replace(tag + "_", "T_"))
+
+
+copy("cancel", cancel=True)
+copy("timeout", timeout=3)
+json.dump(out, open("/io/slow_%s.json" % tag, "w"))
+"""
+
+
+@pytest.mark.timeout(900)
+def test_a_stopped_pull_stops_at_the_destination_as_in_gfal2(tmp_path: Path) -> None:
+    """A cancelled or timed-out pull: XrdCl's ``ofs.tpc cancel``, gfal2's error, nothing left.
+
+    gfal2's XrdCl sends the destination ``Fcntl("ofs.tpc cancel")`` when the
+    context is cancelled, and reports the destination's answer; a pull out
+    of time is XrdCl's expired ``kXR_sync``, whose errno gfal2 maps to
+    ``ESTALE`` where this package says ``ETIMEDOUT`` (see the module).
+    """
+    name = f"xgfal-xrootd-slow-{os.getpid()}"
+    io_dir = tmp_path / "io"
+    io_dir.mkdir()
+    (io_dir / "slow.py").write_text(SLOW_DRIVER)
+    _docker(
+        "run", "-d", "--rm", "--name", name,
+        "-e", "PYTHONPYCACHEPREFIX=/tmp/pyc",
+        "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
+        "-v", f"{_xrdclient_src()}:/src/xrdclient/src:ro",
+        "-v", f"{io_dir}:/io",
+        IMAGE, "sleep", "infinity",
+    )  # fmt: skip
+    try:
+        start = START.format(config=SLOW_CONFIG).replace(
+            "chown xrd /data", "head -c 20000000 /dev/urandom > /data/big.bin\nchown -R xrd /data"
+        )
+        _docker("exec", name, "bash", "-c", start)
+        time.sleep(1)
+        found = {}
+        logs = {}
+        for tag, client in (("theirs", "gfal2"), ("ours", "xgfalclient")):
+            _docker("exec", name, "python3", "/io/slow.py", client, tag, timeout=300)
+            found[tag] = json.loads((io_dir / f"slow_{tag}.json").read_text())
+            logs[tag] = _docker("exec", name, "cat", "/tmp/xrd.log")
+    finally:
+        _docker("rm", "-f", name, check=False)
+    theirs, ours = found["theirs"], found["ours"]
+    report = json.dumps(found, indent=1)
+    assert ours["cancel"] == theirs["cancel"], report
+    assert ours["cancel"][0][:2] == ["err", 125], report  # ECANCELED
+    assert "destination file prematurely closed" in ours["cancel"][0][2]
+    # The same words and events; only the errno differs, deliberately.
+    assert theirs["timeout"][0][1] == 116 and ours["timeout"][0][1] == 110, report
+    assert ours["timeout"][0][2] == theirs["timeout"][0][2], report
+    assert ours["timeout"][1:] == theirs["timeout"][1:], report
+    for label in ("cancel", "timeout"):
+        assert ours[label][2] is False and theirs[label][2] is False, report  # nothing left
+    # The destination heard the cancel on the pull's handle: once for gfal2's
+    # cancel, and for each of this package's stops.
+    theirs_log = logs["theirs"]
+    ours_log = logs["ours"][len(theirs_log) :]
+    assert theirs_log.count("query Qopaqug rc=0") == 1, theirs_log
+    assert ours_log.count("query Qopaqug rc=0") == 2, ours_log
+
+
 if __name__ == "__main__":
     with serving() as box:
         result = differences(run_driver(box))

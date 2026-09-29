@@ -254,6 +254,11 @@ class Gfal2Context:
         instance = cls(self)
         # Swap in a new list, so a thread iterating the old one never sees it change.
         self.plugins = sorted([*self.plugins, instance], key=lambda plugin: plugin.priority)
+        # gfal2's words for a plugin it loads and for the order it then tries them in.
+        _log.info("[gfal_module_load] plugin %s loaded with success ", cls.__module__)
+        _log.debug(" gfal_plugin loaded successfully : %s", cls.__module__)
+        order = "".join(f"{plugin.label} -> " for plugin in self.plugins)
+        _log.debug(" plugin priority order: %s", order)
         return instance
 
     def _load_for(self, *schemes: str) -> None:

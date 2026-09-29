@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import ssl
 from pathlib import Path
 
 import pytest
 
+import xgfalclient
 from conftest import REAL_UID, UNUSED_UID
 from xgfalclient import GError
 from xgfalclient.creds import (
@@ -299,3 +301,40 @@ def test_a_stale_seeded_certificate_is_passed_over(tmp_path: Path) -> None:
     # Seeded and present: used as is.
     options.set_string("X509", "CERT", str(real))
     assert find_x509(options, None, "", {"X509_USER_PROXY": str(real)}) is not None
+
+
+def test_seed_options_says_where_it_looked(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """gfal2's debug lines for each outcome of the credential search."""
+    home = tmp_path / "home"
+    (home / ".globus").mkdir(parents=True)
+    for name in ("usercert.pem", "userkey.pem"):
+        (home / ".globus" / name).write_text("x")
+    xgfalclient.set_verbose(xgfalclient.verbose_level.debug)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="gfal2"):
+            for env in (
+                {"BEARER_TOKEN": "t"},
+                {"X509_USER_PROXY": "/p"},
+                {"X509_USER_CERT": "/c", "X509_USER_KEY": "/k"},
+                {"HOME": str(home)},
+                {},
+            ):
+                _seeded(env)
+    finally:
+        xgfalclient.set_verbose(xgfalclient.verbose_level.verbose)
+    cert, key = home / ".globus" / "usercert.pem", home / ".globus" / "userkey.pem"
+    assert [r.getMessage() for r in caplog.records] == [
+        "Using BEARER token credentials from the env",
+        "Using credentials from X509_USER_PROXY",
+        "Certificate: /p",
+        "Private key: /p",
+        "Using credentials from X509_USER_CERT and X509_USER_KEY",
+        "Certificate: /c",
+        "Private key: /k",
+        "Using credentials from default certificate location",
+        f"Certificate: {cert}",
+        f"Private key: {key}",
+        "Could not find the credentials in any of the known locations",
+    ]
