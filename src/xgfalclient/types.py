@@ -12,6 +12,9 @@ flags read back as ``bool``, and ``scitag`` must be in ``[65, 65535]``.
 Setting ``timeout = 0`` is accepted; the copy engine treats it as "no limit"
 where gfal2's local copy expires at once (README, "Where it differs").
 ``set_checksum`` still accepts a plain int for the mode, which gfal2 does not.
+
+Knowingly friendlier than the bindings' records: fields are writable,
+``Stat`` and ``Dirent`` compare by value and have readable reprs.
 """
 
 from __future__ import annotations

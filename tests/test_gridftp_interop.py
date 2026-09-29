@@ -253,7 +253,10 @@ def collect() -> dict[str, Any]:
         )  # fmt: skip
         _docker(
             "run", "-d", "--name", driver, "--network", network,
-            "-v", f"{work}:/work:ro", "-v", f"{ROOT}:/src:ro",
+            # The package alone: src/ also holds the gfal2 shim, which would
+            # shadow the real gfal2 and compare this package with itself.
+            "-v", f"{work}:/work:ro",
+            "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/src/xgfalclient:ro",
             "-e", "X509_USER_PROXY=/tmp/x509up", "-e", "X509_CERT_DIR=/work/pki/certificates",
             IMAGE, "sleep", "infinity",
         )  # fmt: skip

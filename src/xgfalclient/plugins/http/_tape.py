@@ -20,7 +20,8 @@ gfal2 call                     request
 
 Messages, and errno values, are gfal2's ``[Tape REST API] ...`` ones: a
 malformed answer is ``ENOMSG``, a status other than the one expected
-``EINVAL``, a file reported ``LOST`` ``ENOENT``, ``NONE`` ``EPERM``, and
+``EINVAL`` (but a 401 or 403 to the discovery request is davix's own
+``HTTP 403 : Permission refused``), a file reported ``LOST`` ``ENOENT``, ``NONE`` ``EPERM``, and
 one not there yet (not on disk, not archived, ``UNAVAILABLE`` for now)
 ``EAGAIN``, which a single-file poll reports as ``0``.
 """
@@ -39,7 +40,7 @@ from typing import TYPE_CHECKING, Any, cast
 from ...errors import GError
 from ...plugin import StagingResult
 from ...url import parse
-from ._client import Target, status_text
+from ._client import Target, davix_status, status_text
 
 if TYPE_CHECKING:
     from .plugin import HTTPPlugin
@@ -124,6 +125,10 @@ class TapeREST:
         except GError as exc:
             raise GError(f"{where}: {exc.message}", exc.code) from exc
         payload = response.body()
+        if response.status in (401, 403):
+            # davix fails the request itself on these, before gfal2 sees the answer.
+            code = davix_status(response.status)[0]
+            raise GError(f"{where}: {status_text(response.status)}", code)
         if response.status != 200:
             detail = payload.decode("utf-8", "replace")
             raise GError(f"{where}: {status_text(response.status)}: {detail}", errno.EINVAL)

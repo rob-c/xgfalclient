@@ -127,10 +127,11 @@ def test_event_str_matches_gfal2() -> None:
     assert str(GfaltEvent(9, "d", "s", timestamp=1)).startswith("[1] BOTH")
 
 
-def test_event_defaults_to_now() -> None:
+def test_bare_event_is_the_bindings_zeroed_record() -> None:
     event = GfaltEvent()
-    assert event.side == 2
-    assert event.timestamp > 1_600_000_000_000
+    fields = (event.side, event.timestamp, event.domain, event.stage, event.description)
+    assert fields == (0, 0, "", "", "")
+    assert str(event) == "[0] SOURCE \t\t"
 
 
 def test_event_description_is_cut_to_gfal2s_buffer() -> None:

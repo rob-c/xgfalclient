@@ -96,9 +96,12 @@ unchanged. The only runtime dependency anywhere is the optional `xrdclient`
   parent creation; the plugin moves bytes, emits `transfer.event(...)`
   (`TRANSFER:TYPE` at least), reports `transfer.progress(n)`/`add(n)`, and
   calls `transfer.check()` between chunks (cancellation and timeout).
-  As in gfal2, `monitor_callback` is never fired for a copy shorter than
-  `transfer.MONITOR_INTERVAL`; tests that need a report set it to `0.0`. The
-  core verifies the destination checksum and cleans up on failure.
+  As in gfal2's core, `monitor_callback` is never fired for a copy shorter
+  than `transfer.MONITOR_INTERVAL`; tests that need a report set it to `0.0`.
+  Where gfal2's plugin reports whatever its library reports (each HTTP
+  performance marker, XrdCl's last progress call), the plugin passes
+  `transfer.progress(n, always=True)`. The core verifies the destination
+  checksum and cleans up on failure.
 * For the core's streamed copy to work through a plugin, its `open()` must
   support `O_RDONLY` with `readinto`, and `O_WRONLY|O_CREAT|O_TRUNC` with
   `write`; `open(..., size=N)` passes the source size to writers that must

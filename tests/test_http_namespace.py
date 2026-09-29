@@ -150,9 +150,8 @@ def test_mkdir_rec(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     assert dav.local("/data/a/b/c").is_dir()
     hctx.mkdir_rec(dav.url("/data/a/b/c"), 0o755)  # already there
     write(dav, "/data/file", b"x")
-    with pytest.raises(GError) as caught:
-        hctx.mkdir_rec(dav.url("/data/file"), 0o755)
-    assert caught.value.code == errno.ENOTDIR
+    hctx.mkdir_rec(dav.url("/data/file"), 0o755)  # a file there counts too, as in gfal2
+    assert dav.local("/data/file").is_file()
 
 
 def test_mkdir_rec_in_one_request_when_the_server_makes_parents(
@@ -244,6 +243,26 @@ def test_unlink(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
         errno.EPERM,
         f"DavPosix::unlink  HTTP 423 : Permission refused  with url {dav.url('/data/g')}",
     )
+
+
+@pytest.mark.parametrize("scheme", ["http", "http+3rd"])
+def test_unlink_over_plain_http_is_just_a_delete(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, scheme: str
+) -> None:
+    """davix's plain-HTTP mode: no PROPFIND first, so a collection is the server's call."""
+    url = dav.url("/data/f", scheme)
+    write(dav, "/data/f", b"x")
+    hctx.unlink(url)
+    assert not dav.local("/data/f").exists()
+    assert dav.methods() == ["DELETE"]
+    with pytest.raises(GError) as caught:
+        hctx.unlink(url)
+    assert caught.value.code == errno.ENOENT
+    assert caught.value.message.startswith("DavPosix::unlink  HTTP 404 : File not found  with url")
+    write(dav, "/data/d/x", b"x")
+    with pytest.raises(GError) as caught:
+        hctx.unlink(dav.url("/data/d", scheme))
+    assert caught.value.code == errno.EEXIST  # the server's 409 for a full collection
 
 
 def test_bulk_unlink(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -407,7 +426,7 @@ def test_urls_are_quoted_and_queries_kept(
 def test_invalid_url(hctx: xgfalclient.Gfal2Context) -> None:
     with pytest.raises(GError) as caught:
         hctx.stat("davs:///no/host")
-    assert caught.value.code == errno.EINVAL
+    assert caught.value.code == errno.EHOSTUNREACH  # davix: no host, no resolution
 
 
 def test_two_servers_in_one_context(

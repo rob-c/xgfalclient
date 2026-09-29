@@ -80,7 +80,7 @@ import uuid
 from collections.abc import Iterator, Sequence
 
 from ..errors import GError
-from ..plugin import O_RDONLY, O_WRONLY, Plugin, PluginFile, StagingResult
+from ..plugin import O_RDONLY, O_WRONLY, DirEntry, Plugin, PluginFile, StagingResult
 from ..transfer import Transfer
 from ..types import Stat
 
@@ -197,6 +197,11 @@ def _fail(code: int) -> GError:
     return GError(os.strerror(code), code)
 
 
+def _not_ready() -> GError:
+    """A poll of a file still pending: gfal2's mock words it this way."""
+    return GError("Not ready", errno.EAGAIN)
+
+
 def _now() -> int:
     """``time(NULL)``: gfal2's staging clock has whole seconds."""
     return int(time.time())
@@ -224,13 +229,14 @@ def _load_time_signal(path: str = _CMDLINE) -> None:
             return
 
 
-def _entries(listing: str) -> Iterator[tuple[str, Stat]]:
+def _entries(listing: str) -> Iterator[tuple[str, Stat, int]]:
     """gfal2's ``opendir`` parse of ``list=``, including where its ``strtol`` calls stop.
 
     An entry is ``name[:mode[:size]]`` with an octal mode (``S_IFREG`` added
     when it has no type bits). gfal2 reads the size one character past the
     end of the mode - normally the ``:`` - so a size-less entry takes its
-    size from the start of the next entry.
+    size from the start of the next entry. ``d_type`` stays 0: gfal2 never
+    sets it.
     """
     position = 0
     while True:
@@ -251,7 +257,7 @@ def _entries(listing: str) -> Iterator[tuple[str, Stat]]:
             stop = len(name) + 1 + used
             tail = token[stop + 1 :] if stop < len(token) else listing[end + 1 :]
             size = _strtol(tail)[0] % _ULLONG  # gfal2's bindings print it unsigned
-        yield name[:255], Stat(st_mode=mode, st_size=size)
+        yield name[:255], Stat(st_mode=mode, st_size=size), 0
         position = end + 1
 
 
@@ -365,7 +371,7 @@ class MockPlugin(Plugin):
     def unlink(self, url: str) -> None:
         self.stat(url)
 
-    def opendir(self, url: str) -> Iterator[tuple[str, Stat | None]]:
+    def opendir(self, url: str) -> Iterator[DirEntry]:
         if not self.stat(url).is_dir():
             raise _fail(errno.ENOTDIR)
         return iter(list(_entries(_value(url, "list", _LIST))))
@@ -437,7 +443,7 @@ class MockPlugin(Plugin):
             if end is None or end <= _now():
                 results.append(_fail(code) if code else True)
             else:
-                results.append(False)
+                results.append(_not_ready())
         return results
 
     def release(self, urls: Sequence[str], token: str) -> list[GError | None]:
@@ -459,7 +465,7 @@ class MockPlugin(Plugin):
                 done = end <= _now()
                 if done:
                     del _archiving_end[url]  # the next poll starts the clock again
-            results.append((_fail(code) if code else True) if done else False)
+            results.append((_fail(code) if code else True) if done else _not_ready())
         return results
 
     # -- copies ------------------------------------------------------------------

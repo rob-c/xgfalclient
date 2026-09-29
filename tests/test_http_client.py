@@ -417,10 +417,60 @@ def test_targets() -> None:
     assert target.path == "/a%20b?authz=T&x=1"
     assert Target.of("dav://h/p").host_header == "h"
     assert Target.of("davs+3rd://h").path == "/"
-    assert Target.of("https://h:x/").port == 443
+    assert Target.of("https://h:/").port == 443
     assert Target.of("http://u:p@h:81/").base == "http://h:81"
-    with pytest.raises(GError):
-        Target.of("root://h/p")
+    # What neon's URI parser refuses, davix calls "not a valid HTTP or Webdav URL" (EIO)
+    for bad in ("root://h/p", "https://h:x/", "https://[::1/x", "https://[::1]:bad/x"):
+        with pytest.raises(GError) as caught:
+            Target.of(bad)
+        assert (caught.value.code, caught.value.message) == (
+            errno.EIO,
+            f" {bad} is not a valid HTTP or Webdav URL",
+        )
+    # ... but an empty host it takes, and fails to resolve.
+    with pytest.raises(_client.TransportError) as refused:
+        Target.of("davs:///x")
+    assert (refused.value.code, refused.value.message) == (
+        errno.EHOSTUNREACH,
+        "Domain name resolution failed",
+    )
+
+
+def test_invalid_urls_through_the_context(hctx: xgfalclient.Gfal2Context) -> None:
+    with pytest.raises(GError) as caught:
+        hctx.stat("https://[::1/x")
+    assert (caught.value.code, caught.value.message) == (
+        errno.EIO,
+        "Result  https://[::1/x is not a valid HTTP or Webdav URL after 1 attempts",
+    )
+    with pytest.raises(GError) as caught:
+        hctx.open("davs://h:port/x", "r")
+    assert (caught.value.code, caught.value.message) == (errno.EIO, " Uri invalid in Davix::Open")
+    with pytest.raises(GError) as caught:
+        hctx.stat("http://")
+    assert (caught.value.code, caught.value.message) == (
+        errno.EHOSTUNREACH,
+        "Result Domain name resolution failed after 1 attempts",
+    )
+    with pytest.raises(GError) as caught:
+        hctx.mkdir("s3://h:bad/b/x", 0o755)  # named as given, not as the marker object
+    assert caught.value.message == " s3://h:bad/b/x is not a valid HTTP or Webdav URL"
+    # unlink words everything in davix's DavPosix::unlink scope, even with no PROPFIND first
+    with pytest.raises(GError) as caught:
+        hctx.unlink("https://h:bad/x")
+    assert caught.value.message == (
+        "DavPosix::unlink  Result  https://h:bad/x is not a valid HTTP or Webdav URL"
+        " after 1 attempts"
+    )
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    with pytest.raises(GError) as caught:
+        hctx.unlink(f"http://127.0.0.1:{port}/x")
+    assert (caught.value.code, caught.value.message) == (
+        errno.ECONNREFUSED,
+        "DavPosix::unlink  Could not connect to server",
+    )
 
 
 def test_url_helpers() -> None:

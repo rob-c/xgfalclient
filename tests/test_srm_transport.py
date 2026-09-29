@@ -154,6 +154,8 @@ def test_network_error_wording() -> None:
     assert _network_error(surl, "Ls", GSIError("bad name")).code == ECOMM
     assert _network_error(surl, "Ls", ssl.SSLError("x")).code == ECOMM
     assert "OSError" in _network_error(surl, "Ls", OSError()).message
+    unknown = _network_error(surl, "Ls", socket.gaierror(socket.EAI_NONAME, "Name unknown"))
+    assert unknown.code == ECOMM and unknown.message.endswith(": Host not found: Name unknown\n")
     garbled = _network_error(surl, "Ls", http.client.BadStatusLine("junk"))
     assert garbled.code == ECOMM and garbled.message.endswith(": junk\n")
 

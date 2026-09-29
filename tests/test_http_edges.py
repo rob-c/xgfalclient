@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import errno
 import http.client
+import logging
 import socket
 from pathlib import Path
 
@@ -118,6 +119,27 @@ def test_delegation_without_a_proxy(hctx: xgfalclient.Gfal2Context, dav: WebDAVS
     with pytest.raises(GError) as caught:
         _delegation.delegate(plugin(hctx), dav.base + DELEGATION, dav.url("/x"))
     assert caught.value.code == errno.EACCES
+
+
+def test_a_credential_that_will_not_load_is_left_out(
+    hctx: xgfalclient.Gfal2Context,
+    davs_open: WebDAVServer,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # gfal2 warns and goes on without it (upstream's own example does this):
+    # a token, or a server that wants no certificate, still gets through.
+    write(davs_open, "/data/f", b"hello")
+    url = davs_open.url("/data/f")
+    hctx.cred_set(url, hctx.cred_new("X509_CERT", str(tmp_path / "missing.pem")))
+    with caplog.at_level(logging.WARNING, logger="gfal2"):
+        assert hctx.stat(url).st_size == 5
+        assert hctx.token_retrieve(url, "", 60, False) == davs_open.macaroons[0]["macaroon"]
+    assert len(caplog.messages) == 2  # the stat, and the macaroon request (X.509 only)
+    assert all(
+        message.startswith("Could not load the user credentials: Could not load the X.509")
+        for message in caplog.messages
+    )
 
 
 def test_delegation_that_never_arrives(

@@ -180,6 +180,7 @@ def list_objects(plugin: HTTPPlugin, url: str) -> list[tuple[str, Stat | None]]:
 
 def mkdir(plugin: HTTPPlugin, url: str) -> None:
     """A zero-length object named ``<path>/``: what davix makes for a directory (S3 too)."""
+    Target.of(url)  # a URL davix refuses is refused by the name it was given
     parsed = parse(url)
     path = parsed.path or "/"
     marker = str(parsed.with_path(path if path.endswith("/") else path + "/"))

@@ -110,23 +110,26 @@ def _truncate(description: str) -> str:
 
 
 class GfaltEvent:
-    """One event: ``side`` (an int), ``timestamp`` (ms), ``domain``, ``stage``, ``description``."""
+    """One event: ``side`` (an int), ``timestamp`` (ms), ``domain``, ``stage``, ``description``.
+
+    Built bare it is the bindings' zeroed record: ``SOURCE`` side, timestamp 0.
+    """
 
     __slots__ = ("description", "domain", "side", "stage", "timestamp")
 
     def __init__(
         self,
-        side: int = BOTH,
+        side: int = SOURCE,
         domain: str = "",
         stage: str = "",
         description: str = "",
-        timestamp: int | None = None,
+        timestamp: int = 0,
     ) -> None:
         self.side = int(side)
         self.domain = domain
         self.stage = stage
         self.description = _truncate(description)
-        self.timestamp = now_ms() if timestamp is None else timestamp
+        self.timestamp = timestamp
 
     def __str__(self) -> str:
         label = _SIDE_LABELS.get(self.side, "BOTH")

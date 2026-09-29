@@ -393,6 +393,7 @@ class Command:
         self.context: Gfal2Context
         self.progress_bar: Progress | None = None
         self.running = False
+        self.interrupted = False
         self.return_code: int | None = -1
         self.prog = self.progr = ""
         self.parser: argparse.ArgumentParser
@@ -452,6 +453,7 @@ class Command:
 
     def _interrupted(self) -> int:
         sys.stderr.write("Caught keyboard interrupt. Canceling...")
+        self.interrupted = True
         previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             canceller = threading.Thread(target=self.context.cancel, daemon=True)
@@ -468,10 +470,13 @@ class Command:
         try:
             self.return_code = func(self)
         except GError as exc:
-            sys.stdout.flush()
-            sys.stderr.write(
-                f"{self.prog} error: {exc.code} ({os.strerror(exc.code)}) - {exc.message}\n"
-            )
+            # The ECANCELED of a Ctrl-C'd command is not reported: gfal2-util
+            # has returned (EINTR) before its thread gets to say anything.
+            if not self.interrupted:
+                sys.stdout.flush()
+                sys.stderr.write(
+                    f"{self.prog} error: {exc.code} ({os.strerror(exc.code)}) - {exc.message}\n"
+                )
             self.return_code = exc.code if 0 <= exc.code <= 255 else 255
         except OSError as exc:
             if exc.errno != errno.EPIPE:

@@ -63,12 +63,19 @@ Where this deliberately differs from gfal2:
   fails alone; gfal2 aborts the whole pipeline with one error.
 * A destination that fails its checksum is removed (``CLEANUP``), as the
   README says of every copy; gfal2 leaves it.
+* A single third-party copy compares the two sizes afterwards (``EIO`` if
+  they differ); gfal2 does that only for a bulk copy.
+* A bulk copy between ``ftp://`` URLs works; gfal2's fails as a whole with
+  ``ECOMM`` "No user supplied", its pipeline never logging in.
 * ``BLOCK_SIZE`` sets the buffer this client's own data movers use; gfal2
   means to set globus' buffer but passes it 0.
 * A seek while writing finishes the ``STOR`` cleanly before the ``ESTO``
   writes; gfal2 aborts it.
 * A ``229`` reply's ``h1,h2,...`` form is read correctly for the PASV
   events; gfal2 shifts its numbers by one.
+* ``GFAL2_GRIDFTP_DEBUG`` is not read: the control channel's commands and
+  replies are logged at debug level to the ``gfal2`` logger instead of
+  globus' debug output on stderr.
 """
 
 from __future__ import annotations
@@ -93,7 +100,7 @@ from ..._version import GFAL2_VERSION
 from ...checksum import checksums_match
 from ...crypto.der import DERError
 from ...crypto.x509 import Credential, load_credential
-from ...errors import GError
+from ...errors import ECOMM, GError
 from ...plugin import O_ACCMODE_MASK, O_CREAT, O_RDONLY, O_WRONLY, Plugin, PluginFile
 from ...types import Stat
 from ...url import URL, parse, scheme_of
@@ -213,6 +220,18 @@ def _explicit_port(url: URL) -> int:
     return int(text) if text.isdigit() else 0
 
 
+def _check_url(url: URL) -> None:
+    """``globus_url_parse``'s refusals, before any credential.
+
+    No host, or a port that does not start with a digit (globus reads the
+    leading number of ``h:0x``, as ``sscanf`` would).
+    """
+    tail = url.netloc.rpartition("@")[2].rpartition("]")[2]
+    port = tail.rpartition(":")[2] if ":" in tail else "0"
+    if not url.host or not port[:1].isdigit():
+        raise GError("globus_ftp_client: an invalid value for url was used ", ECOMM)
+
+
 def lookup_host(host: str, ipv6: bool) -> tuple[str, bool]:
     """gfal2's ``lookup_host``: an address of ``host`` and whether it has an IPv6 one.
 
@@ -311,6 +330,7 @@ class GridFTPPlugin(Plugin):
         return found
 
     def _profile(self, url: URL) -> _Profile:
+        _check_url(url)
         text = str(url)
         timeout = float(self.option_timeout())
         if url.scheme == "gsiftp":

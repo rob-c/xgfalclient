@@ -29,7 +29,11 @@ as gfal2 creates it), and pipes one into the other until the source says
 EOF - so ``/proc`` files and FIFOs copy, whatever their ``st_size``.
 ``monitor_callback`` fires, as in gfal2's local copy, only once more than
 five seconds have passed since the last report, with no final report;
-plugin copies report every second.
+plugin copies report every second. (gfal2 counts whole seconds of
+``time()``, so its first report lands somewhere between 5 and 6 seconds in
+and says 6; this one comes at 5 and says 5.) ``[CORE] COPY_DIRECT_IO`` and
+``COPY_BUFFER_ALIGNMENT`` (``O_DIRECT`` streaming, off by default) are not
+honoured.
 
 The stream is pipelined. A reader thread fills a small ring of buffers while
 the calling thread drains them into the destination, so the source and the
@@ -72,7 +76,7 @@ from . import events as ev
 from ._log import LOGGER
 from .checksum import checksums_match, format_adler32, normalise_name
 from .enums import checksum_mode
-from .errors import GError
+from .errors import GError, from_oserror
 from .plugin import O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Plugin, PluginFile
 from .types import TransferParameters
 from .url import parent
@@ -105,7 +109,7 @@ def emit(
 
     An exception from the callback propagates: it aborts the copy.
     """
-    event = ev.GfaltEvent(side, domain, stage, description)
+    event = ev.GfaltEvent(side, domain, stage, description, ev.now_ms())
     callback = params.event_callback
     if callback is not None:
         _call(callback, event)
@@ -221,35 +225,42 @@ class Transfer:
 
     # -- progress ----------------------------------------------------------------
 
-    def progress(self, transferred: int, *, force: bool = False) -> None:
-        """Record the absolute byte count; fire ``monitor_callback`` at most once an interval."""
+    def progress(self, transferred: int, *, force: bool = False, always: bool = False) -> None:
+        """Record the absolute byte count; fire ``monitor_callback`` at most once an interval.
+
+        ``always`` fires it now, however short the copy: for plugins whose
+        gfal2 counterpart reports every step its library reports - each HTTP
+        performance marker (davix), each XrdCl progress call - rather than
+        on the core's clock.
+        """
         with self._lock:
             self.transferred = transferred
-        self._report(force)
+        self._report(force, always)
 
     def add(self, count: int) -> None:
         """Add ``count`` bytes to the running total; safe from several threads."""
         with self._lock:
             self.transferred += count
-        self._report(False)
+        self._report(False, False)
 
-    def _report(self, force: bool) -> None:
+    def _report(self, force: bool, always: bool) -> None:
         callback = self.params.monitor_callback
         if callback is None:
             return
         with self._lock:
             now = time.monotonic()
             interval = self.monitor_interval
-            # Like gfal2, a copy shorter than one interval is never reported,
-            # and ``force`` only flushes the final figure of a longer one.
-            if now - self.started < interval:
-                return
-            if not force and now - self._last_report < interval:
-                return
+            # Like gfal2's core, a copy shorter than one interval is never
+            # reported, and ``force`` only flushes the final figure of a longer one.
+            if not always:
+                if now - self.started < interval:
+                    return
+                if not force and now - self._last_report < interval:
+                    return
             transferred = self.transferred
             elapsed = now - self.started
             window = max(now - self._last_report, 1e-9)
-            average = int(transferred / elapsed)
+            average = int(transferred / max(elapsed, 1e-9))
             instant = int((transferred - self._last_bytes) / window)
             self._last_report, self._last_bytes = now, transferred
         try:
@@ -599,7 +610,8 @@ def stream(transfer: Transfer) -> None:
     except GError as exc:
         raise GError(f"Could not open source: {exc.message}", exc.code) from exc
     if info.is_dir():
-        raise GError(f"{transfer.source} is a directory", errno.EISDIR)
+        # gfal2 opens it and fails on the first read, in the file plugin's words.
+        raise from_oserror(OSError(errno.EISDIR, ""))
     transfer.source_size = info.st_size
     size = info.st_size if stat_module.S_ISREG(info.st_mode) and info.st_size > 0 else None
     try:

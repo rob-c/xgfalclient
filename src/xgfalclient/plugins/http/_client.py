@@ -174,8 +174,11 @@ class Target:
     def of(cls, url: str, *, s3: bool = False) -> Target:
         parsed = parse(url)
         scheme = wire_scheme(parsed.scheme)
-        if not scheme or not parsed.host:
-            raise GError(f"Invalid URL: {url}", errno.EINVAL)
+        if not scheme or not valid_authority(parsed.netloc):
+            raise GError(f" {url} is not a valid HTTP or Webdav URL", errno.EIO)
+        if not parsed.host:
+            # davix takes an empty host and fails to resolve it.
+            raise TransportError("Domain name resolution failed", errno.EHOSTUNREACH)
         explicit = _explicit_port(parsed.netloc)
         port = explicit or (443 if scheme == "https" else 80)
         raw = parsed.path or "/"
@@ -195,6 +198,17 @@ class Target:
     def base(self) -> str:
         """``scheme://host:port`` - where server-rooted APIs live."""
         return f"{self.scheme}://{self.host_header}"
+
+
+def valid_authority(netloc: str) -> bool:
+    """Whether davix (neon's URI parser) takes ``netloc``: a closed ``[...]``, a numeric port."""
+    host = netloc.rpartition("@")[2]
+    if host.startswith("["):
+        if "]" not in host:
+            return False
+        host = host.rpartition("]")[2]
+    port = host.partition(":")[2]
+    return not port or port.isdigit()
 
 
 def _explicit_port(netloc: str) -> int:
@@ -223,6 +237,8 @@ class TransportError(GError):
 
 #: The scope in which davix reads 405 and 409 as a directory question.
 MKDIR = "mkdir"
+#: An upload: a 409 there means the parent collection is missing (RFC 4918).
+PUT = "put"
 
 _EHOSTDOWN = getattr(errno, "EHOSTDOWN", errno.EIO)
 
@@ -256,6 +272,12 @@ def davix_status(status: int, scope: str = "") -> tuple[int, str]:
     if status == 409:
         if scope == MKDIR:
             return errno.ENOENT, "Conflict, File not Found"
+        if scope == PUT:
+            # davix's words, but not its EEXIST: a PUT's 409 is a missing
+            # parent, and "File exists" would read as an existing target to
+            # anything matching on it (the ATLAS pilot does). gfal2 itself
+            # reports a stale errno here.
+            return errno.ENOENT, "Conflict, File Exist"
         return errno.EEXIST, "Conflict, File Exist"
     return _DAVIX.get(status, (errno.EIO, f"Unexpected server error: {status}"))
 
@@ -746,14 +768,29 @@ class HTTPClient:
 
     # -- credentials ---------------------------------------------------------------
 
+    def tls(self, url: str) -> ssl.SSLContext:
+        """The TLS context for ``url``, with its X.509 credential when that loads.
+
+        One that does not (a missing or unreadable file) is left out with a
+        warning, as gfal2's ``get_certificate`` does: the request goes ahead
+        without it, so a token or a server that asks for no certificate
+        still works.
+        """
+        try:
+            return self.context.ssl_context(url, group=self.group)
+        except GError as exc:
+            _log.warning("Could not load the user credentials: %s", exc.message)
+            return self.context.ssl_context(url, group=self.group, x509=False)
+
     def auth(self, url: str) -> Auth:
         """How to authorise requests for ``url``, as gfal2's ``get_credentials`` does.
 
         The TLS context always carries the X.509 credential, if there is one:
         gfal2 presents it whatever else it sends.
         """
+        Target.of(url)  # a URL davix refuses fails as such, before any lookup
         parsed = parse(url)
-        tls = self.context.ssl_context(url, group=self.group)
+        tls = self.tls(url)
         scheme = parsed.scheme.partition("+")[0]
         if scheme in ("cs3", "cs3s"):
             configured = self.context.options.string("BEARER", "TOKEN")

@@ -415,6 +415,42 @@ def test_keyboard_interrupt_cancel_hangs(
     assert err.endswith("Canceling...failed to cancel after waiting some time\n")
 
 
+def test_keyboard_interrupt_hides_the_cancellation_error(
+    run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # gfal2-util has returned EINTR before its thread reports the ECANCELED
+    go = threading.Event()
+    workers: list[threading.Thread] = []
+
+    def interrupted(worker: threading.Thread, timeout: float | None) -> None:
+        workers.append(worker)
+        raise KeyboardInterrupt
+
+    def slow(self: Gfal2Context, path: str) -> Stat:
+        go.wait(10)
+        raise GError("Transfer canceled", errno.ECANCELED)
+
+    def cancel(self: Gfal2Context) -> int:
+        go.set()
+        workers[0].join(10)
+        return 1
+
+    monkeypatch.setattr(base, "_wait", interrupted)
+    monkeypatch.setattr(Gfal2Context, "stat", slow)
+    monkeypatch.setattr(Gfal2Context, "cancel", cancel)
+    code, _, err = run("stat", url(tree))
+    assert code == errno.EINTR
+    assert err.endswith("Caught keyboard interrupt. Canceling...")
+
+
+def test_chmod_negative_mode(run: Run, tree: Path) -> None:
+    before = (tree / "a.txt").stat().st_mode
+    code, _, err = run("chmod", "--", "-1", url(tree / "a.txt"))
+    assert code == 255
+    assert err.endswith("OverflowError: can't convert negative value to unsigned int\n")
+    assert (tree / "a.txt").stat().st_mode == before
+
+
 def test_python_dash_m(capsys: pytest.CaptureFixture[str], tree: Path) -> None:
     assert module_main(["gfal2_version", "--ignored"]) == 0
     assert module_main(["gfal_srm_ifce_version"]) == 0

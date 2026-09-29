@@ -90,9 +90,13 @@ then sends ``root://h/p`` as the relative path ``p``, which a stock server
 refuses); ``PARALLEL_COPIES`` (a bulk copy runs one file at a time through
 the core); falling back from a pull to a stream for non-``root`` pairs
 (XrdCl's ``thirdParty=first``), which gfal2 does not do against a stock
-server either. XrdCl sets ``XrdSecGSIDELEGPROXY`` process-wide for a pull, so
-that every later login in the process follows the last pull's setting;
-here only the pull's destination login does, and everything else follows
+server either; the ``xrd.gsiusrpxy=`` (or ``xrd.gsiusrcrt=``/``gsiusrkey=``)
+CGI gfal2 adds to a URL whose X.509 credential came from ``cred_set``: the
+credential reaches xrdclient through its configuration instead, so only
+the copy events' URLs read differently. XrdCl sets
+``XrdSecGSIDELEGPROXY`` process-wide for a pull, so that every later login
+in the process follows the last pull's setting; here only the pull's
+destination login does, and everything else follows
 the environment (``gfal-copy`` exports ``XrdSecGSIDELEGPROXY=1``, as
 upstream's does, which xrdclient honours by signing the server's proxy
 request at login, as XrdCl does).
@@ -1324,7 +1328,7 @@ class XRootDPlugin(Plugin):
             except GError:
                 raise exc from None
             size = self._pull(transfer, job)
-        transfer.progress(size, force=True)
+        transfer.progress(size, always=True)  # XrdCl's last JobProgress, however short
 
     def _pull(self, transfer: Transfer, job: _Rendezvous) -> int:
         """The rendezvous, in a worker; this thread watches the clock.
@@ -1416,7 +1420,7 @@ class XRootDPlugin(Plugin):
                 self._download_serially(transfer, source, config, fd)
         finally:
             os.close(fd)
-        transfer.progress(transfer.transferred, force=True)
+        transfer.progress(transfer.transferred, always=True)  # XrdCl's last JobProgress
 
     def _download_serially(
         self, transfer: Transfer, source: XRootDURL, config: Config, fd: int
@@ -1431,7 +1435,7 @@ class XRootDPlugin(Plugin):
         os.ftruncate(fd, 0)
         writer = LocalFile(transfer.destination, local_path(transfer.destination), os.O_WRONLY, 0)
         try:
-            pump(transfer, reader, writer)
+            pump(transfer, reader, writer, final_report=False)  # the caller reports
         finally:
             writer.close()
             reader.close()
@@ -1476,7 +1480,8 @@ class XRootDPlugin(Plugin):
                 if _Upload.usable(handle):
                     moved = _Upload(transfer, reader, writer, handle).run()
                 else:
-                    moved = pump(transfer, reader, writer)
+                    moved = pump(transfer, reader, writer, final_report=False)
+                    transfer.progress(moved, always=True)
             except BaseException:
                 # The failure is the news, not the close that follows it on
                 # a connection it may have left unusable.
@@ -2000,7 +2005,7 @@ class _Upload:
         for offset, length in self.again:
             self.writer.pwrite(self.reader.pread(offset, length), offset)
             self._acked(length)
-        self.transfer.progress(self.done, force=True)
+        self.transfer.progress(self.done, always=True)
         return self.done
 
     def _stream(self) -> None:

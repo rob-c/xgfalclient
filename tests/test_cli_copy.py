@@ -267,6 +267,35 @@ def test_copy_force_retries_after_eexist(
     assert calls == [target, target]
 
 
+def test_copy_force_reports_an_eexist_with_nothing_to_remove(
+    run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 409 for a missing parent is EEXIST too: the copy's error, not the unlink's ENOENT."""
+
+    def conflict(self: Gfal2Context, *args: Any) -> Any:
+        raise GError("TRANSFER ERROR: HTTP 409 : Conflict, File Exist  (destination)", errno.EEXIST)
+
+    monkeypatch.setattr(Gfal2Context, "filecopy", conflict)
+    source, target = url(tree / "a.txt"), url(tree / "no" / "f")
+    code, _out, err = run("-f", source, target)
+    assert (code, err) == (
+        errno.EEXIST,
+        "gfal-copy error: 17 (File exists) - "
+        "TRANSFER ERROR: HTTP 409 : Conflict, File Exist  (destination)\n",
+    )
+
+    # Any other failure to remove it is reported as gfal2-util reports it.
+    def refused(self: Gfal2Context, path: str) -> int:
+        raise GError("Permission denied", errno.EACCES)
+
+    monkeypatch.setattr(Gfal2Context, "unlink", refused)
+    code, _out, err = run("-f", source, target)
+    assert (code, err) == (
+        errno.EACCES,
+        "gfal-copy error: 13 (Permission denied) - Permission denied\n",
+    )
+
+
 def test_copy_lfc_destination_warns(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original = Gfal2Context.stat
 

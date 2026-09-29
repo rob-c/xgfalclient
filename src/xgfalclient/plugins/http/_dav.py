@@ -3,7 +3,9 @@
 A multistatus is parsed with :mod:`xml.etree`, which never fetches an
 external entity, and a body that declares a DTD at all is refused before it
 is parsed - an entity-expansion bomb is a DTD feature, and no WebDAV server
-needs one.
+needs one. A body that does not parse is ``EIO`` ``XML Parsing Error: ...``
+as in davix, but the rest of the message is expat's diagnosis, not
+libxml2's (``XML parse error at line 1: Document is empty``).
 
 The ``stat`` a ``<D:response>`` becomes is davix's: WebDAV has no owner and
 no permissions, so the mode is ``0777`` plus the file type, uid, gid, nlink

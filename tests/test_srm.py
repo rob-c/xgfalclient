@@ -85,6 +85,13 @@ def test_stat_missing(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
     )
 
 
+def test_bare_scheme_is_nobodys(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
+    plugin = sctx.plugin(srm.url("/f"), "stat")
+    assert plugin.handles("SRM://h/f", "stat")
+    assert not plugin.handles("srm://", "stat") and not plugin.handles("file:///f", "stat")
+    fails(errno.EPROTONOSUPPORT, sctx.stat, "srm://")
+
+
 def test_listdir_and_opendir(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
     assert sctx.listdir(srm.url("/data")) == ["f", "sub"]
     entries = [(entry.d_name, info.st_size) for entry, info in _readpp(sctx, srm.url("/data"))]

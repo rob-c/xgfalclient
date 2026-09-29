@@ -355,6 +355,9 @@ def _network_error(surl: SURL, short: str, exc: BaseException) -> GError:
         return ifce_error(errno.ECONNREFUSED, f"{where}: Connection refused")
     if isinstance(exc, (ssl.SSLError, GSIError)):
         return ifce_error(ECOMM, f"{where}: CGSI-gSOAP: Error during the GSI handshake: {exc}")
+    if isinstance(exc, socket.gaierror):
+        # getaddrinfo's codes are negative and no errno; gSOAP fails the send.
+        return ifce_error(ECOMM, f"{where}: Host not found: {exc.strerror}")
     if isinstance(exc, OSError) and exc.errno:
         return ifce_error(exc.errno, f"{where}: {os.strerror(exc.errno)}")
     return ifce_error(ECOMM, f"{where}: {str(exc) or type(exc).__name__}")

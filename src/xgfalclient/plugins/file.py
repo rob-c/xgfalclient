@@ -17,6 +17,11 @@ what it points to, and a dangling link fails the long listing with
 Files ``ctx.open`` creates are ``0744`` before the umask, the mode gfal2's
 ``open`` passes; a FIFO or other unseekable file is read and written in
 order rather than by offset, so the core can stream from ``/proc`` and pipes.
+
+Knowingly different: ``symlink`` takes any target text (a relative path, or
+a URL of another scheme, written into the link as it is); gfal2 wants the
+target to be a ``file://`` URL too and refuses anything else with
+``EPROTONOSUPPORT``.
 """
 
 from __future__ import annotations

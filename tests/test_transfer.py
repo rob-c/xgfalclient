@@ -253,6 +253,7 @@ def test_local_copy_narrates_like_gfal2(ctx: Gfal2Context, src: Path, tmp_path: 
     ]
     assert {e.domain for e in events[3:]} == {"GFAL2:CORE:COPY:LOCAL"}
     assert events[6].description == "streamed"
+    assert all(e.timestamp > 1_600_000_000_000 for e in events)  # ms since the epoch
 
 
 def test_copy_onto_itself_is_refused(ctx: Gfal2Context, src: Path) -> None:
@@ -543,7 +544,10 @@ def test_stream_source_failures(ctx: Gfal2Context, tmp_path: Path) -> None:
     assert caught.value.message == "Could not open source: Permission denied"
     with pytest.raises(GError) as caught:
         run_copy(ctx, TransferParameters(), file_url(tmp_path), file_url(tmp_path / "x"))
-    assert caught.value.code == errno.EISDIR
+    assert (caught.value.code, caught.value.message) == (
+        errno.EISDIR,
+        "errno reported by local system call Is a directory",
+    )
     with pytest.raises(GError) as caught:
         run_copy(
             ctx, TransferParameters(), "mock://h/s?size=3&open_errno=5", file_url(tmp_path / "x")

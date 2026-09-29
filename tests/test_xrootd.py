@@ -1660,6 +1660,43 @@ def test_a_pull_without_a_timeout_between_progress_reports(
     assert 6 not in done
 
 
+def test_a_short_copy_still_reports_its_size_once(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    target: FakeServer,
+    base: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # gfal2's xrootd plugin reports each XrdCl JobProgress, and XrdCl makes
+    # one for the last chunk however quick the copy: never none, never two.
+    from xrdclient.client import bulk
+
+    monkeypatch.setattr(xgfalclient.transfer, "MONITOR_INTERVAL", 3600.0)  # load-proof
+    (tmp_path / "src").write_bytes(b"x" * 5000)
+
+    def copy(source: str, destination: str) -> list[int]:
+        params = ctx.transfer_parameters()
+        seen: list[int] = []
+        params.monitor_callback = lambda s, d, avg, inst, moved, elapsed: seen.append(moved)
+        ctx.filecopy(params, source, destination)
+        return seen
+
+    assert copy(f"file://{tmp_path}/src", base + "/up/short") == [5000]
+    assert copy(base + "/up/short", f"file://{tmp_path}/back") == [5000]
+    Puller(server, target)
+    assert copy(_url(server) + "/data/a.txt", _url(target) + "/pulled") == [len(HELLO)]
+    # The same one-request-at-a-time, where the fast paths are not to be had.
+    monkeypatch.setattr(xrootd._Upload, "usable", staticmethod(lambda handle: False))
+    assert copy(f"file://{tmp_path}/src", base + "/up/plain") == [5000]
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise bulk.BulkUnsupported("not here")
+
+    monkeypatch.setattr(bulk, "download", refuse)
+    assert copy(base + "/data/a.txt", f"file://{tmp_path}/serial") == [len(HELLO)]
+
+
 def test_progress_is_quiet_until_the_destination_exists(
     ctx: xgfalclient.Gfal2Context, plugin: XRootDPlugin, target: FakeServer
 ) -> None:

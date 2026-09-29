@@ -306,6 +306,15 @@ def test_connection_refused(gctx: Ctx) -> None:
     assert message.startswith(f"globus_xio: Unable to connect to 127.0.0.1:{port}")
 
 
+@pytest.mark.parametrize("url", ["gsiftp://", "gsiftp://h:bad/x", "ftp://[::1]:x/f", "ftp://h:/f"])
+def test_url_globus_cannot_parse(gctx: Ctx, url: str) -> None:
+    # Refused before any credential is looked for, as globus_url_parse does.
+    assert code_of(lambda: gctx.stat(url)) == (
+        ECOMM,
+        "globus_ftp_client: an invalid value for url was used ",
+    )
+
+
 def test_gsi_login_details(gctx: Ctx, gsi: GridFTPServer) -> None:
     write(root_of(gsi) / "f", b"x")
     gctx.stat(gsi.url("/f"))

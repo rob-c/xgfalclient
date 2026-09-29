@@ -14,7 +14,11 @@ also prints `` error in request of <what>: <error>`` on standard error,
 which this does too. Where gfal2 would crash on a reply that is not a CDMI
 object, or has no ``capabilitiesURI``, this reports ``EPROTO`` or an empty
 class; and json-c's escaping of ``/`` as ``\\/`` in a class list is not
-reproduced.
+reproduced. gfal2's http plugin claims the QoS calls for any URL at all, so
+there a ``root://`` or ``file://`` one is sent to davix as HTTP and fails
+with whatever the far end makes of that (``ECOMM`` from an XRootD port);
+here the calls belong to the HTTP schemes, and any other URL is
+``EPROTONOSUPPORT``.
 """
 
 from __future__ import annotations

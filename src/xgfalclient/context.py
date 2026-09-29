@@ -24,7 +24,9 @@ plugin without ``access``; a bulk ``unlink`` routes each URL to its own
 plugin (gfal2 sends them all to the first URL's); ``rename`` across two
 plugins is refused with ``EPROTONOSUPPORT`` where gfal2 silently does
 nothing; client info is percent-encoded byte for byte, where gfal2 mangles
-non-ASCII bytes to ``%FF``; ``read(0)`` and ``write("")`` succeed; and
+non-ASCII bytes to ``%FF``; ``read(0)`` and ``write("")`` succeed;
+``read``/``pread`` of bytes that are not UTF-8 return them surrogate-escaped
+(gfal2 raises ``UnicodeDecodeError`` and the bytes are lost); and
 ``cancel()`` never waits for operations running on the calling thread (a
 callback that cancels its own copy would deadlock gfal2); and a second
 ``free()`` does nothing rather than raise.
@@ -234,6 +236,8 @@ class Gfal2Context:
         #: Running operations per thread, so ``cancel()`` never waits for its own.
         self._running_by_thread: dict[int, int] = {}
         self._cancelling = 0
+        #: Threads with a ``cancel()`` draining -> how many; see :meth:`_release_drained`.
+        self._drains: dict[int, int] = {}
         self._lock = threading.Lock()
         self._idle = threading.Condition(self._lock)
         self._freed = False
@@ -298,7 +302,11 @@ class Gfal2Context:
             raise self._no_plugin(url)
         return found
 
-    def _find(self, url: str, operation: str) -> Plugin | None:
+    def _find(self, url: str, operation: str, checked: bool = True) -> Plugin | None:
+        """The first plugin for ``operation`` on ``url``; ``checked`` applies gfal2's
+        length limit, which its list forms apply to the first URL only."""
+        if checked and len(url) >= _URL_MAX_LEN and operation in _LENGTH_CHECKED:
+            raise GError("Invalid surl, surl too long or NULL", errno.EINVAL)
         self._load_for(_load_key(url))
         for candidate in self.plugins:
             if candidate.implements(operation) and candidate.handles(url, operation):
@@ -340,7 +348,21 @@ class Gfal2Context:
             left = self._running_by_thread.pop(me) - 1
             if left:
                 self._running_by_thread[me] = left
+            if self._cancelling:
+                self._release_drained()
             self._idle.notify_all()
+
+    def _release_drained(self) -> None:
+        """End the ``cancel()`` calls whose wait is over, as the last operation leaves.
+
+        gfal2's canceller clears its flag the moment the count reaches zero; left
+        to the waiting thread (which needs the GIL back first), the thread whose
+        operation was just cancelled would see its next call refused.
+        """
+        for thread, count in list(self._drains.items()):
+            if self._running == self._running_by_thread.get(thread, 0):
+                del self._drains[thread]
+                self._cancelling -= count
 
     def _guard(self, method: Any, *args: Any) -> Any:
         """Run a plugin call, counting it as running and making every failure a ``GError``."""
@@ -397,12 +419,13 @@ class Gfal2Context:
         group: str = "",
         check_hostname: bool = True,
         alpn: tuple[str, ...] = (),
+        x509: bool = True,
     ) -> ssl.SSLContext:
-        """The TLS client context for ``url``: its X.509 credential, the grid CAs,
-        and ``[group] INSECURE`` honoured."""
+        """The TLS client context for ``url``: its X.509 credential (unless
+        ``x509=False``), the grid CAs, and ``[group] INSECURE`` honoured."""
         insecure = self.options.boolean(group, "INSECURE", False) if group else False
         return self.tls.get(
-            self.x509(url),
+            self.x509(url) if x509 else None,
             verify=not insecure,
             ca_path=self.ca_path(),
             check_hostname=check_hostname,
@@ -438,7 +461,7 @@ class Gfal2Context:
         return answer if isinstance(answer, int) else 0
 
     def chmod(self, path: str, mode: int) -> int:
-        self._dispatch("chmod", path, mode)
+        self._dispatch("chmod", path, _mode_t(mode))
         return 0
 
     def rename(self, old: str, new: str) -> int:
@@ -457,10 +480,11 @@ class Gfal2Context:
         return self.stat(path)
 
     def mkdir(self, path: str, mode: int = 0o755) -> int:
-        self._dispatch("mkdir", path, mode)
+        self._dispatch("mkdir", path, _mode_t(mode))
         return 0
 
     def mkdir_rec(self, path: str, mode: int = 0o755) -> int:
+        mode = _mode_t(mode)
         if self._find(path, "mkdir_rec") is not None:
             try:
                 self._dispatch("mkdir_rec", path, mode)
@@ -524,7 +548,11 @@ class Gfal2Context:
         return self._dispatch("readlink", path)  # type: ignore[no-any-return]
 
     def symlink(self, target: str, link: str) -> int:
-        plugin = self.plugin(link, "symlink")
+        plugin = self._find(link, "symlink")
+        if plugin is None:
+            # gfal2 looks the target up first, so its refusal names the target
+            # unless that one could have been linked.
+            raise self._no_plugin(link if self._find(target, "symlink") else target)
         self._guard(plugin.symlink, target, link)
         return 0
 
@@ -533,13 +561,19 @@ class Gfal2Context:
             self._dispatch("unlink", path)
             return 0
         paths = _non_empty(path)
-        bulk = self._find(paths[0], "unlink_bulk")
+        try:
+            bulk = self._find(paths[0], "unlink_bulk")
+        except GError as exc:
+            return [exc] * len(paths)
         if bulk is not None:
             return self._guard(bulk.unlink_bulk, paths)  # type: ignore[no-any-return]
         results: list[GError | None] = []
         for item in paths:
             try:
-                self._dispatch("unlink", item)
+                plugin = self._find(item, "unlink", checked=False)
+                if plugin is None:
+                    raise self._no_plugin(item)
+                self._guard(plugin.unlink, item)
                 results.append(None)
             except GError as exc:
                 results.append(exc)
@@ -833,12 +867,18 @@ class Gfal2Context:
         with self._lock:
             self._cancel_generation += 1
             running = self._running
+            me = threading.get_ident()
+            self._drains[me] = self._drains.get(me, 0) + 1
             self._cancelling += 1
             try:
-                me = threading.get_ident()
-                self._idle.wait_for(lambda: self._running == self._running_by_thread.get(me, 0))
+                self._idle.wait_for(
+                    lambda: (
+                        me not in self._drains
+                        or self._running == self._running_by_thread.get(me, 0)
+                    )
+                )
             finally:
-                self._cancelling -= 1
+                self._cancelling -= self._drains.pop(me, 0)
             return running
 
     def free(self) -> None:
@@ -882,15 +922,23 @@ def _freed() -> GError:
 
 
 def _live(method: Any) -> Any:
-    """Refuse the call once the context is freed, as every bindings method does."""
+    """Refuse the call once the context is freed, as every bindings method does.
+
+    A ``bytes`` argument is taken as the string it spells, as Boost.Python
+    converts one for every ``std::string`` parameter (``ctx.stat(b"file:///f")``).
+    """
 
     @functools.wraps(method)
     def call(self: Gfal2Context, *args: Any, **kwargs: Any) -> Any:
         if self._freed:
             raise _freed()
-        return method(self, *args, **kwargs)
+        return method(self, *map(_text, args), **kwargs)
 
     return call
+
+
+def _text(value: Any) -> Any:
+    return os.fsdecode(value) if isinstance(value, bytes) else value
 
 
 #: The bindings' methods; each raises ``EFAULT`` on a freed context.
@@ -964,6 +1012,31 @@ def _non_empty(paths: Sequence[str]) -> list[str]:
         raise GError("Empty list of files", errno.EINVAL)
     return found
 
+
+def _mode_t(mode: int) -> int:
+    """A ``mode_t`` argument, refused as Boost.Python refuses it outside 32 bits.
+
+    Without this ``chmod(url, -1)`` reached ``os.chmod`` and set 7777.
+    """
+    if mode < 0:
+        raise OverflowError("can't convert negative value to unsigned int")
+    if mode >> 32:
+        raise OverflowError("bad numeric conversion: positive overflow")
+    return mode
+
+
+#: gfal2's plugin lookup refuses a URL of ``GFAL_URL_MAX_LEN`` (2048) bytes or
+#: more with ``EINVAL`` for these operations; readlink, setxattr, symlink,
+#: token_retrieve and the QoS calls find their plugin another way, unchecked.
+_URL_MAX_LEN = 2048
+_LENGTH_CHECKED = frozenset(
+    (
+        "access", "stat", "lstat", "chmod", "rename", "mkdir", "mkdir_rec", "rmdir",
+        "listdir", "opendir", "open", "unlink", "unlink_bulk", "getxattr", "listxattr",
+        "checksum", "bring_online", "bring_online_poll", "release", "abort_bring_online",
+        "archive_poll",
+    )
+)  # fmt: skip
 
 #: The attribute prefix gfal2's core answers with a checksum when a plugin cannot.
 _CHECKSUM_XATTR = "user.checksum."

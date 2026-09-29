@@ -34,7 +34,9 @@ patches the raw status itself, the answers are gfal2's: ``rmdir`` says
 ``EISDIR`` (gfal2 leaks 4). As in gfal2, ``access`` is ``EPROTONOSUPPORT``
 (there is none, and the core does not fall back to ``stat``) and only a
 lower-case ``sftp://`` is claimed. The default user is ``getpass``'s (the
-login environment first), where gfal2 asks ``getpwuid``.
+login environment first), where gfal2 asks ``getpwuid``. Error messages
+name the operation, the URL and the reason; gfal2's say only "SFTP Protocol
+Error", "Could not resolve host" or "Could not connect" (the codes agree).
 """
 
 from __future__ import annotations

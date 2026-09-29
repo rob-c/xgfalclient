@@ -35,6 +35,8 @@ def mkdir(cmd: Command) -> None:
 
 
 def save(cmd: Command) -> None:
+    # Bytes from stdin untouched, as cat writes them: gfal2-util's text-mode
+    # read dies on input that is not UTF-8 (UnicodeEncodeError, empty file).
     handle = cmd.context.open(cmd.params.file, "w")
     try:
         while True:

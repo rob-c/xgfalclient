@@ -262,9 +262,17 @@ class _Copier:
                 bar.stop(False)
                 out("\n")
             if exc.code == errno.EEXIST and params.force:
-                self.context.unlink(destination)
-                self.copy_file(source, destination, size, special=special)
-                return
+                try:
+                    self.context.unlink(destination)
+                except GError as gone:
+                    # Nothing there, so the EEXIST was not the destination's (a 409
+                    # for a missing parent): report it, not the unlink's ENOENT.
+                    # gfal2 numbers that 409 with a stale errno, so seldom gets here.
+                    if gone.code != errno.ENOENT:
+                        raise
+                else:
+                    self.copy_file(source, destination, size, special=special)
+                    return
             self.failure(exc.message, exc.code)
 
     def stream(self, source: str, destination: str) -> None:

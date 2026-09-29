@@ -35,6 +35,14 @@ Connection settings are liblfc's environment first, then gfal2's
 ``[LFC PLUGIN]`` options: ``LFC_HOST``, ``LFC_PORT`` (default 5010),
 ``LFC_CONNTIMEOUT``, ``LFC_CONRETRY``, ``LFC_CONRETRYINT``; ``CSEC_MECH``
 chooses the authentication mechanisms (default ``GSI ID``).
+
+Knowingly different from gfal2: the host in ``lfc://host/path`` always
+wins (gfal2 lets an ``$LFC_HOST`` set at start-up override it); there is no
+built-in ``LFC_HOST`` (gfal2's ``lfc_plugin.conf`` named the retired
+``lfc-puppet01.cern.ch``), so a bare ``lfn:`` without one is ``EINVAL``;
+``lstat`` always asks the server (gfal2 answers from a cache that
+``readdirpp`` fills, possibly stale); and connection failures keep their
+own ``errno`` (see :mod:`.wire`) where gfal2 says ``ECOMM``.
 """
 
 from __future__ import annotations

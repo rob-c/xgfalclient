@@ -16,6 +16,8 @@ Every request is signed with SigV4 (``hmac`` and ``hashlib``, nothing else).
 davix falls back to the older SigV2 when no region is configured; this does
 not - SigV2 is retired at AWS and every S3 implementation that matters takes
 V4 - and signs for ``us-east-1`` instead, which is what they all accept.
+The signature travels in an ``Authorization`` header; davix puts it in the
+query string (``X-Amz-Signature=...``), which S3 accepts just the same.
 
 S3 has no directories. As in davix, ``mkdir`` puts an empty ``<key>/``
 marker object, a "directory" is a key prefix that something lives under,
@@ -352,7 +354,7 @@ def stat(plugin: HTTPPlugin, url: str) -> Stat:
         if response.status != 404:
             raise status_error(response.status)
         if not _listing(plugin, url, limit=1)[1]:
-            raise status_error(404)
+            raise GError(f"{url} not found", errno.ENOENT)  # davix's s3StatMapper
         return Stat(st_mode=OBJECT_DIR_MODE)
     _listing(plugin, url, limit=1)  # the bucket itself: exists if it lists
     return Stat(st_mode=OBJECT_DIR_MODE)

@@ -220,6 +220,10 @@ class SRMPlugin(Plugin):
     def close(self) -> None:
         self.transport.close()
 
+    def handles(self, url: str, operation: str) -> bool:
+        """gfal2's ``^srm://.+$``, case-blind: a bare ``srm://`` is nobody's (93)."""
+        return super().handles(url, operation) and len(url) > len("srm://")
+
     # -- options -------------------------------------------------------------------
 
     def _timeout(self) -> float:

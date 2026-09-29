@@ -24,12 +24,30 @@ def tape(dav: WebDAVServer) -> Tape:
 
 
 def test_without_a_tape_api(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
+    # davix itself fails a 401 or 403, with its own words and errno...
     with pytest.raises(GError) as caught:
         hctx.getxattr(dav.url("/data/a"), "user.status")
-    assert caught.value.code == errno.EINVAL  # any status but 200
-    assert caught.value.message == (
+    assert (caught.value.code, caught.value.message) == (
+        errno.EPERM,
         "[Tape REST API] Failed to query /.well-known/wlcg-tape-rest-api: "
-        "HTTP 403 : Permission refused : tape REST API not enabled"
+        "HTTP 403 : Permission refused ",
+    )
+    dav.fault("GET", WELL_KNOWN, status=401, body=b"who?")
+    with pytest.raises(GError) as caught:
+        hctx.getxattr(dav.url("/data/a"), "user.status")
+    assert (caught.value.code, caught.value.message) == (
+        errno.EACCES,
+        "[Tape REST API] Failed to query /.well-known/wlcg-tape-rest-api: "
+        "HTTP 401 : Authentication Error ",
+    )
+    # ...and gfal2 any other status but 200, with the body.
+    dav.fault("GET", WELL_KNOWN, status=404, body=b"no tape here")
+    with pytest.raises(GError) as caught:
+        hctx.getxattr(dav.url("/data/a"), "user.status")
+    assert (caught.value.code, caught.value.message) == (
+        errno.EINVAL,
+        "[Tape REST API] Failed to query /.well-known/wlcg-tape-rest-api: "
+        "HTTP 404 : File not found : no tape here",
     )
     port = dav.port
     dav.stop()

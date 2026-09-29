@@ -41,6 +41,8 @@ def test_stock_defaults(options: Options) -> None:
     ]
     assert "GRIDFTP PLUGIN" in options.groups()
     assert "DCAU" in options.keys("GRIDFTP PLUGIN")
+    # gfal2-plugin-dcap's dcap_plugin.conf (gfal2-all installs it); nothing reads it.
+    assert options.get_boolean("DCAP PLUGIN", "MODE_PASSIVE") is True
 
 
 def test_missing_group_and_key_codes(options: Options) -> None:
@@ -110,6 +112,13 @@ def test_setters_round_trip_as_glib_does(options: Options) -> None:
     assert options.get_string("X", "B") == "false"
     options.set_integer("X", "I", 7)
     assert options.get_string("X", "I") == "7"
+    options.set_integer("X", "I", 2**31 - 1)
+    assert options.get_integer("X", "I") == 2**31 - 1
+    with pytest.raises(OverflowError, match="positive overflow"):
+        options.set_integer("X", "I", 2**31)
+    with pytest.raises(OverflowError, match="negative overflow"):
+        options.set_integer("X", "I", -(2**31) - 1)
+    assert options.get_integer("X", "I") == 2**31 - 1  # unchanged
     options.set_string_list("X", "L", ["a", "b"])
     assert options.get_string("X", "L") == "a;b;"
     assert options.get_string_list("X", "L") == ["a", "b"]

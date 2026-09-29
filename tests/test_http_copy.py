@@ -7,6 +7,8 @@ import errno
 import logging
 import os
 import socket
+import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -198,6 +200,49 @@ def test_parallel_download_failures(
     assert caught.value.code == errno.EIO and "Short read" in caught.value.message
 
 
+def test_parallel_download_failure_stops_the_other_streams(
+    hctx: xgfalclient.Gfal2Context,
+    dav: WebDAVServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # One stream fails while the other is mid-segment; the other stops at its
+    # next block rather than finishing its range.
+    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
+    monkeypatch.setattr(_copy, "BLOCK", 64 << 10)
+    write(dav, "/data/big", os.urandom(2 * MB))
+    stopped = threading.Event()
+    second = threading.Event()
+
+    class Watched(threading.Event):
+        def set(self) -> None:
+            super().set()
+            stopped.set()
+
+    fake = types.SimpleNamespace(Lock=threading.Lock, Event=Watched, Thread=threading.Thread)
+    monkeypatch.setattr(_copy, "threading", fake)
+    original = _copy._pwrite_all
+    lock = threading.Lock()
+    writes: list[int] = []
+
+    def pwrite(fd: int, view: memoryview, offset: int) -> None:
+        with lock:
+            writes.append(offset)
+            first = len(writes) == 1
+        if first:
+            assert second.wait(10)
+            raise GError("boom", errno.EIO)
+        second.set()
+        assert stopped.wait(10)
+        original(fd, view, offset)
+
+    monkeypatch.setattr(_copy, "_pwrite_all", pwrite)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(params(nbstreams=2), dav.url("/data/big"), file_url(tmp_path / "a"))
+    assert "boom" in caught.value.message
+    assert len(writes) == 2
+
+
 def test_download_errors(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_path: Path) -> None:
     write(dav, "/data/f", b"0123456789")
     dav.fault("GET", status=200, body=b"01234")
@@ -210,6 +255,12 @@ def test_download_errors(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_
     with pytest.raises(GError) as caught:
         hctx.filecopy(dav.url("/data"), file_url(tmp_path / "b"))
     assert caught.value.code == errno.EISDIR
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(dav.url("/data/nope"), file_url(tmp_path / "c"))
+    assert (caught.value.code, caught.value.message) == (
+        errno.ENOENT,
+        "Could not open source: Result HTTP 404 : File not found  after 1 attempts",
+    )
 
 
 # -- third-party copy ---------------------------------------------------------------------
@@ -244,6 +295,24 @@ def test_pull(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVSer
     assert copy_request.header("TransferHeaderAuthorization") is None
     assert copy_request.header("Copy-Flags") is None
     assert seen[-1] == 3000
+
+
+def test_every_performance_marker_is_reported(
+    hctx: xgfalclient.Gfal2Context,
+    dav: WebDAVServer,
+    dav2: WebDAVServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # davix's performance callback reaches monitor_callback for each marker,
+    # however quick the copy; the core's once-a-second clock does not apply.
+    monkeypatch.setattr(transfer_module, "MONITOR_INTERVAL", 3600.0)
+    write(dav, "/data/src", b"s" * 3000)
+    dav2.marker_every = 1000
+    seen: list[int] = []
+    copy = params()
+    copy.monitor_callback = lambda src, dst, avg, inst, done, elapsed: seen.append(done)
+    hctx.filecopy(copy, dav.url("/data/src"), dav2.url("/data/dst"))
+    assert seen == [1000, 2000, 3000]
 
 
 def test_pull_with_everything(

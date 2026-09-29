@@ -210,8 +210,12 @@ def test_upload_to_a_missing_parent(hctx: xgfalclient.Gfal2Context, dav: WebDAVS
     handle.write("x")
     with pytest.raises(GError) as caught:
         handle.close()
-    # A 409 outside mkdir is davix's "Conflict, File Exist".
-    assert caught.value.code == errno.EEXIST
+    # davix's words, but a PUT's 409 is a missing parent: ENOENT, never the
+    # "File exists" that callers matching on it would read as an existing target.
+    assert (caught.value.code, caught.value.message) == (
+        errno.ENOENT,
+        "HTTP 409 : Conflict, File Exist ",
+    )
 
 
 def test_upload_follows_a_redirect_before_the_body(

@@ -11,7 +11,10 @@ and the same GLib error codes (3 for a missing key, 4 for a missing group,
 Values parse as GLib parses them: a boolean is exactly ``true``/``false``/
 ``1``/``0`` (trailing blanks allowed, case significant), an integer is
 decimal digits with an optional sign within the C ``int`` range. A group
-with no keys in a file is not created, since gfal2 merges key by key. A file
+with no keys in a file is not created, since gfal2 merges key by key.
+Values are kept as written, without GLib's escaping, so a list element
+containing ``;`` comes back split (GLib escapes it on write and then
+refuses to read the value back at all). A file
 that will not load fails with ``Error while loading configuration file
 <path>: <GLib's text>`` and GLib's code (``G_FILE_ERROR_*`` for the file,
 ``G_KEY_FILE_ERROR_*`` for its contents).
@@ -138,6 +141,9 @@ LOG_SENSITIVE=false
 LOG_CONTENT=false
 KEEP_ALIVE=true
 RETRIEVE_BEARER_TOKEN=true
+
+[DCAP PLUGIN]
+MODE_PASSIVE=true
 
 [MOCK PLUGIN]
 MAX_TRANSFER_TIME=5
@@ -318,7 +324,13 @@ class Options:
         )
 
     def set_integer(self, group: str, key: str, value: int) -> None:
-        self._set(group, key, str(int(value)))
+        """Store a C ``int``; outside its range, the bindings' ``OverflowError``."""
+        number = int(value)
+        if number > _INT_MAX:
+            raise OverflowError("bad numeric conversion: positive overflow")
+        if number < _INT_MIN:
+            raise OverflowError("bad numeric conversion: negative overflow")
+        self._set(group, key, str(number))
 
     def get_boolean(self, group: str, key: str) -> bool:
         raw = self._raw(group, key).rstrip(_BLANKS)

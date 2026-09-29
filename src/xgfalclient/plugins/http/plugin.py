@@ -6,7 +6,8 @@ The namespace is WebDAV, request for request as davix sends it:
 ``stat``    ``PROPFIND`` ``Depth: 0``; for ``http(s)://`` a ``HEAD`` if that fails
 ``mkdir``   ``MKCOL`` (``405`` is ``EEXIST``, ``409`` a missing parent)
 ``rmdir``   ``PROPFIND`` to see it is a collection, then ``DELETE`` of ``dir/``
-``unlink``  ``PROPFIND`` to see it is not a collection, then ``DELETE``
+``unlink``  ``PROPFIND`` to see it is not a collection, then ``DELETE``;
+            for ``http(s)://`` (davix's plain-HTTP mode) the ``DELETE`` alone
 ``rename``  ``MOVE`` with a ``Destination``
 ``listdir`` ``PROPFIND`` ``Depth: 1``, less the collection's own entry
 checksum    ``HEAD`` with ``Want-Digest`` (RFC 3230)
@@ -29,6 +30,8 @@ the size, and no times.
 
 Where this differs from gfal2, deliberately:
 
+* a refused connection is ``ECONNREFUSED`` (davix's ``ConnectionProblem``
+  becomes ``EHOSTDOWN`` in gfal2), with davix's words for it;
 * a checksum the ``HEAD`` did not carry is asked for once more with a
   one-byte ``GET``, which some servers need before they compute one, and
   a hex digest where RFC 3230 wants base64 is read as hex (davix decodes it
@@ -77,6 +80,7 @@ from ._client import (
     Response,
     Signer,
     status_error,
+    valid_authority,
     wire_url,
 )
 from ._dav import (
@@ -244,7 +248,7 @@ class HTTPPlugin(Plugin):
     ) -> Response:
         auth = None
         if x509_only:
-            auth = Auth(tls=self.context.ssl_context(cred_url or url, group=self.option_group))
+            auth = Auth(tls=self.client.tls(cred_url or url))
         return self.client.request(
             method,
             url,
@@ -339,9 +343,8 @@ class HTTPPlugin(Plugin):
             return
         except GError as exc:
             if exc.code == errno.EEXIST:
-                if self.stat(url).is_dir():
-                    return
-                raise GError(f"{url} exists and is not a directory", errno.ENOTDIR) from None
+                # Whatever is there - a file included - is done, as gfal2's core has it.
+                return
             up = parent(url)
             if exc.code != errno.ENOENT or up == url:
                 raise
@@ -366,13 +369,23 @@ class HTTPPlugin(Plugin):
 
     def unlink(self, url: str) -> None:
         prefix = "DavPosix::unlink  "
+        if not valid_authority(parse(url).netloc):
+            raise _result(GError(f" {url} is not a valid HTTP or Webdav URL", errno.EIO), prefix)
+        # davix's plain-HTTP mode (http, https) has no POSIX semantics: the DELETE
+        # alone, no PROPFIND first - Rucio rewrites davs:// to https:// to save it.
+        if scheme_of(url).partition("+")[0] not in ("http", "https"):
+            try:
+                info = self._stat(url)
+            except GError as exc:
+                raise _result(exc, prefix) from None
+            if info.is_dir():
+                raise GError(
+                    f"{prefix} {url} is a directory, impossible to unlink\\n", errno.EISDIR
+                )
         try:
-            info = self._stat(url)
-        except GError as exc:
-            raise _result(exc, prefix) from None
-        if info.is_dir():
-            raise GError(f"{prefix} {url} is a directory, impossible to unlink\\n", errno.EISDIR)
-        response = self._request("DELETE", url)
+            response = self._request("DELETE", url)
+        except GError as exc:  # the network's failure, in davix's unlink scope
+            raise GError(f"{prefix}{exc.message}", exc.code) from None
         response.body()
         if response.status not in (200, 202, 204):
             raise _decorated(response.status, url, prefix=prefix)
@@ -434,6 +447,8 @@ class HTTPPlugin(Plugin):
     # -- I/O -------------------------------------------------------------------------
 
     def open(self, url: str, flags: int, mode: int = 0o644, size: int | None = None) -> PluginFile:
+        if not valid_authority(parse(url).netloc):
+            raise GError(" Uri invalid in Davix::Open", errno.EIO)
         access = flags & O_ACCMODE_MASK
         if access == O_RDONLY:
             info = self.stat(url)

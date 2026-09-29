@@ -128,7 +128,10 @@ def _docker(*args: str, check: bool = True) -> str:
 def test_parity_with_gfal2() -> None:
     name = f"xgfal-srm-interop-{uuid.uuid4().hex[:8]}"
     _docker(
-        "run", "-d", "--name", name, "-v", f"{ROOT}:/xgfal:ro",
+        # The package alone: src/ also holds the gfal2 shim, which would
+        # shadow the real gfal2 and compare this package with itself.
+        "run", "-d", "--name", name,
+        "-v", f"{ROOT / 'src' / 'xgfalclient'}:/xgfal/src/xgfalclient:ro",
         "--entrypoint", "sleep", IMAGE, "infinity",
     )  # fmt: skip
     try:

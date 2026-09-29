@@ -246,6 +246,8 @@ def test_guard_translates_oserror_and_refuses_after_free(fctx: Gfal2Context) -> 
     with pytest.raises(GError) as caught:
         fctx._guard(boom, None)
     assert caught.value.code == errno.EIO
+    # bytes arguments are strings, as Boost.Python converts them
+    assert fctx.stat(b"fake://h/f").st_size == fctx.stat("fake://h/f").st_size
     handle = fctx.open("fake://h/f", "r")
     fctx.free()
     for call in (
@@ -404,6 +406,18 @@ def test_mkdir_rec_prefers_the_plugin(fctx: Gfal2Context) -> None:
         fctx.mkdir_rec("rec://h/broken", 0o700)
 
 
+@pytest.mark.parametrize("call", ["chmod", "mkdir", "mkdir_rec"])
+def test_modes_are_unsigned_32_bit(fctx: Gfal2Context, call: str) -> None:
+    # Boost.Python's mode_t conversion: gfal-chmod -- -1 used to set 7777
+    plugin = fake(fctx)
+    with pytest.raises(OverflowError, match="can't convert negative value to unsigned int"):
+        getattr(fctx, call)("fake://h/new", -1)
+    with pytest.raises(OverflowError, match="positive overflow"):
+        getattr(fctx, call)("fake://h/new", 1 << 32)
+    assert "fake://h/new" not in plugin.dirs
+    assert getattr(fctx, call)("fake://h/f" if call == "chmod" else "fake://h/new", 0o7777) == 0
+
+
 def test_listdir_and_opendir_fallbacks(fctx: Gfal2Context) -> None:
     assert fctx.listdir("fake://h/d") == ["d", "f"]  # from opendir
     assert fctx.listdir("min://h/d") == ["a", "b"]  # the plugin's own
@@ -475,6 +489,30 @@ def test_unlink_list_forms(fctx: Gfal2Context) -> None:
 
     fctx.add_plugin(Bulk)
     assert fctx.unlink(["bulk://h/a", "bulk://h/b"]) == [None, None]
+
+
+def test_urls_of_2048_bytes_are_refused_as_gfal2_does(fctx: Gfal2Context) -> None:
+    fits = "fake://h/" + "a" * (2047 - len("fake://h/"))
+    long = fits + "a"
+    invalid = ("Invalid surl, surl too long or NULL", errno.EINVAL)
+    assert fctx.readlink(fits) == "target"
+    for call in (
+        lambda: fctx.stat(long),
+        lambda: fctx.opendir(long),
+        lambda: fctx.rename("fake://h/f", long),
+        lambda: fctx.getxattr(long, "user.checksum.adler32"),
+        lambda: fctx.bring_online(long, 1, 1, True),
+    ):
+        with pytest.raises(GError) as caught:
+            call()
+        assert caught.value.args == invalid
+    # Unchecked lookups reach the plugin.
+    assert fctx.readlink(long) == "target"
+    # List forms check the first URL only.
+    first = fctx.unlink([long, "fake://h/f"])
+    assert [e.args for e in first] == [invalid, invalid]  # type: ignore[union-attr]
+    later = fctx.unlink(["fake://h/nope", long, "nope://h/x"])
+    assert [e.code for e in later] == [errno.ENOENT] * 2 + [errno.EPROTONOSUPPORT]  # type: ignore[union-attr]
 
 
 # -- files ----------------------------------------------------------------------------
@@ -867,6 +905,57 @@ def test_cancel_waits_for_other_threads(fctx: Gfal2Context) -> None:
     worker.join(10)
     assert answers == [1] and fctx._cancelling == 0
     assert fctx.stat("fake://h/f").st_size == 5
+
+
+def test_a_cancelled_thread_may_go_on_at_once(fctx: Gfal2Context) -> None:
+    """The drain ends as the last operation leaves, not when the canceller next runs."""
+    started, release = threading.Event(), threading.Event()
+    after: list[int] = []
+
+    def slow() -> None:
+        started.set()
+        release.wait(10)
+
+    def work() -> None:
+        fctx._guard(slow)
+        after.append(fctx.stat("fake://h/f").st_size)  # straight away, as gfal2 allows
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    started.wait(10)
+    canceller = threading.Thread(target=fctx.cancel)
+    canceller.start()
+    while not fctx._cancelling:
+        time.sleep(0.001)
+    release.set()
+    worker.join(10)
+    canceller.join(10)
+    assert after == [5] and fctx._cancelling == 0
+
+
+def test_cancel_drains_when_the_last_operation_leaves(fctx: Gfal2Context) -> None:
+    started = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+
+    def slow(index: int) -> None:
+        started[index].set()
+        release[index].wait(10)
+
+    workers = [threading.Thread(target=fctx._guard, args=(slow, index)) for index in (0, 1)]
+    for index, worker in enumerate(workers):
+        worker.start()
+        started[index].wait(10)
+    canceller = threading.Thread(target=fctx.cancel)
+    canceller.start()
+    while not fctx._cancelling:
+        time.sleep(0.001)
+    release[0].set()
+    workers[0].join(10)
+    assert fctx._cancelling == 1 and canceller.is_alive()  # one still running
+    release[1].set()
+    workers[1].join(10)
+    canceller.join(10)
+    assert fctx._cancelling == 0 and not fctx._drains
 
 
 def test_cancel_from_inside_an_operation_does_not_wait_for_it(fctx: Gfal2Context) -> None:

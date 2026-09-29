@@ -59,7 +59,13 @@ checksum algorithm set, the plugin's ``COPY_CHECKSUM_TYPE`` is used (gfal2
 asks the endpoints for an algorithm named ``""``, and fails); a copy whose
 deadline has passed tries no further mode; and a ``copy_mode`` query
 argument does not also switch fallback off for every later copy in the
-context, as gfal2's (which writes it into the options) does.
+context, as gfal2's (which writes it into the options) does. A failed
+streamed ``PUT`` is numbered from its status as davix numbers it (403
+``EPERM``, 500 or 507 ``EIO``), except that a 409 - a missing parent, for
+a ``PUT`` - is ``ENOENT`` rather than davix's ``EEXIST``, which tools that
+match "File exists" would take for an existing target; gfal2 reports a
+stale ``errno`` there - ``EISDIR``, ``EEXIST``, 256 or 39 against the same
+answers - with the same message.
 """
 
 from __future__ import annotations
@@ -572,7 +578,11 @@ class _NoRanges(Exception):
 
 def download(plugin: HTTPPlugin, transfer: Transfer) -> None:
     transfer.event(ev.TRANSFER_TYPE, STREAMED)
-    info = plugin.stat(transfer.source)
+    try:
+        info = plugin.stat(transfer.source)
+    except GError as exc:
+        # gfal2's streamed copy opens the source first, in these words.
+        raise GError(f"Could not open source: {exc.message}", exc.code) from None
     if info.is_dir():
         raise GError(f"{transfer.source} is a directory", errno.EISDIR)
     size = info.st_size
@@ -808,7 +818,8 @@ def _follow(response: Response, transfer: Transfer) -> None:
             if moved.isdigit():
                 index = block.get("stripe index", "0")
                 stripes[int(index) if index.isdigit() else 0] = int(moved)
-                transfer.progress(sum(stripes.values()))
+                # Every marker is reported, as davix's performance callback is.
+                transfer.progress(sum(stripes.values()), always=True)
             transfer.check()
         elif ":" in text:
             name, _, value = text.partition(":")

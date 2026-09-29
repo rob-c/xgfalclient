@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from ...errors import GError
 from ...plugin import PluginFile
-from ._client import FileBody, Response, Upload, status_error
+from ._client import PUT, FileBody, Response, Upload, status_error
 
 if TYPE_CHECKING:
     from .plugin import HTTPPlugin
@@ -39,7 +39,7 @@ def check_upload(response: Response) -> None:
     """Raise the gfal2-worded error for a ``PUT`` that did not succeed."""
     with response:
         if response.status not in UPLOAD_OK:
-            raise status_error(response.status)
+            raise status_error(response.status, scope=PUT)
 
 
 class HTTPReadFile(PluginFile):

@@ -76,7 +76,14 @@ def test_s3_namespace(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
     assert hctx.stat(s3url(s3, "/bucket")).is_dir()
     with pytest.raises(GError) as caught:
         hctx.stat(s3url(s3, "/bucket/nope"))
-    assert caught.value.message == "Result HTTP 404 : File not found  after 1 attempts"
+    # davix's s3StatMapper: a HEAD 404 and nothing listed under the key
+    assert caught.value.message == f"Result {s3url(s3, '/bucket/nope')} not found after 1 attempts"
+    assert caught.value.code == errno.ENOENT
+    with pytest.raises(GError) as caught:
+        hctx.unlink(s3url(s3, "/bucket/nope"))
+    assert caught.value.message == (
+        f"DavPosix::unlink  Result {s3url(s3, '/bucket/nope')} not found after 1 attempts"
+    )
     assert sorted(hctx.listdir(s3url(s3, "/bucket/dir"))) == ["a", "sub"]
     assert sorted(hctx.listdir(s3url(s3, "/bucket/"))) == ["dir", "top"]
     with pytest.raises(GError) as caught:

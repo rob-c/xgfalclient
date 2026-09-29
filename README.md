@@ -18,10 +18,16 @@ ctx.filecopy(params, "file:///tmp/f.root", "root://se.example.org//store/f.root"
 
 Unmodified code that says `import gfal2` works as it is: the wheel also
 installs a `gfal2` module (reporting the bindings' version, 1.13.1, while
-`get_version()` reports gfal2 2.23.5) and gfal2-util's `gfal2_util` package.
+`get_version()` reports gfal2 2.23.5) and gfal2-util's `gfal2_util` package;
+`xgfalclient.install_as_gfal2()` does the same for one process explicitly.
 Because of that, don't install it into a Python environment that also has the
 `python3-gfal2` RPM on its path - whichever comes first on `sys.path` wins.
-`xgfalclient.install_as_gfal2()` does the same for one process explicitly.
+Install it in a virtual environment. On EL9 a `pip install --user` (in
+`~/.local`) or a root `pip install` (in `/usr/local`) comes before the RPMs
+on `sys.path`, so it takes over every `import gfal2` and also the RPM's own
+`/usr/bin/gfal-*`, which run the first `python` that can import `gfal2`.
+EL9's pip also has a bug here: a root `pip uninstall xgfalclient` deletes
+gfal2-util's `/usr/bin/gfal-*` scripts along with its own.
 
 ## Why
 
@@ -116,6 +122,8 @@ Deliberately, and only where gfal2's behaviour is a bug:
   deletes the source;
 * a failed copy cleans up its destination whenever `transfer_cleanup` is set,
   including after a destination checksum mismatch;
+* `TransferParameters.timeout = 0` means no limit; gfal2's local copy
+  expires at once;
 * error codes are the intended ones where gfal2 reports a stale `errno` or
   a raw protocol status (details in each plugin's module docstring);
 * `sftp://` checks host keys (accept-new by default; gfal2 checks none) and

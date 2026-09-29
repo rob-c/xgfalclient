@@ -525,7 +525,7 @@ def mock_plugin(ctx: Gfal2Context) -> MockPlugin:
 
 def entries(ctx: Gfal2Context, url: str) -> list[tuple[str, str, int]]:
     listing = mock_plugin(ctx).opendir(url)
-    return [(name, oct(info.st_mode), info.st_size) for name, info in listing if info]
+    return [(e[0], oct(e[1].st_mode), e[1].st_size) for e in listing if e[1]]
 
 
 @pytest.fixture
@@ -701,6 +701,15 @@ def test_mock_listing(ctx: Gfal2Context) -> None:
     ]
     assert entries(ctx, M + "?list=x:0644:-3")[0][2] == 2**64 - 3
     assert ctx.listdir(M + "?list=,,a,") == ["a"]
+    for target, link, named in ((M, M + "2", M), ("file:///a", M, M)):
+        with pytest.raises(GError) as caught:
+            ctx.symlink(target, link)  # no mock symlink: gfal2 names the target first
+        assert (caught.value.code, caught.value.message.rsplit(" ", 1)[-1]) == (
+            errno.EPROTONOSUPPORT,
+            named,
+        )
+    dirents = list(ctx.opendir(M + "?list=a:0644:1,b:040755:0"))
+    assert [(d.d_name, d.d_type) for d in dirents] == [("a", 0), ("b", 0)]  # gfal2 sets none
     long = ",".join(f"n{i:03d}" for i in range(300))
     assert len(ctx.listdir(M + "?list=" + long)) == 205  # gfal2 reads 1023 characters
     with pytest.raises(GError) as caught:
@@ -779,7 +788,12 @@ def test_mock_staging(ctx: Gfal2Context) -> None:
     assert ctx.bring_online_poll(slow, token) == 0
     assert ctx.abort_bring_online(slow, token) == 0
     assert ctx.bring_online_poll(slow, token) == 0  # gfal2's abort changes nothing
-    assert mock_plugin(ctx).bring_online_poll([slow, base + "/other"], token) == [False, True]
+    pending, done = mock_plugin(ctx).bring_online_poll([slow, base + "/other"], token)
+    assert isinstance(pending, GError)
+    assert (pending.code, pending.message) == (errno.EAGAIN, "Not ready")
+    assert done is True
+    listed = ctx.bring_online_poll([slow, base + "/other"], token)
+    assert listed[0].message == "Not ready" and listed[1] is None
     assert xgfalclient.creat_context().bring_online_poll(slow, token) == 0  # process-wide
     failing = base + "/f?staging_time=3600&staging_errno=5"
     assert ctx.bring_online(failing, 10, 10, True)[0] == 0  # the error waits for the time
@@ -810,8 +824,9 @@ def test_mock_archiving(ctx: Gfal2Context) -> None:
     assert caught.value.code == errno.EIO
     pending = base + "/p?archiving_time=3600&archiving_errno=5"
     assert ctx.archive_poll(pending) == 0 and ctx.archive_poll(pending) == 0
-    plugin = mock_plugin(ctx)
-    assert plugin.archive_poll([base + "/q?archiving_time=3600", base]) == [False, True]
+    listed = ctx.archive_poll([base + "/q?archiving_time=3600", base])
+    assert (listed[0].code, listed[0].message) == (errno.EAGAIN, "Not ready")
+    assert listed[1] is None
 
 
 def copy_events(

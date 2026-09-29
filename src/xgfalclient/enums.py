@@ -9,6 +9,10 @@ the *last* member registered for a duplicated value (``verbose_level.values[128]
 is ``trace``, as Boost's registration order leaves it), and calling the class
 with any int (``checksum_mode(2)``) gives a nameless instance equal to it,
 printed ``gfal2.checksum_mode(2)``, whose ``name`` raises ``AttributeError``.
+
+Knowingly looser than Boost: members accept new attributes, the classes
+live in ``xgfalclient.enums`` (pickles name that module, so they load
+without the ``gfal2`` shim) and have no class-level ``name`` descriptor.
 """
 
 from __future__ import annotations
