@@ -17,7 +17,7 @@ import stat
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -34,11 +34,20 @@ from xgfalclient.cli.__main__ import main as module_main
 from xgfalclient.context import Gfal2Context
 from xgfalclient.errors import GError
 from xgfalclient.plugins.mock import MockPlugin
+from xgfalclient.testing.lfc import USER_DN, LFCServer
+from xgfalclient.testing.pki import PKI
 from xgfalclient.types import Stat
 
 Run = Callable[..., tuple[int, str, str]]
 
 OLD = 1577934245  # 2020-01-02 03:04:05 UTC
+
+
+@pytest.fixture(autouse=True)
+def _ls_colors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ``LS_COLORS`` from the environment, and none read yet."""
+    monkeypatch.delenv("LS_COLORS", raising=False)
+    monkeypatch.setattr(utils, "_colors", None)
 
 
 @pytest.fixture
@@ -270,7 +279,7 @@ def test_unexpected_exception_in_command(run: Run, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(tape, "read_list", broken)
     code, _out, err = run("bringonline", "--from-file", "list")
     assert code == 255
-    assert err.startswith("Exception in thread gfal-command:\nTraceback (most recent call last):")
+    assert err.startswith("Exception in thread Thread-1:\nTraceback (most recent call last):")
     assert err.endswith("ValueError: unreadable list\n")
 
 
@@ -293,6 +302,68 @@ def test_broken_pipe_is_quiet(run: Run, tree: Path, monkeypatch: pytest.MonkeyPa
     assert code == 255
 
 
+class _PipeStdout(io.StringIO):
+    """A stdout on a real descriptor whose reader has gone."""
+
+    def __init__(self, fd: int) -> None:
+        super().__init__()
+        self.fd = fd
+
+    def write(self, text: str) -> int:
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    def fileno(self) -> int:
+        return self.fd
+
+
+def test_broken_pipe_points_stdout_at_devnull(tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """So the interpreter's last flush cannot fail again; ``gfal-rm`` still exits 0."""
+    read_end, write_end = os.pipe()
+    try:
+        monkeypatch.setattr(sys, "stdout", _PipeStdout(write_end))
+        assert cli.ls([url(tree)]) == 255
+        assert stat.S_ISCHR(os.fstat(write_end).st_mode)
+        assert cli.rm([url(tree / "a.txt")]) == 0
+    finally:
+        os.close(read_end)
+        os.close(write_end)
+
+
+@pytest.mark.parametrize(("command", "status"), [("ls", 255), ("rm", 0)])
+def test_broken_pipe_in_a_real_process(tmp_path: Path, command: str, status: int) -> None:
+    """``gfal-ls dir | head -1``: gfal2-util's status, and nothing on stderr."""
+    import subprocess
+
+    for index in range(3000):  # well past a pipe's buffer
+        (tmp_path / f"a-rather-long-file-name-to-fill-the-pipe-{index}").write_bytes(b"")
+    args = [command, "-r", url(tmp_path)] if command == "rm" else [command, url(tmp_path)]
+    process = subprocess.Popen(
+        [sys.executable, "-m", "xgfalclient.cli", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    process.stdout.readline()
+    process.stdout.close()
+    assert process.wait(60) == status
+    assert process.stderr.read() == b""
+    process.stderr.close()
+
+
+def test_ls_colors_warning_from_every_command(
+    run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LS_COLORS", "di=1:a=b=c")
+    code, out, err = run("stat", "--help")
+    assert code == 0 and out.startswith("usage: gfal-stat")
+    assert err == "unparsable value for LS_COLORS environment variable: a=b=c\n"
+    assert run("rm", url(tree / "a.txt"))[2] == ""  # once per process, as gfal2-util
+
+
+def test_exit_status() -> None:
+    assert [base.exit_status(code) for code in (None, 0, 2, -1, 256)] == [0, 0, 2, 255, 0]
+
+
 def test_timeout(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     release = threading.Event()
 
@@ -307,7 +378,7 @@ def test_timeout(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert err == "Command timed out after 1 seconds!\n"
     release.set()
     for thread in threading.enumerate():
-        if thread.name == "gfal-command":
+        if thread.name == "Thread-1":
             thread.join(10)
 
 
@@ -345,6 +416,9 @@ def test_keyboard_interrupt_cancel_hangs(
 
 
 def test_python_dash_m(capsys: pytest.CaptureFixture[str], tree: Path) -> None:
+    assert module_main(["gfal2_version", "--ignored"]) == 0
+    assert module_main(["gfal_srm_ifce_version"]) == 0
+    assert capsys.readouterr().out == "GFAL-client-2.23.5\ngfal-srm-ifce--1.24.8\n"
     assert module_main(["gfal-ls", url(tree / "a.txt")]) == 0
     assert module_main(["ls", url(tree / "a.txt")]) == 0
     assert capsys.readouterr().out == url(tree / "a.txt") + "\n" + url(tree / "a.txt") + "\n"
@@ -462,7 +536,7 @@ def test_save_write_failure_closes(run: Run, monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_xattr(run: Run, monkeypatch: pytest.MonkeyPatch) -> None:
-    assert run("xattr", "mock://h/f", "user.status") == (0, "ONLINE\n", "")
+    assert run("xattr", "mock://h/f?user.status=ONLINE", "user.status") == (0, "ONLINE\n", "")
     code, _, err = run("xattr", "mock://h/f", "user.nope")
     assert (code, err) == (
         errno.ENODATA,
@@ -477,14 +551,17 @@ def test_xattr(run: Run, monkeypatch: pytest.MonkeyPatch) -> None:
         return original(self, path, name)
 
     monkeypatch.setattr(MockPlugin, "getxattr", flaky)
-    code, out, _ = run("xattr", "mock://h/f?replicas=r1")
+    names = ["user.status", "user.replicas", "user.guid", "user.comment", "spacetoken"]
+    # gfal2's mock has no listxattr
+    monkeypatch.setattr(MockPlugin, "listxattr", lambda self, path: names, raising=False)
+    code, out, _ = run("xattr", "mock://h/f?user.status=ONLINE&user.replicas=r1&spacetoken=T")
     assert code == 0
     assert out == (
         "user.status = ONLINE\n"
         "user.replicas = r1\n"
         "user.guid FAILED: no guid here\n"
-        "user.comment = \n"
-        "spacetoken = \n"
+        "user.comment FAILED: Failed to retrieve xattr user.comment\n"
+        "spacetoken = T\n"
     )
 
 
@@ -549,6 +626,9 @@ def test_token(run: Run, monkeypatch: pytest.MonkeyPatch) -> None:
         return original(self, *args)
 
     monkeypatch.setattr(Gfal2Context, "token_retrieve", spy)
+    # gfal2's mock has no token_retrieve
+    token = lambda self, *args: "mock-token"  # noqa: E731
+    monkeypatch.setattr(MockPlugin, "token_retrieve", token, raising=False)
     assert run("token", "mock://h/f") == (0, "mock-token\n", "")
     assert run("token", "-v", "-w", "--issuer", "https://i", "mock://h/f") == (
         0,
@@ -648,32 +728,37 @@ def test_size_to_human(size: int, text: str) -> None:
 def test_ls_color(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tree / "exe").write_text("")
     os.chmod(tree / "exe", 0o755)
-    os.symlink(tree / "a.txt", tree / "link")
     monkeypatch.setenv("LS_COLORS", "di=01;34:ln=01;36:ex=01;32:no=00:junk:a=b=c")
     code, out, err = run("ls", "-l", "--color", "always", url(tree))
     assert code == 0
     assert err == "unparsable value for LS_COLORS environment variable: a=b=c\n"
     assert "\033[01;34msub\033[0m\t" in out
-    assert "\033[01;36mlink\033[0m\t" in out
     assert "\033[01;32mexe\033[0m\t" in out
     assert "\033[037ma.txt\033[0m\t" in out
-    code, out, _ = run("ls", "--color=always", url(tree / "a.txt"))
+    code, out, err = run("ls", "--color=always", url(tree / "a.txt"))
     assert out == f"\033[00m{url(tree / 'a.txt')}\033[0m\n"
+    assert err == ""  # read, and warned about, once per process
     monkeypatch.delenv("LS_COLORS")
+    monkeypatch.setattr(utils, "_colors", None)
     code, out, _ = run("ls", "--color=always", url(tree / "a.txt"))
     assert out == f"\033[037m{url(tree / 'a.txt')}\033[0m\n"
+    monkeypatch.setenv("LS_COLORS", "ln=01;36")
+    monkeypatch.setattr(utils, "_colors", None)
+    monkeypatch.setattr(Gfal2Context, "stat", lambda self, path: Stat(st_mode=stat.S_IFLNK | 0o777))
+    code, out, _ = run("ls", "-l", "--color=always", "mock://h/link")
+    assert "\033[01;36mmock://h/link\033[0m\t" in out
     monkeypatch.setattr(ls_module, "stdout_isatty", lambda: True)
     assert run("ls", url(tree / "a.txt"))[1].startswith("\033[037m")
     assert run("ls", "--color=never", url(tree / "a.txt"))[1] == url(tree / "a.txt") + "\n"
 
 
 def test_ls_xattr(run: Run) -> None:
-    _, out, _ = run(
-        "ls", "-l", "--xattr", "user.status", "--xattr", "user.guid", "mock://h/f?guid=g"
-    )
-    assert out.endswith(" mock://h/f?guid=g\tONLINE\tg\n")
-    _code, out, _ = run("ls", "-l", "--xattr", "user.status", "mock://h/d?list=a:1")
-    assert out.endswith(" a\tONLINE\n")
+    target = "mock://h/f?user.status=ONLINE&user.guid=g"
+    _, out, _ = run("ls", "-l", "--xattr", "user.status", "--xattr", "user.guid", target)
+    assert out.endswith(f" {target}\tONLINE\tg\n")
+    listing = "mock://h/d?list=a:1&user.status=ONLINE"
+    _code, out, _ = run("ls", "-l", "--xattr", "user.status", listing)
+    assert out.endswith(" a\tONLINE/a\n")  # gfal2's too: the child is "<listing>/a"
     assert run("ls", "--xattr", "user.status", "mock://h/d?list=a:1") == (0, "a\n", "")
 
 
@@ -713,18 +798,40 @@ def test_rm_directory(run: Run, tree: Path) -> None:
     assert not (tree / "sub").exists()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_rm_recursive_rmdir_failure(run: Run, tree: Path) -> None:
+    (tree / "p" / "d").mkdir(parents=True)
+    os.chmod(tree / "p", 0o555)
+    try:
+        code, out, err = run("rm", "-r", url(tree / "p" / "d"))
+    finally:
+        os.chmod(tree / "p", 0o755)
+    assert (code, out) == (errno.EACCES, f"{url(tree / 'p' / 'd')}\tFAILED\n")
+    assert err.startswith("gfal-rm error: 13 (Permission denied) - ")
+
+
+def test_rm_recursive_rmdir_missing(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def gone(self: Gfal2Context, path: str) -> int:
+        raise GError("gone", errno.ENOENT)
+
+    monkeypatch.setattr(Gfal2Context, "rmdir", gone)
+    code, out, _ = run("rm", "-r", url(tree / "sub"))
+    assert (code, out) == (
+        errno.ENOENT,
+        f"{url(tree / 'sub/b')}\tDELETED\n{url(tree / 'sub')}\tMISSING\n",
+    )
+
+
 def test_rm_failures(run: Run) -> None:
     code, out, err = run("rm", "mock://h/f?errno=13", "mock://h/g")
     assert (code, out) == (13, "mock://h/f?errno=13\tFAILED\n")
     assert err == "gfal-rm error: 13 (Permission denied) - Permission denied\n"
-    code, out, _ = run("rm", "mock://h/f?access_errno=13")
-    assert (code, out) == (13, "mock://h/f?access_errno=13\tFAILED\n")
-    code, out, _ = run("rm", "--just-delete", "mock://h/f?access_errno=2", "mock://h/g")
-    assert (code, out) == (2, "mock://h/f?access_errno=2\tMISSING\nmock://h/g\tDELETED\n")
-    code, out, _ = run("rm", "-r", "mock://h/d?list=&access_errno=2")
-    assert (code, out) == (2, "mock://h/d?list=&access_errno=2\tMISSING\n")
-    code, out, _ = run("rm", "-r", "mock://h/d?list=&access_errno=5")
-    assert (code, out) == (5, "mock://h/d?list=&access_errno=5\tFAILED\n")
+    code, out, _ = run("rm", "--just-delete", "mock://h/f?errno=2", "mock://h/g")
+    assert (code, out) == (2, "mock://h/f?errno=2\tMISSING\nmock://h/g\tDELETED\n")
+    code, out, _ = run("rm", "-r", "mock://h/d?list=&errno=2")
+    assert (code, out) == (2, "mock://h/d?list=&errno=2\tMISSING\n")
+    code, out, _ = run("rm", "-r", "mock://h/d?list=&errno=5")
+    assert (code, out) == (5, "mock://h/d?list=&errno=5\tFAILED\n")
 
 
 def test_rm_just_delete_dry_run(run: Run, tree: Path) -> None:
@@ -762,7 +869,7 @@ def test_rm_bulk(run: Run, tree: Path) -> None:
         "No such file or directory\n"
         "mock://h/x\tDELETED\n"
     )
-    code, out, _ = run("rm", "--just-delete", url(tree / "nope"), "mock://h/x?access_errno=5")
+    code, out, _ = run("rm", "--just-delete", url(tree / "nope"), "mock://h/x?errno=5")
     assert code == 5  # the failure that stops the command wins
 
 
@@ -882,3 +989,72 @@ def test_evict(run: Run) -> None:
         "",
         "gfal-evict error: 22 (Invalid argument) - Invalid argument\n",
     )
+
+
+# ---------------------------------------------------------------------------
+# Version tools and the legacy commands
+# ---------------------------------------------------------------------------
+
+
+def test_version_tools(run: Run) -> None:
+    assert run("gfal2_version") == (0, "GFAL-client-2.23.5\n", "")
+    assert run("gfal_srm_ifce_version", "-x") == (0, "gfal-srm-ifce--1.24.8\n", "")
+
+
+def test_legacy_help(run: Run) -> None:
+    code, out, _ = run("legacy_register", "--help")
+    assert code == 0
+    assert out.startswith("usage: gfal-legacy-register [-h] [-V]")
+    assert "\nGfal util REGISTER command. Register a replica.\n" in out
+    assert "  lfc                   LFC entry (lfc:// or guid:)\n" in out
+    assert "  surl                  Site URL to be unregistered\n" in out
+    _, out, _ = run("legacy_unregister", "--help")
+    assert "\nGfal util UNREGISTER command. Unregister a replica.\n" in out
+    _, out, _ = run("legacy_replicas", "--help")
+    assert "\nGfal util REPLICAS command. List replicas.\n" in out
+    assert run("legacy_replicas")[0] == 2
+
+
+def test_legacy_bringonline(run: Run, no_sleep: list[float]) -> None:
+    notice = "This command is deprecated. Please use gfal-bringonline instead.\n"
+    code, out, _ = run("legacy_bringonline", "--help")
+    assert code == 0
+    assert out.startswith(notice + "usage: gfal-legacy-bringonline [-h]")
+    assert "\nGfal util BRINGONLINE command. Execute bring online.\n" in out
+    code, out, _ = run("legacy_bringonline", "mock://h/f")
+    assert code == 0
+    assert out.startswith(notice + "Bringonline token: ")
+
+
+def test_legacy_replicas_without_catalogue(run: Run, tree: Path) -> None:
+    code, out, err = run("legacy_replicas", url(tree / "a.txt"))
+    assert (code, out) == (errno.ENODATA, "")
+    assert err.startswith(f"gfal-legacy-replicas error: {errno.ENODATA} (")
+
+
+@pytest.fixture
+def lfc(grid_env: PKI, monkeypatch: pytest.MonkeyPatch) -> Iterator[LFCServer]:
+    for name in ("LFC_HOST", "LFC_PORT", "CSEC_MECH", "LFC_CONNTIMEOUT", "LFC_CONRETRYINT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LFC_CONRETRY", "0")
+    with LFCServer(gsi=grid_env.server_context(), mapfile={USER_DN: "xgfal"}) as server:
+        server.mkdir("/grid", 0o777)
+        yield server
+
+
+def test_legacy_register_replicas_unregister(run: Run, lfc: LFCServer) -> None:
+    entry = lfc.url("/grid/f")
+    first = "mock://se.example.org/f?size=12&checksum=0000abcd"
+    second = "mock://se.example.org/g?size=12&checksum=0000abcd"
+    assert run("legacy_register", entry, first) == (0, "", "")
+    assert run("legacy_register", entry, second) == (0, "", "")
+    assert [replica.sfn for replica in lfc.lookup("/grid/f").replicas] == [first, second]
+    assert run("legacy_replicas", entry) == (0, f"{first}\n{second}\n", "")
+    assert run("legacy_unregister", entry, first) == (0, "", "")
+    assert run("legacy_replicas", entry) == (0, f"{second}\n", "")
+    code, _, err = run("legacy_unregister", entry, first)
+    assert code == errno.ENOENT
+    assert err.startswith("gfal-legacy-unregister error: 2 (No such file or directory) - ")
+    code, _, err = run("legacy_register", entry, "file:///no/host")
+    assert code == errno.EINVAL
+    assert err.startswith("gfal-legacy-register error: 22 (Invalid argument) - ")

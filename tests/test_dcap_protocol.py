@@ -30,7 +30,7 @@ from xgfalclient.types import Stat
         ("dcap://door/pnfs/f", DcapURL("dcap", "door", 22125, "/pnfs/f")),
         ("gsidcap://door/pnfs/f", DcapURL("gsidcap", "door", 22128, "/pnfs/f")),
         ("kdcap://door/pnfs/f", DcapURL("kdcap", "door", 22725, "/pnfs/f")),
-        ("DCAP://door:1234/pnfs/f", DcapURL("dcap", "door", 1234, "/pnfs/f")),
+        ("dcap://door:1234/pnfs/f", DcapURL("dcap", "door", 1234, "/pnfs/f")),
         ("dcap://[::1]:1/a?b#c", DcapURL("dcap", "::1", 1, "/a?b#c")),
         ("dcap://door//double", DcapURL("dcap", "door", 22125, "//double")),
     ],
@@ -41,7 +41,15 @@ def test_parse_url(url: str, expected: DcapURL) -> None:
 
 @pytest.mark.parametrize(
     "url",
-    ["dcap:///pnfs/f", "dcap://door", "root://door/f", 'dcap://door/a"b', "dcap://door/a\nb"],
+    [
+        "dcap:///pnfs/f",
+        "dcap://door",
+        "root://door/f",
+        'dcap://door/a"b',
+        "dcap://door/a\nb",
+        "DCAP://door/f",
+        "Gsidcap://door/f",
+    ],
 )
 def test_parse_url_rejects(url: str) -> None:
     with pytest.raises(GError) as info:

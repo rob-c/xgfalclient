@@ -39,7 +39,7 @@ def check_upload(response: Response) -> None:
     """Raise the gfal2-worded error for a ``PUT`` that did not succeed."""
     with response:
         if response.status not in UPLOAD_OK:
-            raise status_error(response.status, response.reason)
+            raise status_error(response.status)
 
 
 class HTTPReadFile(PluginFile):
@@ -152,10 +152,17 @@ def _read_exactly(response: Response, size: int) -> bytes:
 class HTTPWriteFile(PluginFile):
     """A remote file opened for writing; the ``PUT`` completes on :meth:`close`."""
 
-    def __init__(self, plugin: HTTPPlugin, url: str, size: int | None) -> None:
+    def __init__(
+        self,
+        plugin: HTTPPlugin,
+        url: str,
+        size: int | None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(url)
         self._plugin = plugin
         self._size = size
+        self._headers = headers or {}
         self._upload: Upload | None = None
         self._spool = (
             tempfile.TemporaryFile(prefix="xgfal-put-")  # noqa: SIM115 - closed in close()
@@ -167,7 +174,7 @@ class HTTPWriteFile(PluginFile):
         if self._upload is None:
             assert self._size is not None
             self._upload = self._plugin.client.upload(
-                self.url, self._size, timeout=self._plugin.io_timeout()
+                self.url, self._size, headers=self._headers, timeout=self._plugin.io_timeout()
             )
         return self._upload
 
@@ -197,7 +204,10 @@ class HTTPWriteFile(PluginFile):
                 if not failing:
                     self._spool.flush()
                     self._plugin._put_file(
-                        self.url, FileBody(self._spool, 0, self.position), self.position
+                        self.url,
+                        FileBody(self._spool, 0, self.position),
+                        self.position,
+                        headers=self._headers,
                     )
             elif failing:
                 if self._upload is not None:

@@ -3,8 +3,12 @@
 Boost.Python enums are ``int`` subclasses with a ``name`` attribute and two
 class-level dictionaries, ``names`` (name to member) and ``values`` (value to
 member). Code in the wild reads all three - ``gfal2.checksum_mode.names`` is
-how gfal2-util parses ``-K`` - so the same surface is reproduced exactly,
-including ``values`` keeping only the first member for a duplicated value.
+how gfal2-util parses ``-K`` - so the same surface is reproduced exactly:
+``str()`` is the bare name and ``repr()`` the qualified one, ``values`` keeps
+the *last* member registered for a duplicated value (``verbose_level.values[128]``
+is ``trace``, as Boost's registration order leaves it), and calling the class
+with any int (``checksum_mode(2)``) gives a nameless instance equal to it,
+printed ``gfal2.checksum_mode(2)``, whose ``name`` raises ``AttributeError``.
 """
 
 from __future__ import annotations
@@ -23,18 +27,24 @@ class BoostEnum(int):
     values: ClassVar[dict[int, Any]]
     name: str
 
-    def __new__(cls: type[E], value: int, name: str) -> E:
+    def __new__(cls: type[E], value: int, name: str | None = None) -> E:
         member = super().__new__(cls, value)
-        member.name = name
+        if name is not None:
+            member.name = name
         return member
 
     def __repr__(self) -> str:
-        return f"gfal2.{type(self).__name__}.{self.name}"
+        name = self.__dict__.get("name")
+        kind = f"gfal2.{type(self).__name__}"
+        return f"{kind}.{name}" if name is not None else f"{kind}({int(self)})"
 
-    __str__ = __repr__
+    def __str__(self) -> str:
+        name = self.__dict__.get("name")
+        return str(name) if name is not None else repr(self)
 
-    def __reduce__(self) -> tuple[Any, tuple[int]]:
-        return (_lookup, (type(self).__name__, int(self)))  # type: ignore[return-value]
+    def __reduce__(self) -> tuple[Any, tuple[str, int, bool]]:
+        named = "name" in self.__dict__
+        return (_lookup, (type(self).__name__, int(self), named))  # type: ignore[return-value]
 
 
 def _define(cls: type[E], members: list[tuple[str, int]]) -> None:
@@ -44,7 +54,7 @@ def _define(cls: type[E], members: list[tuple[str, int]]) -> None:
         member = cls(value, name)
         setattr(cls, name, member)
         cls.names[name] = member
-        cls.values.setdefault(value, member)
+        cls.values[value] = member
 
 
 class checksum_mode(BoostEnum):
@@ -88,6 +98,7 @@ _ENUMS: dict[str, type[BoostEnum]] = {
 }
 
 
-def _lookup(kind: str, value: int) -> BoostEnum:
-    """Unpickle a member: the first one registered for ``value``."""
-    return _ENUMS[kind].values[value]  # type: ignore[no-any-return]
+def _lookup(kind: str, value: int, named: bool = True) -> BoostEnum:
+    """Unpickle: the member registered for ``value``, or a nameless instance again."""
+    cls = _ENUMS[kind]
+    return cls.values[value] if named else cls(value)  # type: ignore[no-any-return]

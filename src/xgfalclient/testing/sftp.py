@@ -512,7 +512,11 @@ class _Session:
         self.send(fx.NAME, rid, uint32(count) + body)
 
     def op_remove(self, rid: int, reader: Reader) -> None:
-        os.unlink(self.server.local(reader.string()))
+        path = self.server.local(reader.string())
+        if _stat.S_ISDIR(os.lstat(path).st_mode):
+            # Linux says EISDIR (FAILURE from sshd); macOS says EPERM. Be Linux.
+            raise IsADirectoryError(errno.EISDIR, "Is a directory")
+        os.unlink(path)
         self.status(rid, fx.FX_OK)
 
     def op_mkdir(self, rid: int, reader: Reader) -> None:

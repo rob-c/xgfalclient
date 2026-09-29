@@ -352,3 +352,13 @@ def test_active_mode_e_upload(ftp: GridFTPServer) -> None:
     control.final()
     assert (Path(ftp.root) / "g").read_bytes() == data
     control.close()
+
+
+def test_partial_and_v2_commands(ftp: GridFTPServer) -> None:
+    write(Path(ftp.root) / "f", b"abc")
+    control = raw(ftp)
+    assert answer(control, "ESTO B 0 /f").startswith("501 Unsupported ESTO module")
+    assert answer(control, "SITE SETNETSTACK default").startswith("200")
+    assert answer(control, "SITE SETNETSTACK udt").startswith("500")
+    assert answer(control, "GET file=/f;").startswith("425")  # no data channel asked for
+    assert answer(control, "MLSD /f").startswith("451")  # not a directory

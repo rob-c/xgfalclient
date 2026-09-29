@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
 
 import pytest
@@ -66,11 +68,37 @@ def test_invalid_values(options: Options) -> None:
 
 
 @pytest.mark.parametrize(
-    ("raw", "value"), [("true", True), ("1", True), ("FALSE", False), ("0", False)]
+    ("raw", "value"), [("true", True), ("1", True), ("false \t", False), ("0", False)]
 )
 def test_booleans(options: Options, raw: str, value: bool) -> None:
     options.set_string("X", "B", raw)
     assert options.get_boolean("X", "B") is value
+
+
+@pytest.mark.parametrize("raw", ["TRUE", "False", " true", "yes", ""])
+def test_booleans_are_case_sensitive_as_in_glib(options: Options, raw: str) -> None:
+    options.set_string("X", "B", raw)
+    with pytest.raises(GError) as caught:
+        options.get_boolean("X", "B")
+    assert caught.value.code == INVALID_VALUE
+
+
+@pytest.mark.parametrize(
+    ("raw", "value"), [("12", 12), ("+12", 12), (" -7", -7), ("2147483647", 2**31 - 1)]
+)
+def test_integers(options: Options, raw: str, value: int) -> None:
+    options.set_string("X", "I", raw)
+    assert options.get_integer("X", "I") == value
+
+
+@pytest.mark.parametrize(
+    "raw", [" 12 ", "1_000", "0x10", "99999999999", "-2147483649", "١٢", "", "12\n"]
+)
+def test_integers_follow_glib_strictly(options: Options, raw: str) -> None:
+    options.set_string("X", "I", raw)
+    with pytest.raises(GError) as caught:
+        options.get_integer("X", "I")
+    assert caught.value.code == INVALID_VALUE
 
 
 def test_setters_round_trip_as_glib_does(options: Options) -> None:
@@ -118,13 +146,19 @@ def test_timeout_prefers_the_plugin_group(options: Options) -> None:
 
 
 def test_parse_ini_grammar() -> None:
-    text = "# comment\n\n[A]\nk = v ; w\n[ B ]\nx=\n"
-    assert parse_ini(text) == {"A": {"k": "v ; w"}, "B": {"x": ""}}
-    for bad in ("k=v\n", "[A]\nnot a key\n", "[A]\n=v\n", "[A]\n[unclosed\n"):
+    text = "# comment\n\n[A]\nk = v ; w\n[ B ]\nx=\n[C]\n"
+    assert parse_ini(text) == {"A": {"k": "v ; w"}, "B": {"x": ""}, "C": {}}
+    for bad in ("[A]\nnot a key\n", "[A]\n=v\n", "[A]\n[unclosed\n"):
         with pytest.raises(GError) as caught:
             parse_ini(bad, "f.conf")
-        assert caught.value.code == PARSE_ERROR
-        assert "f.conf" in caught.value.message
+        line = bad.split("\n")[1]
+        assert caught.value.args == (
+            f"Key file contains line “{line}” which is not a key-value pair, group, or comment",
+            PARSE_ERROR,
+        )
+    with pytest.raises(GError) as caught:
+        parse_ini("k=v\n[A]\n")
+    assert caught.value.args == ("Key file does not start with a group", GROUP_NOT_FOUND)
 
 
 def test_load_file_and_errors(tmp_path: Path, options: Options) -> None:
@@ -133,20 +167,60 @@ def test_load_file_and_errors(tmp_path: Path, options: Options) -> None:
     options.load_file(str(conf))
     assert options.get_boolean("HTTP PLUGIN", "INSECURE") is True
     assert options.get_integer("NEW", "K") == 1
+    missing = tmp_path / "missing.conf"
     with pytest.raises(GError) as caught:
-        options.load_file(str(tmp_path / "missing.conf"))
-    assert caught.value.code == 2
-    assert "missing.conf" in caught.value.message
+        options.load_file(str(missing))
+    assert caught.value.args == (
+        f"Error while loading configuration file {missing}: No such file or directory",
+        4,  # G_FILE_ERROR_NOENT
+    )
+    for irregular in (tmp_path, Path(os.devnull)):
+        with pytest.raises(GError) as caught:
+            options.load_file(str(irregular))
+        assert caught.value.args == (
+            f"Error while loading configuration file {irregular}: Not a regular file",
+            PARSE_ERROR,
+        )
+    bad = tmp_path / "bad.conf"
+    bad.write_text("[OK]\nK=1\n[G]\ngarbage\n")
+    with pytest.raises(GError) as caught:
+        options.load_file(str(bad))
+    assert caught.value.code == PARSE_ERROR
+    assert caught.value.message.startswith(f"Error while loading configuration file {bad}: Key")
+    assert "OK" not in options.groups()  # all or nothing
 
 
-def test_load_file_error_without_errno(monkeypatch: pytest.MonkeyPatch, options: Options) -> None:
+def test_a_group_without_keys_is_not_created(tmp_path: Path, options: Options) -> None:
+    conf = tmp_path / "x509.conf"
+    conf.write_text("[X509]\n# CERT=/path\n")
+    options.load_file(str(conf))
+    with pytest.raises(GError) as caught:
+        options.get_string("X509", "CERT")
+    assert caught.value.code == GROUP_NOT_FOUND
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (OSError("no errno here"), ("no errno here", 24)),
+        (OSError(errno.EACCES, "denied"), ("Permission denied", 2)),
+        (OSError(errno.ECONNRESET, "odd"), (os.strerror(errno.ECONNRESET), 24)),
+    ],
+)
+def test_load_file_open_failures(
+    monkeypatch: pytest.MonkeyPatch, options: Options, error: OSError, expected: tuple[str, int]
+) -> None:
     def refuse(*args: object, **kwargs: object) -> None:
-        raise OSError("no errno here")
+        raise error
 
     monkeypatch.setattr(options_module, "open", refuse, raising=False)
     with pytest.raises(GError) as caught:
         options.load_file("/anywhere.conf")
-    assert caught.value.code == 0
+    message, code = expected
+    assert caught.value.args == (
+        f"Error while loading configuration file /anywhere.conf: {message}",
+        code,
+    )
 
 
 def test_system_files_follow_gfal_config_dir(tmp_path: Path) -> None:

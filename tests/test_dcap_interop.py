@@ -145,6 +145,9 @@ _GFAL2_SCHEMES: set[str] = set()
 @pytest.fixture
 def gfal2_ctx(monkeypatch: pytest.MonkeyPatch, base: str) -> object:
     gfal2 = pytest.importorskip("gfal2")
+    if Path(gfal2.__file__).resolve().is_relative_to(Path(__file__).resolve().parent.parent):
+        # src/gfal2 is this package's shim: comparing with it compares with ourselves.
+        pytest.skip("import gfal2 found this repository's shim, not the real bindings")
     scheme = base.partition(":")[0]
     if _GFAL2_SCHEMES - {scheme}:
         # libdcap keys its one control line per process by host name alone, so

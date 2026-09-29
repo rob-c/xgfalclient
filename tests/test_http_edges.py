@@ -12,7 +12,16 @@ from pathlib import Path
 import pytest
 
 import xgfalclient
-from test_http_helpers import Events, dav, dav2, davs, hctx, make_server, write  # noqa: F401
+from test_http_helpers import (  # noqa: F401 - fixtures
+    Events,
+    dav,
+    dav2,
+    davs,
+    davs_open,
+    hctx,
+    make_server,
+    write,
+)
 from xgfalclient import GError
 from xgfalclient.plugin import O_CREAT, O_TRUNC, O_WRONLY
 from xgfalclient.plugins.http import _delegation
@@ -112,15 +121,17 @@ def test_delegation_without_a_proxy(hctx: xgfalclient.Gfal2Context, dav: WebDAVS
 
 
 def test_delegation_that_never_arrives(
-    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, davs: WebDAVServer, grid_env: PKI
+    hctx: xgfalclient.Gfal2Context, davs_open: WebDAVServer, davs: WebDAVServer, grid_env: PKI
 ) -> None:
     hctx.set_opt_boolean("HTTP PLUGIN", "ENABLE_FALLBACK_TPC_COPY", False)
-    write(dav, "/data/src", b"x")
+    hctx.set_opt_boolean("HTTP PLUGIN", "RETRIEVE_BEARER_TOKEN", False)
+    write(davs_open, "/data/src", b"x")
     davs.delegation = True
     davs.delegation_timeout = 0.2
     davs.fault("POST", path=DELEGATION, status=500, body=b"", times=2)
-    with pytest.raises(GError):
-        hctx.filecopy(dav.url("/data/src"), davs.url("/data/dst"))
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(davs_open.url("/data/src"), davs.url("/data/dst"))
+    assert "Delegation" in caught.value.message or "delegat" in caught.value.message
 
 
 def test_server_rejects_a_mismatched_proxy(davs: WebDAVServer, grid_env: PKI) -> None:

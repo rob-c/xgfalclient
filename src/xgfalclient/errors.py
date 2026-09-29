@@ -9,6 +9,13 @@ message alone, as it is there.
 It deliberately does not subclass :class:`OSError`: a ``GError`` is a plain
 ``Exception``, as in gfal2, so an ``except OSError`` in caller code does not
 start swallowing grid failures it never used to see.
+
+The class carries the bindings' class-level ``code = 0`` and ``message = ""``.
+Its constructor stays lenient (both arguments optional, keywords accepted)
+where gfal2's insists on exactly ``(str, int)``: nothing that works there
+breaks here. Imported as ``gfal2`` (the shim, or :func:`install_as_gfal2`),
+the class reports ``__module__ == "gfal2"``, so an uncaught one prints as
+``gfal2.GError: ...`` and still pickles by that name.
 """
 
 from __future__ import annotations
@@ -32,6 +39,9 @@ __all__ = [
 
 class GError(Exception):
     """A gfal2 error: ``code`` is an ``errno`` value, ``message`` the text."""
+
+    code: int = 0
+    message: str = ""
 
     def __init__(self, message: str = "", code: int = 0) -> None:
         super().__init__(message, code)

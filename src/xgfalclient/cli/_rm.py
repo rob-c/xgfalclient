@@ -119,6 +119,7 @@ def rm(cmd: Command) -> int | None:
 
 SPECS = {
     "rm": Spec(
+        "rm",
         "Removes files or directories",
         [
             arg(

@@ -1,22 +1,67 @@
-"""The records gfal2 hands back: ``Stat`` and ``Dirent``.
+"""The records gfal2 hands back, ``Stat`` and ``Dirent``, and the one it takes,
+``TransferParameters``.
 
-Both mirror the bindings field for field. ``str(stat)`` prints the same
-nine lines gfal2 does, with the mode in bare octal (``mode: 100644``),
-because scripts have been known to parse it.
+``Stat`` and ``Dirent`` mirror the bindings field for field. ``str(stat)``
+prints the same nine lines gfal2 does, with the mode in bare octal
+(``mode: 100644``), because scripts have been known to parse it.
+
+``TransferParameters`` fields are typed as the bindings type them: a
+non-integer ``timeout`` raises ``TypeError`` and a negative one
+``OverflowError`` on assignment (not a baffling failure of the copy later),
+flags read back as ``bool``, and ``scitag`` must be in ``[65, 65535]``.
+Setting ``timeout = 0`` is accepted; the copy engine treats it as "no limit"
+where gfal2's local copy expires at once (README, "Where it differs").
+``set_checksum`` still accepts a plain int for the mode, which gfal2 does not.
 """
 
 from __future__ import annotations
 
+import errno
+import operator
 import os
 import stat as _stat
-from typing import Any
+import warnings
+from collections.abc import Callable
+from typing import Any, Generic, TypeVar, overload
 
-__all__ = ["Stat", "Dirent", "DT_UNKNOWN", "DT_DIR", "DT_REG", "DT_LNK", "dtype_for_mode"]
+from .enums import checksum_mode
+from .errors import GError
+from .events import GfaltEvent
+
+__all__ = [
+    "Stat",
+    "Dirent",
+    "TransferParameters",
+    "DT_UNKNOWN",
+    "DT_FIFO",
+    "DT_CHR",
+    "DT_DIR",
+    "DT_BLK",
+    "DT_REG",
+    "DT_LNK",
+    "DT_SOCK",
+    "dtype_for_mode",
+]
 
 DT_UNKNOWN = 0
+DT_FIFO = 1
+DT_CHR = 2
 DT_DIR = 4
+DT_BLK = 6
 DT_REG = 8
 DT_LNK = 10
+DT_SOCK = 12
+
+#: ``S_IFMT`` bits to the ``d_type`` the kernel reports for them.
+_DTYPES = {
+    _stat.S_IFIFO: DT_FIFO,
+    _stat.S_IFCHR: DT_CHR,
+    _stat.S_IFDIR: DT_DIR,
+    _stat.S_IFBLK: DT_BLK,
+    _stat.S_IFREG: DT_REG,
+    _stat.S_IFLNK: DT_LNK,
+    _stat.S_IFSOCK: DT_SOCK,
+}
 
 _FIELDS = (
     "st_dev",
@@ -101,14 +146,8 @@ class Stat:
 
 
 def dtype_for_mode(mode: int) -> int:
-    """The ``d_type`` that goes with a ``st_mode``."""
-    if _stat.S_ISDIR(mode):
-        return DT_DIR
-    if _stat.S_ISLNK(mode):
-        return DT_LNK
-    if _stat.S_ISREG(mode):
-        return DT_REG
-    return DT_UNKNOWN
+    """The ``d_type`` that goes with a ``st_mode`` (``DT_UNKNOWN`` if none does)."""
+    return _DTYPES.get(_stat.S_IFMT(mode), DT_UNKNOWN)
 
 
 class Dirent:
@@ -139,3 +178,201 @@ class Dirent:
 def _reclen(name: str) -> int:
     """``d_reclen`` as glibc computes it: header plus name, 8-byte aligned."""
     return (19 + len(name.encode("utf-8", "surrogateescape")) + 1 + 7) & ~7
+
+
+# -- transfer parameters ------------------------------------------------------------
+
+T = TypeVar("T")
+
+
+class _Field(Generic[T]):
+    """A typed ``TransferParameters`` property, stored as ``_<name>`` on the instance.
+
+    The private slot keeps ``copy()`` (which clones ``vars()``) from running
+    values through validation again, and an unset field reads as its default.
+    """
+
+    def __init__(self, default: T) -> None:
+        self.default = default
+        self.name = ""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+
+    @overload
+    def __get__(self, instance: None, owner: type | None = None) -> _Field[T]: ...
+
+    @overload
+    def __get__(self, instance: object, owner: type | None = None) -> T: ...
+
+    def __get__(self, instance: object | None, owner: type | None = None) -> Any:
+        if instance is None:
+            return self
+        return instance.__dict__.get("_" + self.name, self.default)
+
+    def __set__(self, instance: object, value: Any) -> None:
+        instance.__dict__["_" + self.name] = self.convert(value)
+
+    def convert(self, value: Any) -> T:
+        raise NotImplementedError
+
+    def mismatch(self, value: Any, wanted: str) -> TypeError:
+        """What Boost.Python raises (an ``ArgumentError``, a ``TypeError``)."""
+        return TypeError(
+            f"TransferParameters.{self.name} must be {wanted}, not {type(value).__name__}"
+        )
+
+
+class _Unsigned(_Field[int]):
+    """An unsigned C integer of ``bits`` bits."""
+
+    def __init__(self, default: int, bits: int) -> None:
+        super().__init__(default)
+        self.limit = 1 << bits
+
+    def convert(self, value: Any) -> int:
+        try:
+            number = operator.index(value)
+        except TypeError:
+            raise self.mismatch(value, "an int") from None
+        if number < 0:
+            raise OverflowError("can't convert negative value to unsigned int")
+        if number >= self.limit:
+            raise OverflowError("bad numeric conversion: positive overflow")
+        return number
+
+
+class _SciTag(_Unsigned):
+    """``gfalt_set_scitag``: an unsigned int in gfal2's SciTag range."""
+
+    def convert(self, value: Any) -> int:
+        number = super().convert(value)
+        if not 65 <= number <= 65535:
+            raise GError("Invalid SciTag value (must be in the [65, 65535] range)", errno.EINVAL)
+        return number
+
+
+class _Flag(_Field[bool]):
+    def convert(self, value: Any) -> bool:
+        try:
+            return bool(operator.index(value))
+        except TypeError:
+            raise self.mismatch(value, "a bool") from None
+
+
+class _Text(_Field[str]):
+    def convert(self, value: Any) -> str:
+        if not isinstance(value, str):
+            raise self.mismatch(value, "a str")
+        return value
+
+
+EventCallback = Callable[[GfaltEvent], Any]
+MonitorCallback = Callable[[str, str, int, int, int, int], Any]
+
+
+class TransferParameters:
+    """What ``ctx.transfer_parameters()`` returns: the knobs of one copy.
+
+    Attribute names, types and defaults are gfal2's. ``checksum_check`` and
+    the ``*_user_defined_checksum`` pair are gfal2's deprecated spellings of
+    :meth:`set_checksum` and still work, with the same warnings.
+    """
+
+    timeout = _Unsigned(3600, 64)
+    nbstreams = _Unsigned(0, 32)
+    tcp_buffersize = _Unsigned(0, 64)
+    scitag = _SciTag(0, 32)
+    overwrite = _Flag(False)
+    strict_copy = _Flag(False)
+    create_parent = _Flag(False)
+    local_transfers = _Flag(True)
+    proxy_delegation = _Flag(True)
+    transfer_cleanup = _Flag(True)
+    evict = _Flag(False)
+    src_spacetoken = _Text("")
+    dst_spacetoken = _Text("")
+
+    def __init__(self) -> None:
+        self.event_callback: EventCallback | None = None
+        self.monitor_callback: MonitorCallback | None = None
+        self._mode = checksum_mode.none
+        self._algorithm = ""
+        self._value = ""
+
+    def copy(self) -> TransferParameters:
+        clone = TransferParameters()
+        clone.__dict__.update(vars(self))
+        return clone
+
+    # -- checksums ---------------------------------------------------------------
+
+    def set_checksum(self, mode: int, algorithm: str, value: str) -> None:
+        """Which ends to verify, with which algorithm, against which value.
+
+        ``source`` and ``target`` compare one end with ``value``, so they
+        need one; ``both`` compares the ends with each other and ``value``
+        is optional.
+        """
+        member = checksum_mode.values.get(int(mode))
+        if member is None:
+            raise GError(f"Invalid checksum mode {mode}", errno.EINVAL)
+        if member in (checksum_mode.source, checksum_mode.target) and not value:
+            raise GError("Checksum value required if mode is not end to end", errno.EINVAL)
+        self._mode, self._algorithm, self._value = member, algorithm or "", value or ""
+
+    def get_checksum(self) -> tuple[checksum_mode, str, str]:
+        return self._mode, self._algorithm, self._value
+
+    @property
+    def checksum_mode(self) -> checksum_mode:
+        return self._mode
+
+    @property
+    def checksum_algorithm(self) -> str:
+        return self._algorithm
+
+    @property
+    def checksum_value(self) -> str:
+        return self._value
+
+    @property
+    def checksum_check(self) -> bool:
+        warnings.warn(
+            "checksum_check is deprecated. Use get_checksum_mode instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._mode != checksum_mode.none
+
+    @checksum_check.setter
+    def checksum_check(self, enabled: bool) -> None:
+        warnings.warn(
+            "checksum_check is deprecated. Use set_checksum instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self._mode = checksum_mode.both if enabled else checksum_mode.none
+
+    def set_user_defined_checksum(self, algorithm: str, value: str) -> None:
+        """Keeps the current mode, and is refused as :meth:`set_checksum` would be."""
+        warnings.warn(
+            "set_user_defined_checksum is deprecated. Use set_checksum instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.set_checksum(self._mode, algorithm, value)
+
+    def get_user_defined_checksum(self) -> tuple[str, str]:
+        warnings.warn(
+            "get_user_defined_checksum is deprecated. Use get_checksum instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._algorithm, self._value
+
+    def __repr__(self) -> str:
+        return (
+            f"TransferParameters(timeout={self.timeout}, nbstreams={self.nbstreams}, "
+            f"overwrite={self.overwrite}, checksum={self._mode.name})"
+        )

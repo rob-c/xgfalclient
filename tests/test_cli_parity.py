@@ -5,7 +5,7 @@ Python (3.9) are the same: the real ``gfal-<cmd>`` there, and this package's
 ``python3 -m xgfalclient.cli <cmd>`` from a bind mount of ``src``. Every case
 starts from a fresh fixture tree whose files have a fixed mtime, so nothing
 needs masking but what is genuinely variable: event timestamps, staging
-tokens, ``ctime``, the version banner and tracebacks' bodies.
+tokens, ``ctime``, ``-V``'s list of plugins and tracebacks' bodies.
 
 Skipped unless ``XGFAL_INTEROP=1``. Run as a script for a report::
 
@@ -33,8 +33,10 @@ pytestmark = pytest.mark.interop
 W = "file:///work/d"
 M = "mock://host/path"
 
-#: (name, [argv...], stdin) - argv[0] is the command without ``gfal-``;
-#: several argvs run in sequence against the same fixture tree.
+#: (name, [argv...], stdin) - argv[0] is the command without ``gfal-`` (or a
+#: tool with an ``_`` in its name, run as it is), after any ``NAME=value``
+#: environment settings; several argvs run in sequence against the same
+#: fixture tree.
 CASES: list[tuple[str, list[list[str]], str]] = []
 
 
@@ -49,6 +51,10 @@ for _command in (
     "chmod",
     "copy",
     "evict",
+    "legacy-bringonline",
+    "legacy-register",
+    "legacy-replicas",
+    "legacy-unregister",
     "ls",
     "mkdir",
     "rename",
@@ -61,6 +67,15 @@ for _command in (
 ):
     case(f"help-{_command}", [_command, "--help"])
     case(f"usage-{_command}", [_command, "--no-such-option"])
+
+# -- common -----------------------------------------------------------------------
+case("version", ["ls", "-V"])
+case("version-copy", ["copy", "--version"])
+case("ls-colors-stat", ["LS_COLORS=di=1:a=b=c", "stat", f"{W}/a.txt"])
+case("ls-colors-help", ["LS_COLORS=a=b=c:x=y=z", "rm", "--help"])
+case("ls-colors-ls", ["LS_COLORS=di=01;34:a=b=c", "ls", "--color=always", W])
+case("gfal2_version", ["gfal2_version"])
+case("gfal_srm_ifce_version", ["gfal_srm_ifce_version", "--help"])
 
 # -- ls ---------------------------------------------------------------------------
 case("ls", ["ls", W])
@@ -244,6 +259,11 @@ case("xattr-mock-get-bad", ["xattr", f"{M}?size=1", "user.nope"])
 case("xattr-mock-list", ["xattr", f"{M}?size=1"])
 case("xattr-file-set-empty", ["xattr", f"{W}/a.txt", "user.x="])
 case("token-mock", ["token", f"{M}?size=1"])
+case("ls-mock-dir-l", ["ls", "-l", f"{M}?list=a:0644:10,b:040755:3,c"])
+case("rm-mock-bulk-errno", ["rm", "--bulk", f"{M}/b?errno=13"])
+case("mkdir-mock-rd-path", ["mkdir", f"{M}/a/?rd_path={M}/a/"])
+case("xattr-mock-get-value", ["xattr", f"{M}?user.guid=g", "user.guid"])
+case("copy-mock-late-errno", ["copy", "-f", f"{M}/s?size=1", f"{M}/d?time=1&transfer_errno=5"])
 case("token-validity", ["token", "--validity=-1", f"{M}?size=1"])
 case("bringonline", ["bringonline", f"{M}?size=1"])
 case("bringonline-errno", ["bringonline", f"{M}?staging_errno=22"])
@@ -258,24 +278,19 @@ case("archivepoll-none", ["archivepoll"])
 case("evict", ["evict", f"{M}?size=1"])
 case("evict-errno", ["evict", f"{M}?release_errno=22", "tok"])
 
+# -- legacy -----------------------------------------------------------------------
+case("legacy-replicas-file", ["legacy-replicas", f"{W}/a.txt"])
+case("legacy-replicas-none", ["legacy-replicas"])
+case("legacy-register-missing", ["legacy-register", f"{W}/nope", f"{W}/a.txt"])
+case("legacy-bringonline", ["legacy-bringonline", f"{M}?size=1"])
+case("legacy-bringonline-none", ["legacy-bringonline"])
+
 #: Cases whose outputs differ for a reason outside the CLI (a plugin or the
 #: core behaving differently from gfal2), with the reason.
 KNOWN: dict[str, str] = {
     "ls-a": "file plugin: '.' and '..' come first (os.scandir cannot report readdir's order)",
     "ls-la": "file plugin: '.' and '..' come first (os.scandir cannot report readdir's order)",
     "ls-verbose": "library log messages are the library's own",
-    "sum-missing": "file plugin: checksum error wording",
-    "copy-K-unsupported": "core: no 'Could not get the source checksum: ' prefix",
-    "copy-mock": "mock plugin: gfal2's says a size_post destination exists before the copy",
-    "copy-mock-errno": "mock plugin: gfal2's says a size_post destination exists before the copy",
-    "copy-mock-to-file": "core: gfal2 creates a streamed copy's destination 0755",
-    "copy-mode": "core: gfal2 creates a streamed copy's destination 0755",
-    "xattr-mock-get": "mock plugin: gfal2's has no user.status xattr",
-    "xattr-mock-list": "mock plugin: gfal2's has no listxattr",
-    "token-mock": "mock plugin: gfal2's has no token_retrieve",
-    "copy-verbose": "core: monitor_callback fires for a sub-second copy (gfal2's does not)",
-    "copy-verbose-K": "core: monitor_callback fires for a sub-second copy (gfal2's does not)",
-    "copy-verbose-mock": "core/mock: event descriptions; gfal2 XML-escapes '&' in LIST:ITEM",
 }
 
 # The driver, run with the image's python3 (3.9).
@@ -301,12 +316,17 @@ def run(side, commands, stdin):
     reset()
     results = []
     for argv in commands:
+        settings = {}
+        while "=" in argv[0]:
+            key, value = argv[0].split("=", 1)
+            settings[key] = value
+            argv = argv[1:]
         if side == "ref":
-            full = ["gfal-" + argv[0]] + argv[1:]
-            env = dict(os.environ)
+            full = [argv[0] if "_" in argv[0] else "gfal-" + argv[0]] + argv[1:]
+            env = dict(os.environ, **settings)
         else:
             full = ["python3", "-m", "xgfalclient.cli"] + argv
-            env = dict(os.environ, PYTHONPATH="/src")
+            env = dict(os.environ, PYTHONPATH="/src", **settings)
         proc = subprocess.run(full, input=stdin.encode(), stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, cwd="/work", env=env, timeout=120)
         results.append([proc.returncode, proc.stdout.decode("utf-8", "replace"),
@@ -327,7 +347,8 @@ _MASKS = [
     # times of files the case itself created (the fixtures are all 2020-01-02)
     (re.compile(r"^(Access|Modify): (?!2020-01-02).*$", re.M), r"\1: <NOW>"),
     (re.compile(r" [A-Z][a-z]{2} [ \d]\d \d\d:\d\d "), " <NOW> "),
-    (re.compile(r"^gfal2-util version .*?(?=\n\S|\Z)", re.M | re.S), "<VERSION>"),
+    # -V: the version line is compared; the plugin list is ours (more plugins)
+    (re.compile(r"^(gfal2-util version [^\n]*)(?:\n\t[^\n]*)+", re.M), r"\1\n<PLUGINS>"),
     (
         re.compile(
             r"^(Exception in thread [^\n]*\n)?Traceback \(most recent call last\):\n(?:[ \t].*\n)*",

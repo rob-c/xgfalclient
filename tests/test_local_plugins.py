@@ -5,7 +5,9 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import signal
 import sys
+import threading
 import types
 import zlib
 from pathlib import Path
@@ -15,11 +17,13 @@ import pytest
 
 import xgfalclient
 from conftest import file_url
-from xgfalclient import GError, Gfal2Context, plugins
+from xgfalclient import GError, Gfal2Context, checksum_mode, plugins
 from xgfalclient.plugin import O_CREAT, O_RDWR, O_WRONLY, Plugin, PluginFile
 from xgfalclient.plugins import file as file_plugin
+from xgfalclient.plugins import mock as mock_module
 from xgfalclient.plugins.file import FilePlugin, LocalFile
 from xgfalclient.plugins.mock import MockPlugin
+from xgfalclient.transfer import Transfer
 
 LOCAL = f"errno reported by local system call {os.strerror(errno.ENOENT)}"
 
@@ -108,7 +112,24 @@ def test_file_listing_tolerates_vanishing_entries(ctx: Gfal2Context, data_dir: P
     plugin = ctx.plugin("file:///", "opendir")
     assert isinstance(plugin, FilePlugin)
     entries = list(plugin._entries(str(data_dir), [Gone()]))  # type: ignore[list-item]
-    assert entries[-1] == ("gone", None)
+    assert entries[-1] == ("gone", None, 0)
+
+
+def test_file_listing_reports_each_entrys_own_type(ctx: Gfal2Context, data_dir: Path) -> None:
+    """d_type as readdir gives it: a link is DT_LNK, a FIFO DT_FIFO, whatever they point at."""
+    (data_dir / "link").symlink_to(data_dir / "hello.txt")
+    (data_dir / "dangling").symlink_to(data_dir / "nowhere")
+    os.mkfifo(data_dir / "fifo")
+    entries = {e.d_name: e.d_type for e in ctx.opendir(file_url(data_dir))}
+    assert (entries["link"], entries["dangling"], entries["fifo"]) == (10, 10, 1)
+    (data_dir / "dangling").unlink()
+    directory = ctx.opendir(file_url(data_dir))
+    found = {}
+    for _ in range(6):  # ., .., hello.txt, link, fifo, then the end
+        entry, info = directory.readpp()
+        if entry is not None:
+            found[entry.d_name] = (entry.d_type, info.st_size)  # type: ignore[union-attr]
+    assert found["link"] == (10, 12)  # its stat is the target's
 
 
 def test_file_io(ctx: Gfal2Context, data_dir: Path) -> None:
@@ -132,6 +153,22 @@ def test_file_io(ctx: Gfal2Context, data_dir: Path) -> None:
     with pytest.raises(GError) as caught:
         ctx.open(base + "/missing/x", "w")
     assert caught.value.code == errno.ENOENT
+
+
+def test_file_io_errors_are_worded_as_gfal2(ctx: Gfal2Context, data_dir: Path) -> None:
+    with ctx.open(file_url(data_dir) + "/hello.txt", "r") as handle:
+        with pytest.raises(GError) as caught:
+            handle.write("x")
+        assert caught.value.args == (
+            "errno reported by local system call Bad file descriptor",
+            errno.EBADF,
+        )
+        with pytest.raises(GError) as caught:
+            handle.lseek(-100, os.SEEK_SET)
+        assert caught.value.args == (
+            "errno reported by local system call Invalid argument",
+            errno.EINVAL,
+        )
 
 
 def test_file_pwrite_retries_short_writes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -241,145 +278,517 @@ def test_file_xattrs_without_os_support(
     assert caught.value.code == errno.ENOTSUP
 
 
-# -- mock:// -------------------------------------------------------------------------------
+def _local(code: int) -> str:
+    return f"errno reported by local system call {os.strerror(code)}"
 
 
-def test_mock_stat_grammar(ctx: Gfal2Context) -> None:
-    info = ctx.stat("mock://host/path/file?size=1234")
-    assert (info.st_size, oct(info.st_mode)) == (1234, "0o100755")
-    assert ctx.stat("mock://h/d?list=a:1").is_dir()
-    assert ctx.stat("mock://h/f").st_size == 0
-    assert ctx.stat("mock://h/f?size=bogus").st_size == 0
-    assert ctx.stat("mock://h/f?size_pre=7").st_size == 7
-    assert ctx.stat("mock://h/f?size_post=9").st_size == 9  # exists before a copy, as in gfal2
+def test_file_access_reports_the_real_errno(
+    ctx: Gfal2Context, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = file_url(tmp_path)
+    (tmp_path / "afile").write_text("x")
+    (tmp_path / "dangle").symlink_to(tmp_path / "nothere")
+    (tmp_path / "loop1").symlink_to(tmp_path / "loop2")
+    (tmp_path / "loop2").symlink_to(tmp_path / "loop1")
+    for path, mode, code in [
+        ("/afile/b", os.R_OK, errno.ENOTDIR),
+        ("/dangle", os.F_OK, errno.ENOENT),
+        ("/loop1", os.F_OK, errno.ELOOP),
+        ("/afile", os.X_OK, errno.EACCES),  # no execute bit: even root is refused
+        ("/afile", 64, errno.EINVAL),
+    ]:
+        with pytest.raises(GError) as caught:
+            ctx.access(base + path, mode)
+        assert (caught.value.code, caught.value.message) == (code, _local(code))
+    monkeypatch.setattr(file_plugin.os, "access", lambda path, mode: False)
+    monkeypatch.setattr(
+        file_plugin.os, "statvfs", lambda path: types.SimpleNamespace(f_flag=os.ST_RDONLY)
+    )
     with pytest.raises(GError) as caught:
-        ctx.stat("mock://host/path/file?errno=13")
-    assert (caught.value.code, caught.value.message) == (errno.EACCES, "Permission denied")
+        ctx.access(base + "/afile", os.W_OK)
+    assert caught.value.code == errno.EROFS
+    monkeypatch.setattr(file_plugin.os, "statvfs", lambda path: types.SimpleNamespace(f_flag=0))
+    with pytest.raises(GError) as caught:
+        ctx.access(base + "/afile", os.W_OK)
+    assert caught.value.code == errno.EACCES
 
 
-def test_mock_namespace_errors(ctx: Gfal2Context) -> None:
+def test_file_listing_follows_links(ctx: Gfal2Context, tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_bytes(b"hello!")
+    (tmp_path / "lnk").symlink_to(tmp_path / "a.txt")
+    os.mkfifo(tmp_path / "fifo")
+    base = file_url(tmp_path)
+    directory = ctx.opendir(base)
+    found = {}
+    while True:
+        dirent, info = directory.readpp()
+        if dirent is None:
+            break
+        found[dirent.d_name] = info
+    assert found["lnk"].st_size == 6 and found["lnk"].is_file()  # the target, as gfal2 shows it
+    (tmp_path / "gone").symlink_to(tmp_path / "nothere")
+    directory = ctx.opendir(base)
+    with pytest.raises(GError) as caught:  # gfal2 aborts the long listing here too
+        while directory.readpp()[0] is not None:
+            pass
+    assert caught.value.code == errno.ENOENT
+    assert "gone" in [e.d_name for e in ctx.opendir(base)]  # a plain listing still works
+
+
+def test_file_open_modes_and_errors(ctx: Gfal2Context, tmp_path: Path) -> None:
+    base = file_url(tmp_path)
+    old = os.umask(0o022)
+    try:
+        with ctx.open(base + "/new", "w") as handle:
+            handle.write("x")
+    finally:
+        os.umask(old)
+    assert (tmp_path / "new").stat().st_mode & 0o777 == 0o744  # gfal2's S_IRWXU|S_IRGRP|S_IROTH
+    with ctx.open(base + "/new", "r") as handle:
+        with pytest.raises(GError) as caught:
+            handle.write("y")
+        assert (caught.value.code, caught.value.message) == (errno.EBADF, _local(errno.EBADF))
+        for offset, whence in ((-10, os.SEEK_SET), (0, 7)):
+            with pytest.raises(GError) as caught:
+                handle.lseek(offset, whence)
+            assert caught.value.message == _local(errno.EINVAL)
+        assert handle.lseek(1, os.SEEK_SET) == 1 and handle.lseek(-1, os.SEEK_CUR) == 0
+
+
+def test_file_reads_a_fifo_in_order(tmp_path: Path) -> None:
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    writer = threading.Thread(target=lambda: fifo.write_bytes(b"abcdef"), daemon=True)
+    writer.start()
+    handle = LocalFile("file://x", str(fifo), os.O_RDONLY, 0)
+    assert handle.read(3) == b"abc"
+    buffer = bytearray(10)
+    assert handle.readinto(buffer) == 3 and buffer[:3] == b"def"
+    assert handle.readinto(buffer) == 0
+    with pytest.raises(GError) as caught:
+        handle.lseek(0)
+    assert caught.value.code == errno.ESPIPE
+    handle.close()
+    writer.join(10)
+
+
+def test_file_checksum_names_are_not_trimmed(ctx: Gfal2Context, data_dir: Path) -> None:
+    with pytest.raises(GError) as caught:
+        ctx.checksum(file_url(data_dir / "hello.txt"), "Adler32 ")
+    assert caught.value.code == errno.ENOSYS
+
+
+# -- mock:// -------------------------------------------------------------------------------
+# Expected values are gfal2 2.23.5's, observed in the gfal-ref image.
+
+M = "mock://host/path"
+
+
+def mock_plugin(ctx: Gfal2Context) -> MockPlugin:
+    found = ctx.plugin(M, "stat")
+    assert isinstance(found, MockPlugin)
+    return found
+
+
+def entries(ctx: Gfal2Context, url: str) -> list[tuple[str, str, int]]:
+    listing = mock_plugin(ctx).opendir(url)
+    return [(name, oct(info.st_mode), info.st_size) for name, info in listing if info]
+
+
+@pytest.fixture
+def slept(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record, rather than sleep, the mock plugin's waits."""
+    calls: list[float] = []
+    monkeypatch.setattr(mock_module.time, "sleep", calls.append)
+    return calls
+
+
+def test_mock_query_is_parsed_as_gfal2_does(ctx: Gfal2Context) -> None:
+    def size(query: str) -> int:
+        return ctx.stat(M + query).st_size
+
+    assert (size(""), size("?size=1234"), size("?sizefoo&size=3")) == (0, 1234, 3)
+    assert oct(ctx.stat(M + "?size=1").st_mode) == "0o100755"
+    # the first argument whose name starts with the key, taken raw
+    assert (size("?size_pre=3&size=10"), size("?size_post=7&size=10")) == (3, 7)
+    assert (size("?size=1%30"), size("?size=1&size=2"), size("#?size=4")) == (1, 1, 4)
+    # strtoull: a leading number, junk is 0, negatives wrap and overflows saturate
+    assert (size("?size=12abc"), size("?size=bogus"), size("?size= 7"), size("?size=-0")) == (
+        12,
+        0,
+        7,
+        0,
+    )
+    assert size("?size=-5") == 2**64 - 5
+    assert size("?size=99999999999999999999") == 2**64 - 1
+    assert ctx.stat(M + "?listing=a").is_dir() and not ctx.stat(M + "?list=").is_dir()
+    for query in ("?errno=13", "?errnox=13", "?errno=4294967309"):
+        with pytest.raises(GError) as caught:
+            ctx.stat(M + query)
+        assert (caught.value.code, caught.value.message) == (errno.EACCES, "Permission denied")
+    assert ctx.stat(M + "?errno=-1").st_size == 0  # only a positive errno fails
+    assert ctx.stat(M + "?errno=+abc").st_size == 0
+    assert mock_module._strtol("-99999999999999999999") == (-(2**63), 21)
+
+
+def test_mock_scheme_is_a_prefix(ctx: Gfal2Context) -> None:
+    plugin = mock_plugin(ctx)
+    assert plugin.handles("mock:foo?size=3", "stat")
+    assert not plugin.handles("MOCK://h/p", "stat")
+    assert plugin.copy_check("mock:a", "mock://h/b")
+    assert not plugin.copy_check("mock:a", "file:///b")
+    assert not plugin.copy_check("file:///a", "mock:b")
+
+
+def test_mock_wait_and_signals(
+    ctx: Gfal2Context, slept: list[float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert ctx.stat(M + "?wait=2&size=1").st_size == 1
+    assert ctx.unlink(M + "?wait=-1") == 0  # a negative wait does not sleep
+    received: list[int] = []
+    monkeypatch.setattr(signal, "signal", signal.signal)  # restored after the test
+    signal.signal(signal.SIGUSR1, lambda number, frame: received.append(number))
+    ctx.stat(M + f"?signal={int(signal.SIGUSR1)}")  # [MOCK PLUGIN] SIGNALS is off
+    assert received == [] and slept == [2]
+    fresh = xgfalclient.creat_context()
+    fresh.set_opt_boolean("MOCK PLUGIN", "SIGNALS", True)
+    try:
+        assert fresh.stat(M + f"?signal={int(signal.SIGUSR1)}&size=2").st_size == 2
+        assert fresh.stat(M + "?signal=100000").st_size == 0  # raise() of no signal is ignored
+    finally:
+        fresh.free()
+    assert received == [signal.SIGUSR1] and slept == [2, 1, 1]
+    signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+
+
+def test_mock_load_time_signal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    received: list[int] = []
+    monkeypatch.setattr(signal, "signal", signal.signal)
+    previous = signal.signal(signal.SIGUSR2, lambda number, frame: received.append(number))
+    try:
+        cmdline = tmp_path / "cmdline"
+        cmdline.write_bytes(b"python3\0-c\0xMOCK_LOAD_TIME_SIGNAL%d\0" % int(signal.SIGUSR2))
+        mock_module._load_time_signal(str(cmdline))
+        assert received == [signal.SIGUSR2]
+        cmdline.write_bytes(b"python3\0-c\0")
+        mock_module._load_time_signal(str(cmdline))
+        mock_module._load_time_signal(str(tmp_path / "missing"))  # no /proc: nothing
+        assert received == [signal.SIGUSR2]
+    finally:
+        signal.signal(signal.SIGUSR2, previous)
+
+
+def test_mock_stat_stages_for_fts_url_copy(ctx: Gfal2Context) -> None:
+    ctx.set_user_agent("some_tool", "1.0")
+    assert ctx.stat(M + "?size_pre=4&size=1").st_size == 4
+    ctx.set_user_agent("fts_url_copy", "3.12")
+    destination = M + "/d?size=9&size_pre=4&size_post=10"
+    assert ctx.stat(M + "/s?size=7").st_size == 7  # the source
+    assert ctx.stat(destination).st_size == 4  # the destination before the copy
+    assert ctx.stat(destination).st_size == 10  # ... and after
+    ctx.stat(M + "/s?size=7")
+    with pytest.raises(GError) as caught:  # size_pre=0 is "no destination yet"
+        ctx.stat(M + "/d?size=9&size_post=10")
+    assert caught.value.code == errno.ENOENT
+    params = ctx.transfer_parameters()
+    ctx.filecopy(params, M + "/s?size=10", destination + "&time=0")  # the copy skips a stage
+    assert ctx.stat(destination).st_size == 10
+
+
+def test_mock_access(ctx: Gfal2Context) -> None:
+    plugin = mock_plugin(ctx)
+    for query in ("?access=1", "?exists=1", "?access_errno=13", "?errno=13&exists=1"):
+        assert plugin.access(M + query, os.R_OK) == 1  # gfal2's binding returns the 1 too
+    for query, code in (
+        ("", errno.ENOENT),
+        ("?exists=0", errno.ENOENT),
+        ("?size=1", errno.ENOENT),
+        ("?access=0&access_errno=13", errno.EACCES),
+    ):
+        with pytest.raises(GError) as caught:
+            ctx.access(M + query, os.R_OK)
+        assert caught.value.code == code
+
+
+def test_mock_namespace(ctx: Gfal2Context, slept: list[float]) -> None:
+    assert ctx.mkdir(M + "/d?access_errno=13&errno=2", 0o755) == 0
+    assert ctx.mkdir_rec(M + "/x/y/z", 0o755) == 0
+    assert ctx.mkdir(M + "/a/b?rd_path=mock://host/path/a", 0o755) == 0  # rd_path is shorter
+    for url in (
+        M + "/a/?rd_path=mock://host/path/a/",
+        M + "/?rd_path=mock://host/path/a/",  # a URL that prefixes a read-only path
+        M + "/a?xrd_path=mock://host/path/a",
+        M + "/a?rd_path=&rd_path=mock://host/path/a/b",
+    ):
+        for call in (ctx.mkdir, ctx.mkdir_rec):
+            with pytest.raises(GError) as caught:
+                call(url, 0o755)
+            assert (caught.value.code, caught.value.message) == (
+                errno.EPERM,
+                "Operation not permitted",
+            )
+    assert mock_module._values(M, "rd_path") == []
+    # unlink is a stat
+    assert ctx.unlink(M + "?access_errno=13&wait=1") == 0 and slept == [1]
+    with pytest.raises(GError) as caught:
+        ctx.unlink(M + "?errno=13")
+    assert caught.value.code == errno.EACCES
+    results = ctx.unlink([M + "?errno=2", M])
+    assert isinstance(results, list) and results[0].code == errno.ENOENT and results[1] is None
     for call in (
-        lambda: ctx.access("mock://h/f?access_errno=1", os.R_OK),
-        lambda: ctx.mkdir("mock://h/f?access_errno=1", 0o755),
-        lambda: ctx.mkdir_rec("mock://h/f?access_errno=1", 0o755),
-        lambda: ctx.rmdir("mock://h/f?access_errno=1"),
-        lambda: ctx.unlink("mock://h/f?access_errno=1"),
-        lambda: ctx.rename("mock://h/f?access_errno=1", "mock://h/g"),
+        lambda: ctx.rmdir(M + "/d?list=a"),
+        lambda: ctx.rename(M + "/a", M + "/b"),
+        lambda: ctx.chmod(M + "/a", 0o700),
+        lambda: ctx.listxattr(M),
+        lambda: ctx.setxattr(M, "user.x", "1", 0),
+        lambda: ctx.token_retrieve(M, "", 60, False),
     ):
         with pytest.raises(GError) as caught:
             call()
-        assert caught.value.code == errno.EPERM
-    assert ctx.access("mock://h/f", os.R_OK) == 0
-    assert ctx.mkdir("mock://h/d", 0o755) == 0
-    assert ctx.mkdir_rec("mock://h/d", 0o755) == 0
-    assert ctx.rmdir("mock://h/d") == 0
-    assert ctx.rename("mock://h/f", "mock://h/g") == 0
-    assert ctx.unlink("mock://h/f") == 0
+        assert caught.value.code == errno.EPROTONOSUPPORT
 
 
 def test_mock_listing(ctx: Gfal2Context) -> None:
-    assert ctx.listdir("mock://host/path?list=a:10,b:20,,c/:0") == ["a", "b", "c"]
-    entries = {e.d_name: e.d_type for e in ctx.opendir("mock://h/p?list=a:10,c/")}
-    assert entries == {"a": 8, "c": 4}
+    listing = M + "?list=a:0644:10,b:040755:3,,c,d:10,e:x:5"
+    assert ctx.listdir(listing) == ["a", "b", "c", "d", "e"]
+    # gfal2 reads a size one character past the end of the mode
+    assert entries(ctx, listing) == [
+        ("a", "0o100644", 10),
+        ("b", "0o40755", 3),
+        ("c", "0o0", 0),
+        ("d", "0o100010", 0),
+        ("e", "0o100000", 0),
+    ]
+    assert entries(ctx, M + "?list=a:0644,5:x,b: 7:9,c:-1:2,d:0644:") == [
+        ("a", "0o100644", 5),
+        ("5", "0o100000", 0),
+        ("b", "0o100007", 9),
+        ("c", "0o37777777777", 2),
+        ("d", "0o100644", 0),
+    ]
+    assert entries(ctx, M + "?list=x:0644:-3")[0][2] == 2**64 - 3
+    assert ctx.listdir(M + "?list=,,a,") == ["a"]
+    long = ",".join(f"n{i:03d}" for i in range(300))
+    assert len(ctx.listdir(M + "?list=" + long)) == 205  # gfal2 reads 1023 characters
     with pytest.raises(GError) as caught:
-        ctx.listdir("mock://h/f?size=1")
+        ctx.listdir(M + "?size=1")
     assert caught.value.code == errno.ENOTDIR
-    with pytest.raises(GError):
-        ctx.listdir("mock://h/f?errno=2")
-
-
-def test_mock_reads(ctx: Gfal2Context, data_dir: Path) -> None:
-    with ctx.open("mock://h/f?size=5", "r") as handle:
-        assert handle.read_bytes(10) == bytes(5)
-        assert handle.lseek(0, os.SEEK_END) == 5
-        assert handle.pread_bytes(4, 10) == bytes(1)
-        assert handle.pread_bytes(9, 10) == b""
-    with ctx.open(f"mock://h/f?rd_path={data_dir / 'hello.txt'}", "r") as handle:
-        assert handle.pread(6, 5) == "world"
     with pytest.raises(GError) as caught:
-        ctx.open("mock://h/f?open_errno=2", "r")
+        ctx.listdir(M + "?errno=2&list=a")
     assert caught.value.code == errno.ENOENT
-    with pytest.raises(GError) as caught:
-        ctx.open("mock://h/f", "w")
-    assert (caught.value.code, caught.value.message) == (
-        errno.ENOSYS,
-        "Mock plugin does not support read and write",
-    )
 
 
-def test_mock_metadata(ctx: Gfal2Context) -> None:
-    assert ctx.checksum("mock://h/f?checksum=abc123", "adler32") == "00abc123"
-    assert ctx.checksum("mock://h/f", "md5") == ""
-    with pytest.raises(GError):
-        ctx.checksum("mock://h/f?errno=5", "md5")
-    assert ctx.getxattr("mock://h/f", "user.status") == "ONLINE"
-    # Not staged (the staging check failed), but with no staging_time it is on disk anyway.
-    assert ctx.getxattr("mock://h/f?staging_errno=5", "user.status") == "ONLINE"
-    assert ctx.getxattr("mock://h/f?replicas=a", "user.replicas") == "a"
-    assert ctx.getxattr("mock://h/f?spacetoken=T", "spacetoken") == "T"
+def test_mock_reads(ctx: Gfal2Context, slept: list[float]) -> None:
+    with ctx.open(M + "?size=5", "r") as handle:
+        data = handle.read_bytes(10)
+        assert len(data) == 5 and data != handle.pread_bytes(0, 5)  # random, as gfal2's
+        assert handle.lseek(0, os.SEEK_END) == 5
+        assert len(handle.pread_bytes(4, 10)) == 1
+        assert handle.pread_bytes(9, 10) == b""
+    with ctx.open(M + "?size=4&read_wait=3", "r") as handle:
+        assert len(handle.read_bytes(4)) == 4 and slept == [3]
+    with ctx.open(M + "?size=5&read_errno=5", "r") as handle, pytest.raises(GError) as caught:
+        handle.read_bytes(5)
+    assert caught.value.code == errno.EIO
+    for url, code in ((M + "?open_errno=13", errno.EACCES), (M + "?errno=2", errno.ENOENT)):
+        with pytest.raises(GError) as caught:
+            ctx.open(url, "r")
+        assert caught.value.code == code
+    assert ctx.open(M + "?size=1&wait=2", "r") and slept == [3, 2]  # open stats first
+    for flag in ("w", "rw"):
+        with pytest.raises(GError) as caught:
+            ctx.open(M, flag)
+        assert (caught.value.code, caught.value.message) == (
+            errno.ENOSYS,
+            "Mock plugin does not support read and write",
+        )
+    with mock_plugin(ctx).open(M, O_WRONLY) as sink:  # only a bare O_WRONLY: /dev/null
+        assert sink.write(b"hello") == 5
+
+
+def test_mock_checksum_and_xattrs(ctx: Gfal2Context) -> None:
+    assert ctx.checksum(M + "?checksum=abc123", "adler32") == "00abc123"
+    assert ctx.checksum(M + "?checksum=a", "FOO", 5, 10) == "a"
+    assert ctx.checksum(M, "md5") == ""
     with pytest.raises(GError) as caught:
-        ctx.getxattr("mock://h/f", "user.bogus")
-    assert caught.value.message == "Failed to retrieve xattr user.bogus"
-    assert "user.status" in ctx.listxattr("mock://h/f")
-    assert ctx.token_retrieve("mock://h/f", "", 60, False) == "mock-token"
+        ctx.checksum(M + "?errno=2&checksum=a", "md5")
+    assert caught.value.code == errno.ENOENT
+    query = "?user.status=ONLINE&user.replicas=a,b&user.guid=g1&user.comment=c&spacetoken=T"
+    answers = [ctx.getxattr(M + query, name) for name in mock_module._XATTRS]
+    assert answers == ["ONLINE", "a,b", "g1", "c", "T"]
+    assert ctx.getxattr(M + "?user.guidx=5", "user.guid") == "5"
+    assert ctx.getxattr(M + "?errno=0", "anything") == ""  # gfal2 tests the errno buffer
+    for url, name in (
+        (M, "user.status"),
+        (M + "?staging_time=100", "user.status"),
+        (M + "?replicas=a", "user.replicas"),
+        (M + "?errno=0", "user.guid"),
+        (M + "?foo=1", "foo"),
+        (M + "?checksum=abc", "user.checksum"),
+    ):
+        with pytest.raises(GError) as caught:
+            ctx.getxattr(url, name)
+        assert (caught.value.code, caught.value.message) == (
+            errno.ENODATA,
+            f"Failed to retrieve xattr {name}",
+        )
+    with pytest.raises(GError) as caught:
+        ctx.getxattr(M + "?errno=5&user.status=ONLINE", "user.status")
+    assert caught.value.code == errno.EIO
 
 
 def test_mock_staging(ctx: Gfal2Context) -> None:
-    status, token = ctx.bring_online("mock://h/f?staging_time=0", 10, 10, True)
-    assert status == 1 and token
-    status, _ = ctx.bring_online("mock://h/slow?staging_time=3600", 10, 10, True)
-    assert status == 0
-    assert ctx.bring_online_poll("mock://h/slow?staging_time=3600", token) == 0
-    assert ctx.getxattr("mock://h/slow?staging_time=3600", "user.status") == "NEARLINE"
-    assert ctx.abort_bring_online("mock://h/slow?staging_time=3600", token) == 0
-    assert ctx.bring_online_poll("mock://h/slow?staging_time=3600", token) == 1
+    base = M + "/test_mock_staging"
+    slow = base + "/slow?staging_time=3600"
+    status, token = ctx.bring_online(slow, 10, 10, False)
+    assert status == 1 and token  # a synchronous request is done at once
+    assert ctx.bring_online(slow, 10, 10, True)[0] == 0
+    assert ctx.bring_online_poll(slow, token) == 0
+    assert ctx.abort_bring_online(slow, token) == 0
+    assert ctx.bring_online_poll(slow, token) == 0  # gfal2's abort changes nothing
+    assert mock_plugin(ctx).bring_online_poll([slow, base + "/other"], token) == [False, True]
+    assert xgfalclient.creat_context().bring_online_poll(slow, token) == 0  # process-wide
+    failing = base + "/f?staging_time=3600&staging_errno=5"
+    assert ctx.bring_online(failing, 10, 10, True)[0] == 0  # the error waits for the time
     with pytest.raises(GError) as caught:
-        ctx.bring_online("mock://h/f?staging_errno=5", 10, 10, True)
+        ctx.bring_online(failing, 10, 10, False)
     assert caught.value.code == errno.EIO
-    assert ctx.release("mock://h/f") == 0
-    with pytest.raises(GError):
-        ctx.release("mock://h/f?release_errno=5")
-    assert ctx.archive_poll("mock://h/f") == 1
-    assert ctx.archive_poll("mock://h/slow?archiving_time=3600") == 0
-    with pytest.raises(GError):
-        ctx.archive_poll("mock://h/f?archiving_errno=5")
-    errors = ctx.archive_poll(["mock://h/f", "mock://h/x?archiving_errno=2"])
-    assert errors[0] is None and errors[1].code == errno.ENOENT
-
-
-def test_mock_copy(ctx: Gfal2Context) -> None:
-    events: list[xgfalclient.GfaltEvent] = []
-    params = ctx.transfer_parameters()
-    params.event_callback = events.append
-    with pytest.raises(GError) as caught:  # gfal2: a size_post destination already exists
-        ctx.filecopy(params, "mock://h/src?size=10&time=0", "mock://h/dst?size_post=10")
-    assert caught.value.code == errno.EEXIST
-    params.overwrite = True
-    ctx.filecopy(params, "mock://h/src?size=10&time=0", "mock://h/dst?size_post=10")
-    assert ctx.stat("mock://h/dst?size_post=10").st_size == 10
-    assert ("TRANSFER:TYPE", "mock") in [(e.stage, e.description) for e in events]
-    ctx.filecopy(params, "mock://h/src?size=10&time=0", "mock://h/new?size_pre=0&size_post=3")
-    assert ctx.stat("mock://h/new?size_pre=0&size_post=3").st_size == 3
+    errors, _ = ctx.bring_online([base + "/e?staging_errno=5", slow, base], 10, 10, True)
+    assert errors[0].code == errno.EIO and errors[1:] == [None, None]
+    assert ctx.bring_online_poll(base + "/never", "t") == 1
+    assert ctx.bring_online(base + "/now", 10, 10, True)[0] == 1
+    assert ctx.bring_online_poll(base + "/now", "t") == 1
     with pytest.raises(GError) as caught:
-        ctx.filecopy(params, "mock://h/src?time=0&transfer_errno=110", "mock://h/d2?size_post=1")
-    assert caught.value.code == 110
-    ctx.set_opt_integer("MOCK PLUGIN", "MIN_TRANSFER_TIME", 0)
-    ctx.set_opt_integer("MOCK PLUGIN", "MAX_TRANSFER_TIME", 0)
-    ctx.filecopy(params, "mock://h/src?size=1", "mock://h/d3?size_post=1")
-    ctx.filecopy(params, "mock://h/src?size=1", "mock://h/d4?size_post=1&time=0")
+        ctx.bring_online_poll(base + "/never?staging_errno=2", "t")
+    assert caught.value.code == errno.ENOENT
+    assert ctx.release(base, "t") == 0 and ctx.release(base) == 0
+    assert [e and e.code for e in ctx.release([base + "?release_errno=13", base], "t")] == [
+        errno.EACCES,
+        None,
+    ]
+
+
+def test_mock_archiving(ctx: Gfal2Context) -> None:
+    base = M + "/test_mock_archiving"
+    assert ctx.archive_poll(base) == 1
+    assert base not in mock_module._archiving_end  # done: the next poll starts again
+    with pytest.raises(GError) as caught:
+        ctx.archive_poll(base + "?archiving_errno=5")
+    assert caught.value.code == errno.EIO
+    pending = base + "/p?archiving_time=3600&archiving_errno=5"
+    assert ctx.archive_poll(pending) == 0 and ctx.archive_poll(pending) == 0
+    plugin = mock_plugin(ctx)
+    assert plugin.archive_poll([base + "/q?archiving_time=3600", base]) == [False, True]
+
+
+def copy_events(
+    ctx: Gfal2Context,
+    source: str,
+    destination: str,
+    events: list[tuple[str, str]] | None = None,
+    **settings: Any,
+) -> list[tuple[str, str]]:
+    """Copy, answering the ``(stage, description)`` of each event (also into ``events``)."""
+    seen = [] if events is None else events
+    params = ctx.transfer_parameters()
+    params.event_callback = lambda e: seen.append((e.stage, e.description))
+    for name, value in settings.items():
+        if name == "checksum":
+            params.set_checksum(*value)
+        else:
+            setattr(params, name, value)
+    ctx.filecopy(params, source, destination)
+    return seen
+
+
+@pytest.fixture
+def ticks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mock_module, "_TICK", 0.01)  # a mock copy's "second"
+
+
+def test_mock_copy(ctx: Gfal2Context, ticks: None) -> None:
+    source = M + "/s?size=10&transfer_errno=5&time=3"  # neither counts on the source
+    events = copy_events(ctx, source, M + "/d?size=10&time=0")  # an existing destination
+    assert [stage for stage, _ in events if not stage.startswith("LIST")] == [
+        "TRANSFER:ENTER",
+        "TRANSFER:TYPE",
+        "TRANSFER:EXIT",
+    ]
+    assert events[-3:] == [
+        ("TRANSFER:ENTER", "Mock copy start, sleep 0"),
+        ("TRANSFER:TYPE", "mock"),
+        ("TRANSFER:EXIT", "Mock copy start, sleep 0"),
+    ]
+    copy_events(ctx, source, M + "/d?time=0&transfer_errno=5")  # fails only while sleeping
+    assert copy_events(ctx, source, M + "/d?time=2")[-1] == (
+        "TRANSFER:EXIT",
+        "Mock copy start, sleep 0",
+    )
+    events = []
+    with pytest.raises(GError) as caught:
+        copy_events(ctx, source, M + "/d?time=3&transfer_errno=5", events, overwrite=True)
+    assert (caught.value.code, caught.value.message) == (errno.EIO, "Input/output error")
+    assert events[-1] == ("TRANSFER:EXIT", "Mock copy start, sleep 2")
+    ctx.set_opt_integer("MOCK PLUGIN", "MIN_TRANSFER_TIME", 2)
+    ctx.set_opt_integer("MOCK PLUGIN", "MAX_TRANSFER_TIME", 2)
+    assert copy_events(ctx, source, M + "/d")[-3][1] == "Mock copy start, sleep 2"
+    ctx.set_opt_integer("MOCK PLUGIN", "MAX_TRANSFER_TIME", 3)  # rand() % (max - min) + min
+    assert copy_events(ctx, source, M + "/d")[-3][1] == "Mock copy start, sleep 2"
+    ctx.set_opt_integer("MOCK PLUGIN", "MIN_TRANSFER_TIME", 4)  # max < min
+    assert copy_events(ctx, source, M + "/d")[-3][1] == "Mock copy start, sleep 4"
+
+
+def test_mock_copy_checksums(ctx: Gfal2Context) -> None:
+    both, source, target = checksum_mode.both, checksum_mode.source, checksum_mode.target
+    src, dst = M + "/s?checksum=aa", M + "/d?time=0&checksum="
+    for mode, user, src_sum, dst_sum, message in (
+        (both, "aa", "aa", "aa", None),
+        (both, "", "aa", "", None),  # an empty checksum matches anything
+        (source, "aa", "bb", "cc", "User and source checksums do not match"),
+        (both, "", "aa", "bb", "Source and destination checksums do not match"),
+        (target, "aa", "", "bb", "User and destination checksums do not match"),
+        (target, "aa", "", "aa", None),
+    ):
+        settings = {"checksum": (mode, "ADLER32", user)}
+        pair = (src.replace("aa", src_sum), dst + dst_sum)
+        events: list[tuple[str, str]] = []
+        if message is None:
+            copy_events(ctx, *pair, events, **settings)
+            continue
+        with pytest.raises(GError) as caught:
+            copy_events(ctx, *pair, events, **settings)
+        assert (caught.value.code, caught.value.message) == (errno.EIO, message)
+        # a source mismatch fails before the copy starts
+        started = any(stage == "TRANSFER:ENTER" for stage, _ in events)
+        assert started == (mode != source)
+
+
+def test_mock_copy_cancel_and_timeout(ctx: Gfal2Context, ticks: None) -> None:
+    plugin = mock_plugin(ctx)
+    params = ctx.transfer_parameters()
+    for destination, code in (
+        (M + "/d?time=5", errno.ECANCELED),
+        (M + "/d?time=5&transfer_errno=5", errno.EIO),  # the copy's own error wins
+    ):
+        transfer = Transfer(ctx, params, M + "/s", destination)
+        ctx.cancel()
+        with pytest.raises(GError) as caught:
+            plugin.copy(transfer)
+        assert caught.value.code == code
+    params.timeout = 1  # gfal2's mock copy ignores the timeout
+    transfer = Transfer(ctx, params, M + "/s", M + "/d?time=2")
+    transfer.started -= 10
+    plugin.copy(transfer)
 
 
 def test_mock_copy_honours_cancel(ctx: Gfal2Context) -> None:
-    import threading
-
     params = ctx.transfer_parameters()
-    params.overwrite = True
     timer = threading.Timer(0.1, ctx.cancel)
     timer.start()
     try:
         with pytest.raises(GError) as caught:
-            ctx.filecopy(params, "mock://h/src?time=30", "mock://h/dst?size_post=1")
-        assert caught.value.code == errno.ECANCELED
+            ctx.filecopy(params, M + "/src", M + "/dst?time=30")
+        assert (caught.value.code, caught.value.message) == (errno.ECANCELED, "Transfer canceled")
     finally:
         timer.cancel()
 
@@ -567,7 +976,7 @@ def test_package_functions(monkeypatch: pytest.MonkeyPatch) -> None:
     xgfalclient.install_as_gfal2()
     import gfal2  # type: ignore[import-not-found]
 
-    assert gfal2 is xgfalclient
+    assert gfal2.Gfal2Context is xgfalclient.Gfal2Context and gfal2.__version__ == "1.13.1"
     assert gfal2.creat_context().get_plugin_names()
     monkeypatch.delitem(sys.modules, "gfal2")
 
@@ -610,6 +1019,8 @@ def test_plugin_base_helpers(ctx: Gfal2Context) -> None:
     ctx.set_opt_string("BARE PLUGIN", "COPY_CHECKSUM_TYPE", "MD5")
     assert plugin.checksum_type() == "MD5"
     assert plugin.options is ctx.options
+    assert (Bare.narrates_transfer, Bare.copy_manages_destination) == (False, False)
+    assert Bare.copy_manages_checksums is False
     plugin.close()
 
 

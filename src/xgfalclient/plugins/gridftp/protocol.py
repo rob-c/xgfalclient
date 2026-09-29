@@ -51,6 +51,7 @@ __all__ = [
     "DESC_EOF",
     "DESC_CLOSE",
     "check_path",
+    "passive_address",
 ]
 
 #: ``MODE E`` block header: descriptor, count, offset - all big-endian.
@@ -173,6 +174,46 @@ def parse_spas(lines: list[str]) -> list[tuple[str, int]]:
     if not found:
         raise _protocol_error("SPAS", "\n".join(lines))
     return found
+
+
+_EVENT_27 = re.compile(
+    r"[12]27 [^\[0-9]+\(?([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+)\)?", re.IGNORECASE
+)
+_EVENT_29_V6 = re.compile(r"\|([0-9]*)\|([^|]*)\|([0-9]+)\|")
+_EVENT_29_V4 = re.compile(r"([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+)")
+
+
+def _dotted(found: re.Match[str]) -> tuple[str, int]:
+    parts = [int(value) for value in found.groups()]
+    return ".".join(str(part) for part in parts[:4]), parts[4] * 256 + parts[5]
+
+
+def passive_address(reply: Reply) -> tuple[str, int, bool] | None:
+    """``(ip, port, is_ipv6)`` a passive reply announces, read as gfal2's PASV plugin reads it.
+
+    ``1xx``/``2xx`` replies ending ``27`` (``PASV``, delayed ``127``) and
+    ``29`` (``EPSV``, ``SPAS``) count; an ``EPSV`` reply names no address,
+    so ``ip`` is ``""`` and the caller looks the host up. gfal2 misreads the
+    ``h1,h2,...`` form of a ``229`` (it shifts the numbers by one); this
+    reads it correctly.
+    """
+    if reply.kind not in (1, 2):
+        return None
+    text = "\r\n".join(reply.lines)
+    if reply.code % 100 == 27:
+        found = _EVENT_27.search(text)
+        if found is None:
+            return None
+        return (*_dotted(found), False)
+    if reply.code % 100 != 29:
+        return None
+    extended = _EVENT_29_V6.search(text)
+    if extended is not None:
+        ipv6 = extended.group(1) == "2"
+        ip = extended.group(2)
+        return (f"[{ip}]" if ipv6 and ip else ip), int(extended.group(3)), ipv6
+    found = _EVENT_29_V4.search(text)
+    return None if found is None else (*_dotted(found), False)
 
 
 def format_port(host: str, port: int) -> str:

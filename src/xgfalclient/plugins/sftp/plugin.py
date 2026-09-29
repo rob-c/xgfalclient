@@ -26,7 +26,15 @@ is a bug or a missing feature, are noted at the operations below: real
 listings; ``ETIMEDOUT`` on a stall; the credential store's ``USER``/``PASSWD``
 honoured; ``StrictHostKeyChecking=accept-new`` by default (gfal2 checks no
 host key at all); and an optional checksum computed by reading the file when
-the server has no ``check-file`` extension.
+the server has no ``check-file`` extension (any algorithm
+:func:`xgfalclient.checksum.new` knows - ADLER32, CRC32 in decimal, MD5, the
+SHAs - and ``EPROTONOSUPPORT``, gfal2's answer, for the rest). Where gfal2
+patches the raw status itself, the answers are gfal2's: ``rmdir`` says
+``ENOTEMPTY`` or ``ENOTDIR``, as it does, and ``unlink`` of a directory says
+``EISDIR`` (gfal2 leaks 4). As in gfal2, ``access`` is ``EPROTONOSUPPORT``
+(there is none, and the core does not fall back to ``stat``) and only a
+lower-case ``sftp://`` is claimed. The default user is ``getpass``'s (the
+login environment first), where gfal2 asks ``getpwuid``.
 """
 
 from __future__ import annotations
@@ -34,7 +42,6 @@ from __future__ import annotations
 import contextlib
 import errno
 import getpass
-import hashlib
 import os
 import stat as _stat
 import struct
@@ -42,8 +49,9 @@ import threading
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, Optional
 
+from ... import checksum
 from ...crypto.sshkeys import KeyError_, PassphraseRequired, PrivateKey, load_private, string
-from ...errors import GError
+from ...errors import GError, not_supported_url
 from ...plugin import (
     O_ACCMODE_MASK,
     O_APPEND,
@@ -75,6 +83,13 @@ def _sftp_error(exc: StatusError, path: str, op: str) -> GError:
     return GError(f"{op} {path}: {exc.message}", exc.errno)
 
 
+def _patched(exc: StatusError, path: str, op: str, code: int) -> GError:
+    """:func:`_sftp_error`, with the errno a closer look found and its words."""
+    if code == exc.errno:
+        return _sftp_error(exc, path, op)
+    return GError(f"{op} {path}: {os.strerror(code)}", code)
+
+
 class SFTPPlugin(Plugin):
     """gfal2's ``sftp://`` plugin, reimplemented on the standard library."""
 
@@ -95,6 +110,10 @@ class SFTPPlugin(Plugin):
         for clients in idle.values():
             for client in clients:
                 client.close()
+
+    def handles(self, url: str, operation: str) -> bool:
+        """gfal2 matches ``sftp:`` case-sensitively: ``SFTP://`` is nobody's (93)."""
+        return url.startswith("sftp://")
 
     # -- endpoint resolution -----------------------------------------------------
 
@@ -260,18 +279,49 @@ class SFTPPlugin(Plugin):
         return True
 
     def rmdir(self, url: str) -> None:
+        """gfal2 patches the codes an SFTP v3 server answers with; so does this.
+
+        OpenSSH says ``FAILURE`` for a directory that is not empty and
+        ``NO_SUCH_FILE`` for a file (``ENOTDIR`` travels as that); a look
+        at what is there says which errno the status stands for.
+        """
+        path = self._path(parse(url))
         with self._session(url) as client:
             try:
-                client.rmdir(self._path(parse(url)))
+                client.rmdir(path)
             except StatusError as exc:
-                raise _sftp_error(exc, url, "Could not rmdir") from exc
+                code = exc.errno
+                if exc.code in (fx.FX_FAILURE, fx.FX_NO_SUCH_FILE):
+                    kind = self._kind(client, path)
+                    if kind is False:
+                        code = errno.ENOTDIR
+                    elif kind and exc.code == fx.FX_FAILURE:
+                        code = errno.ENOTEMPTY
+                raise _patched(exc, url, "Could not rmdir", code) from exc
 
     def unlink(self, url: str) -> None:
+        """A directory is ``EISDIR``, where OpenSSH says ``FAILURE`` (and gfal2 leaks 4)."""
+        path = self._path(parse(url))
         with self._session(url) as client:
             try:
-                client.remove(self._path(parse(url)))
+                client.remove(path)
             except StatusError as exc:
-                raise _sftp_error(exc, url, "Could not unlink") from exc
+                code = exc.errno
+                if exc.code == fx.FX_FAILURE and self._kind(client, path):
+                    code = errno.EISDIR
+                raise _patched(exc, url, "Could not unlink", code) from exc
+
+    @staticmethod
+    def _kind(client: SFTPClient, path: bytes) -> bool | None:
+        """``True`` for a directory, ``False`` for anything else, ``None`` if nothing is there."""
+        try:
+            return _stat.S_ISDIR(client.lstat(path).to_stat().st_mode)
+        except StatusError:
+            return None
+
+    def access(self, url: str, mode: int) -> None:
+        """gfal2's sftp plugin has no ``access``, and its core no fallback: ``EPROTONOSUPPORT``."""
+        raise not_supported_url(url)
 
     def rename(self, old: str, new: str) -> None:
         # posix-rename overwrites the target, unlike gfal2's plain v3 rename.
@@ -328,15 +378,16 @@ class SFTPPlugin(Plugin):
                 raise GError(
                     f"The server has no check-file extension for {url}", errno.EPROTONOSUPPORT
                 )
-            return self._checksum_by_read(client, path, name, offset, length)
+            return self._checksum_by_read(client, url, path, name, offset, length)
 
     def _checksum_by_read(
-        self, client: SFTPClient, path: bytes, name: str, offset: int, length: int
+        self, client: SFTPClient, url: str, path: bytes, name: str, offset: int, length: int
     ) -> str:
         try:
-            hasher = hashlib.new(name)
+            hasher = checksum.new(name)
         except ValueError as exc:
-            raise GError(f"Unknown checksum algorithm {name!r}", errno.EINVAL) from exc
+            # What gfal2 answers for every algorithm: it has no sftp checksum.
+            raise not_supported_url(url) from exc
         try:
             handle = client.open(path, fx.FXF_READ)
         except StatusError as exc:
@@ -356,7 +407,9 @@ class SFTPPlugin(Plugin):
                     remaining -= len(data)
         finally:
             client.close_handle(handle, quiet=True)
-        return hasher.hexdigest()
+        digest = hasher.hexdigest()
+        # CRC32 in decimal, as gfal2's file plugin prints it.
+        return str(int(digest, 16)) if checksum.normalise_name(name) == "crc32" else digest
 
     # -- file I/O ----------------------------------------------------------------
 
@@ -404,7 +457,7 @@ class SFTPPlugin(Plugin):
     # -- copies ------------------------------------------------------------------
 
     def copy_check(self, source: str, destination: str) -> bool:
-        ends = (scheme_of(source), scheme_of(destination))
+        ends = (source.partition("://")[0], destination.partition("://")[0])
         # Claim only file<->sftp, where a direct pipelined copy beats the core
         # (which would go through a PluginFile). sftp<->sftp is left to the core.
         return ("sftp" in ends) and ("file" in ends)

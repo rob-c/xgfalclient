@@ -16,8 +16,12 @@ params.set_checksum(gfal2.checksum_mode.both, "ADLER32", "")
 ctx.filecopy(params, "file:///tmp/f.root", "root://se.example.org//store/f.root")
 ```
 
-Code that must keep saying `import gfal2` can call
-`xgfalclient.install_as_gfal2()` once at start-up.
+Unmodified code that says `import gfal2` works as it is: the wheel also
+installs a `gfal2` module (reporting the bindings' version, 1.13.1, while
+`get_version()` reports gfal2 2.23.5) and gfal2-util's `gfal2_util` package.
+Because of that, don't install it into a Python environment that also has the
+`python3-gfal2` RPM on its path - whichever comes first on `sys.path` wins.
+`xgfalclient.install_as_gfal2()` does the same for one process explicitly.
 
 ## Why
 
@@ -44,14 +48,19 @@ As in gfal2, each protocol is a plugin, loaded the first time a URL needs it.
 | `http`, `https`, `dav`, `davs` | http | WebDAV, HTTP third-party copy (pull, push, streamed fallback), gridsite delegation, WLCG tape REST API, SE-issued tokens, CDMI QoS |
 | `s3`, `s3s` | http | AWS SigV4, multipart upload, pre-signed TPC |
 | `gcloud`, `gclouds` | http | service-account V4 signed URLs, as davix does |
+| `swift`, `swifts` | http | OpenStack Swift with a configured token (`[SWIFT]`), as davix does |
+| `cs3`, `cs3s` | http | CS3 over HTTP with a bearer token |
 | `root`, `roots`, `xroot`, `xroots` | xrootd | through xrdclient (pure Python); GSI, tokens, TPC, staging |
 | `gsiftp`, `ftp` | gridftp | GSI control channel, MODE E parallel streams, DCAU, third-party copy |
-| `srm` | srm | SRM v2.2 over httpg, TURL resolution to the other plugins |
+| `srm` | srm | SRM v2.2 over httpg, TURL resolution to the other plugins, BDII endpoint discovery |
 | `dcap`, `gsidcap`, `kdcap` | dcap | dCache's native protocol |
 | `sftp` | sftp | over the system `ssh`, or a pure-Python SSH-2 transport |
 | `lfc` | lfc | the LCG File Catalog (retired from gfal2, kept here) |
 | `file` | file | the local filesystem, with gfal2's quirks |
 | `mock` | mock | gfal2's test plugin: a storage element described by its URL |
+
+`rfio://` is not supported; neither is it by gfal2 on EL9, which no longer
+builds its RFIO plugin.
 
 ## Authentication
 
@@ -88,8 +97,16 @@ The stock gfal2 defaults are built in, and `$GFAL_CONFIG_DIR` (or an existing
 `gfal-copy`, `gfal-ls`, `gfal-stat`, `gfal-mkdir`, `gfal-rm`, `gfal-rename`,
 `gfal-sum`, `gfal-cat`, `gfal-save`, `gfal-chmod`, `gfal-xattr`,
 `gfal-bringonline`, `gfal-archivepoll`, `gfal-evict` and `gfal-token`, with
-gfal2-util 1.9.1's options, output and exit codes; also
+gfal2-util 1.9.1's options, output and exit codes; the deprecated
+`gfal-legacy-register`, `gfal-legacy-unregister`, `gfal-legacy-replicas` (LFC
+replicas) and `gfal-legacy-bringonline`; `gfal2_version` and
+`gfal_srm_ifce_version`; man pages for all of them; and
 `python -m xgfalclient.cli <command>`.
+
+gfal2-util's Python package is there too, for wrappers that run or extend the
+commands in-process: `from gfal2_util.shell import Gfal2Shell`, or a
+`gfal2_util.base.CommandBase` subclass with `@base.arg`-decorated
+`execute_<name>` methods.
 
 ## Where it differs from gfal2
 

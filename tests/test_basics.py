@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import pickle
 import stat as stat_module
+import warnings
 
 import pytest
 
@@ -13,8 +15,17 @@ import xgfalclient
 from xgfalclient import errors
 from xgfalclient._compat import dataclass_slots, peer_chain_der
 from xgfalclient.enums import checksum_mode, event_side, verbose_level
-from xgfalclient.events import BOTH, DESTINATION, SOURCE, GfaltEvent
-from xgfalclient.types import DT_DIR, DT_LNK, DT_REG, DT_UNKNOWN, Dirent, Stat, dtype_for_mode
+from xgfalclient.events import BOTH, DESTINATION, SOURCE, GfaltEvent, log_event, markup_escape
+from xgfalclient.types import (
+    DT_DIR,
+    DT_LNK,
+    DT_REG,
+    DT_UNKNOWN,
+    Dirent,
+    Stat,
+    TransferParameters,
+    dtype_for_mode,
+)
 from xgfalclient.url import URL, basename, join, parent, parse, scheme_of
 
 # -- errors ---------------------------------------------------------------------
@@ -28,6 +39,7 @@ def test_gerror_has_the_bindings_shape() -> None:
     assert str(error) == "No such file"
     assert repr(error) == "GError('No such file', 2)"
     assert not isinstance(error, OSError)
+    assert (xgfalclient.GError.code, xgfalclient.GError.message) == (0, "")
 
 
 def test_gerror_pickles() -> None:
@@ -75,19 +87,32 @@ def test_checksum_mode_matches_boost_enum_surface() -> None:
     assert checksum_mode.names["source"] is checksum_mode.source
     assert checksum_mode.values[2] is checksum_mode.target
     assert repr(checksum_mode.none) == "gfal2.checksum_mode.none"
-    assert str(checksum_mode.none) == "gfal2.checksum_mode.none"
+    assert str(checksum_mode.none) == "none"
+    assert f"{checksum_mode.both}" == "both" and f"{checksum_mode.both:d}" == "3"
     assert isinstance(checksum_mode.both, int)
 
 
-def test_duplicate_values_keep_the_first_member() -> None:
-    assert verbose_level.values[128] is verbose_level.debug
+def test_enums_build_nameless_members_from_ints() -> None:
+    made = checksum_mode(2)
+    assert made == checksum_mode.target and made is not checksum_mode.target
+    assert type(made) is checksum_mode
+    assert repr(made) == str(made) == "gfal2.checksum_mode(2)"
+    assert repr(checksum_mode(9)) == "gfal2.checksum_mode(9)"
+    with pytest.raises(AttributeError):
+        made.name  # noqa: B018
+
+
+def test_duplicate_values_keep_the_last_member() -> None:
+    assert verbose_level.values[128] is verbose_level.trace
     assert verbose_level.trace == verbose_level.debug
-    assert verbose_level.trace.name == "trace"
+    assert verbose_level.debug.name == "debug"
 
 
 def test_enums_pickle_to_the_same_member() -> None:
     assert pickle.loads(pickle.dumps(event_side.event_destination)) is event_side.event_destination
     assert pickle.loads(pickle.dumps(checksum_mode.both)) is checksum_mode.both
+    nameless = pickle.loads(pickle.dumps(checksum_mode(9)))
+    assert repr(nameless) == "gfal2.checksum_mode(9)"
 
 
 # -- events ---------------------------------------------------------------------
@@ -106,6 +131,28 @@ def test_event_defaults_to_now() -> None:
     event = GfaltEvent()
     assert event.side == 2
     assert event.timestamp > 1_600_000_000_000
+
+
+def test_event_description_is_cut_to_gfal2s_buffer() -> None:
+    assert GfaltEvent(description="x" * 600).description == "x" * 511
+    assert GfaltEvent(description="é" * 300).description == "é" * 255  # never half a char
+    assert GfaltEvent(description="short").description == "short"
+
+
+def test_log_event_as_gfal2_does(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO, logger="gfal2"):
+        for side in (SOURCE, DESTINATION, BOTH):
+            log_event(GfaltEvent(side, "GFAL2:CORE:COPY", "LIST:ENTER", "a => b"))
+    assert [(r.name, r.levelno, r.getMessage()) for r in caplog.records] == [
+        ("gfal2", logging.INFO, f"Event triggered: {label} GFAL2:CORE:COPY LIST:ENTER a => b")
+        for label in ("SOURCE", "DESTINATION", "BOTH")
+    ]
+
+
+def test_markup_escape_is_g_markup_escape_text() -> None:
+    assert markup_escape("""a&b<c>'d"e""") == "a&amp;b&lt;c&gt;&apos;d&quot;e"
+    assert markup_escape("\x01\t\n\r\x1f\x7f\x85\x9fé") == "&#x1;\t\n\r&#x1f;&#x7f;\x85&#x9f;é"
+    assert markup_escape("mock://h/b?size_pre=0&size_post=10").endswith("0&amp;size_post=10")
 
 
 # -- Stat and Dirent -------------------------------------------------------------
@@ -140,7 +187,11 @@ def test_stat_from_os(tmp_path: object) -> None:
         (stat_module.S_IFDIR, DT_DIR),
         (stat_module.S_IFREG, DT_REG),
         (stat_module.S_IFLNK, DT_LNK),
-        (stat_module.S_IFIFO, DT_UNKNOWN),
+        (stat_module.S_IFIFO | 0o644, 1),
+        (stat_module.S_IFCHR, 2),
+        (stat_module.S_IFBLK, 6),
+        (stat_module.S_IFSOCK, 12),
+        (0o644, DT_UNKNOWN),
     ],
 )
 def test_dtype_for_mode(mode: int, dtype: int) -> None:
@@ -300,3 +351,125 @@ def test_peer_chain_der_private_method_before_3_13() -> None:
 def test_peer_chain_der_leaf_only_on_3_9() -> None:
     assert peer_chain_der(_Tls(b"leaf")) == [b"leaf"]
     assert peer_chain_der(_Tls(None)) == []
+
+
+# -- TransferParameters -----------------------------------------------------------
+
+
+def test_parameter_defaults_match_gfal2() -> None:
+    params = TransferParameters()
+    assert (params.timeout, params.nbstreams, params.tcp_buffersize, params.scitag) == (
+        3600,
+        0,
+        0,
+        0,
+    )
+    assert not (params.overwrite or params.strict_copy or params.create_parent or params.evict)
+    assert params.local_transfers and params.proxy_delegation and params.transfer_cleanup
+    assert (params.src_spacetoken, params.dst_spacetoken) == ("", "")
+    assert params.event_callback is None and params.monitor_callback is None
+    assert params.get_checksum() == (checksum_mode.none, "", "")
+    assert (params.checksum_mode, params.checksum_algorithm, params.checksum_value) == (
+        checksum_mode.none,
+        "",
+        "",
+    )
+    assert repr(params) == (
+        "TransferParameters(timeout=3600, nbstreams=0, overwrite=False, checksum=none)"
+    )
+    field = TransferParameters.__dict__["timeout"]
+    assert TransferParameters.timeout is field  # the descriptor, read from the class
+    with pytest.raises(NotImplementedError):
+        type(field).__mro__[1].convert(field, 1)  # the base field converts nothing
+
+
+def test_parameters_are_typed_as_the_bindings_type_them() -> None:
+    params = TransferParameters()
+    params.timeout, params.nbstreams, params.tcp_buffersize = 5, 2, 2**40
+    params.timeout = True  # an int, as far as Boost is concerned
+    assert (params.timeout, params.nbstreams, params.tcp_buffersize) == (1, 2, 2**40)
+    for name, value in [("timeout", "5"), ("nbstreams", 1.5), ("src_spacetoken", 5)]:
+        with pytest.raises(TypeError, match=name):
+            setattr(params, name, value)
+    for name, value in [("timeout", -1), ("tcp_buffersize", -1), ("nbstreams", 2**32)]:
+        with pytest.raises(OverflowError):
+            setattr(params, name, value)
+    params.overwrite = 1  # type: ignore[assignment]
+    assert params.overwrite is True
+    with pytest.raises(TypeError):
+        params.overwrite = "x"  # type: ignore[assignment]
+    params.dst_spacetoken = "T"
+    assert params.dst_spacetoken == "T" and params.timeout == 1
+
+
+@pytest.mark.parametrize("value", [0, 64, 65536])
+def test_scitag_range(value: int) -> None:
+    params = TransferParameters()
+    with pytest.raises(xgfalclient.GError) as caught:
+        params.scitag = value
+    assert caught.value.args == (
+        "Invalid SciTag value (must be in the [65, 65535] range)",
+        errno.EINVAL,
+    )
+    params.scitag = 65
+    params.scitag = 65535
+    assert params.scitag == 65535
+
+
+def test_parameters_copy_is_independent() -> None:
+    params = TransferParameters()
+    params.overwrite = True
+    params.scitag = 100
+    params.set_checksum(checksum_mode.both, "md5", "")
+    clone = params.copy()
+    clone.overwrite = False
+    assert params.overwrite and clone.scitag == 100
+    assert clone.get_checksum() == (checksum_mode.both, "md5", "")
+
+
+def test_set_checksum_validation() -> None:
+    params = TransferParameters()
+    with pytest.raises(xgfalclient.GError):
+        params.set_checksum(7, "adler32", "")
+    for mode in (checksum_mode.source, checksum_mode.target):
+        with pytest.raises(xgfalclient.GError) as caught:
+            params.set_checksum(mode, "adler32", "")
+        assert caught.value.message == "Checksum value required if mode is not end to end"
+    params.set_checksum(1, "adler32", "abc")
+    assert params.get_checksum() == (checksum_mode.source, "adler32", "abc")
+    params.set_checksum(checksum_mode.none, None, None)  # type: ignore[arg-type]
+    assert params.get_checksum() == (checksum_mode.none, "", "")
+
+
+def test_deprecated_checksum_spellings_warn_as_gfal2() -> None:
+    params = TransferParameters()
+    with pytest.warns(DeprecationWarning, match="Use get_checksum_mode instead"):
+        assert params.checksum_check is False
+    params.set_checksum(checksum_mode.source, "adler32", "abc")
+    with pytest.warns(DeprecationWarning, match="checksum_check is deprecated. Use set_checksum"):
+        params.checksum_check = False
+    assert params.get_checksum() == (checksum_mode.none, "adler32", "abc")  # type and value kept
+    with pytest.warns(DeprecationWarning):
+        params.checksum_check = True
+    assert params.get_checksum()[0] == checksum_mode.both
+    with pytest.warns(DeprecationWarning, match="set_user_defined_checksum is deprecated"):
+        params.set_user_defined_checksum("md5", "x")
+    assert params.get_checksum() == (checksum_mode.both, "md5", "x")  # the mode is kept
+    with pytest.warns(DeprecationWarning, match="get_user_defined_checksum is deprecated"):
+        assert params.get_user_defined_checksum() == ("md5", "x")
+    params.set_checksum(checksum_mode.target, "md5", "x")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(xgfalclient.GError):  # as set_checksum would refuse it
+            params.set_user_defined_checksum("md5", "")
+
+
+def test_set_verbose_moves_the_threshold_only() -> None:
+    try:
+        assert xgfalclient.set_verbose(verbose_level.debug) == 0
+        assert xgfalclient._log.threshold() == logging.DEBUG
+        xgfalclient.set_verbose(verbose_level.normal)
+        assert xgfalclient._log.threshold() == logging.ERROR
+    finally:
+        xgfalclient.set_verbose(verbose_level.verbose)
+    assert xgfalclient._log.threshold() == logging.INFO

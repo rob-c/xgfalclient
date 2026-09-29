@@ -300,6 +300,7 @@ def copy(cmd: Command) -> int:
 
 SPECS = {
     "copy": Spec(
+        "copy",
         "Copy a file or set of files",
         [
             arg(

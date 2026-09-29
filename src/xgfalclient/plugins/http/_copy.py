@@ -1,36 +1,59 @@
 """Copies the http plugin claims: uploads, parallel downloads, and third-party copies.
 
-**Uploads** (``file://`` to HTTP) are one ``PUT`` whose body leaves with
-``sendfile`` in the clear, and in large blocks over TLS.
+**HTTP destinations** go through gfal2's ``gfal_http_copy``, event for
+event: ``PREPARE:ENTER``/``EXIT``, ``TRANSFER:ENTER``, one ``TRANSFER:TYPE``
+per attempt, and ``TRANSFER:EXIT`` - with the pair on success, the error on
+failure. The modes are ``3rd pull`` (the destination fetches), ``3rd push``
+(the source sends) and ``streamed`` (the bytes flow through this process),
+tried in that order from the first one chosen:
 
-**Downloads** (HTTP to ``file://``) are where this beats gfal2, which reads
-one stream through the core: a large file is fetched as ranged ``GET``\\ s
-over several pooled connections at once, each writing its bytes straight
-into place with ``os.pwrite``. ``params.nbstreams`` sets the number of
-streams when it is positive. Over TLS the default is two: every TLS record
-costs a trip through the GIL, and past two streams the threads spend more
-time queueing for it than the extra connections gain.
+* a ``file://`` source, or remote copy switched off, means ``streamed`` and
+  nothing else - whatever ``ENABLE_STREAM_COPY`` says;
+* a ``copy_mode=pull|push`` query argument on the source (else on the
+  destination) forces that mode, with no fallback;
+* otherwise ``DEFAULT_COPY_MODE`` (``3rd pull``, ``3rd push`` or
+  ``streamed``; anything else is ``3rd pull``, with a warning).
 
-**HTTP to HTTP** is gfal2's mode chain, event for event: ``3rd pull`` (the
-destination fetches), then ``3rd push`` (the source sends), then
-``streamed`` (the bytes flow through this process), starting from
-``DEFAULT_COPY_MODE`` and falling back only while
-``ENABLE_FALLBACK_TPC_COPY`` allows. Each attempt announces itself with a
-``TRANSFER:TYPE`` event; a failed attempt's partial destination is removed
-(a ``CLEANUP`` event) before the next begins. ``ENABLE_REMOTE_COPY=false``
-leaves only ``streamed``; ``ENABLE_STREAM_COPY=false`` - or a ``+3rd``
-scheme on either side - removes it.
+``ENABLE_REMOTE_COPY``, ``ENABLE_STREAM_COPY``, ``ENABLE_FALLBACK_TPC_COPY``
+and ``DEFAULT_COPY_MODE`` are read from the source's and the destination's
+own groups first (``[DAV:HOST]``, ``[HTTP:HOST]`` ...), where a boolean set
+on either end must hold on both, and from ``[HTTP PLUGIN]`` otherwise. A
+failed attempt's partial destination is removed (a ``CLEANUP`` event,
+``0`` when it was gone already) unless it failed because the destination
+exists; the next mode is tried unless the copy was cancelled, refused
+(``EPERM``, ``EACCES``) or found nothing to copy (``ENOENT``).
 
 A third-party ``COPY`` carries what davix sends: ``Source`` or
-``Destination``, ``X-Number-Of-Streams``, ``Secure-Redirection``,
-``RequireChecksumVerification``, and the far side's credential. That is a
-token in ``TransferHeaderAuthorization`` when there is one - the far URL's
-own ``authz``, the context's bearer token, or, with an X.509 proxy and
-``RETRIEVE_BEARER_TOKEN``, a macaroon minted by the far SE - and
-``Credential: none``. With only a proxy, and ``proxy_delegation`` set, the
-near side is instead allowed to ask for a delegated proxy (``X-Delegate-To``).
-The response body streams performance markers, which become
-``transfer.progress``, and ends ``success:`` or ``failure:``.
+``Destination``, ``X-Number-Of-Streams``, ``Secure-Redirection``, a
+``RequireChecksumVerification: false`` where gfal2 sends one (it never
+sends ``true``), ``SciTag``, and the far side's credential: a bearer token
+in ``TransferHeaderAuthorization`` with ``Credential: none`` - a
+user-set one, or one the far SE mints when ``RETRIEVE_BEARER_TOKEN`` is on -
+else ``Credential: gridsite`` when the far side is HTTPS (the active end may
+then ask for a delegated proxy, ``X-Delegate-To``), else ``Credential:
+none`` and ``X-No-Delegate: true``. An S3 or GCS far side gets a
+pre-signed URL and ``Copy-Flags: NoHead``. The response streams
+performance markers, which become ``transfer.progress``, and ends
+``success``, ``failure``/``failed`` or ``aborted``; errors are worded and
+numbered as davix words them.
+
+``[CORE] RESOLVE_DNS`` makes the copy use one address of each endpoint's
+DNS alias, by its reverse-resolved name, as gfal2 does (DMC-1348).
+
+**HTTP to ``file://``** is not claimed by gfal2 at all; this plugin takes it
+to download large files as ranged ``GET``\\ s over several pooled
+connections at once, each writing its bytes straight into place with
+``os.pwrite``. ``params.nbstreams`` sets the number of streams when it is
+positive; over TLS the default is two, since every TLS record costs a trip
+through the GIL. Its events are the core's.
+
+Where this differs from gfal2, deliberately: the source and destination
+checksums and the overwrite check are the core's (so they come before
+``PREPARE:ENTER`` rather than inside it, and are worded as the core words
+them); a copy whose deadline has passed tries no further mode; and a
+``copy_mode`` query argument does not also switch fallback off for every
+later copy in the context, as gfal2's (which writes it into the options)
+does.
 """
 
 from __future__ import annotations
@@ -38,50 +61,43 @@ from __future__ import annotations
 import errno
 import logging
 import os
-import re
+import random
+import socket
 import threading
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ... import events as ev
-from ...enums import checksum_mode
-from ...errors import ECOMM, GError
-from ...plugin import O_CREAT, O_TRUNC, O_WRONLY
+from ...errors import GError
+from ...plugin import O_CREAT, O_TRUNC, O_WRONLY, PluginFile
 from ...transfer import Transfer, pump
 from ...url import parse, scheme_of
-from ._client import (
-    BLOCK,
-    FileBody,
-    Response,
-    http_errno,
-    status_error,
-    url_token,
-    wire_scheme,
-    wire_url,
-)
+from ._client import BLOCK, FileBody, Response, config_group, wire_scheme, wire_url
 from ._delegation import delegate
-from ._io import HTTPReadFile
-from ._token import retrieve
+from ._io import HTTPReadFile, HTTPWriteFile
+from ._token import se_token
 
 if TYPE_CHECKING:
+    from ...options import Options
     from .plugin import HTTPPlugin
 
-__all__ = ["PULL", "PUSH", "STREAMED", "copy", "copy_modes"]
+__all__ = ["PULL", "PUSH", "STREAMED", "CopyMode", "copy", "copy_mode", "is_http_scheme"]
 
 _log = logging.getLogger("gfal2")
 
 PULL = "3rd pull"
 PUSH = "3rd push"
 STREAMED = "streamed"
-_ORDER = (PULL, PUSH, STREAMED)
-_SPELLINGS = {
-    "3rd pull": PULL,
-    "pull": PULL,
-    "3rd push": PUSH,
-    "push": PUSH,
-    "streamed": STREAMED,
-    "stream": STREAMED,
-    "streaming": STREAMED,
-}
+_MODES = (PULL, PUSH, STREAMED)
+#: ``copy_mode=`` query values.
+_QUERY_MODES = {"pull": PULL, "push": PUSH}
+#: What ``is_http_scheme`` accepts in gfal2: no ``+3rd``.
+HTTP_SCHEMES = frozenset(
+    {"http", "https", "dav", "davs", "s3", "s3s", "gcloud", "gclouds"}
+    | {"swift", "swifts", "cs3", "cs3s"}
+)
+_CHECKSUM_SOURCE = 1
+_CHECKSUM_TARGET = 2
 
 #: Files at least this big are downloaded over several connections.
 PARALLEL_THRESHOLD = 32 << 20
@@ -94,7 +110,10 @@ SEGMENT = 64 << 20
 #: The longest line believed to be a performance marker.
 MAX_MARKER_LINE = 1 << 16
 
-_QUOTED_STATUS = re.compile(r"\b([45]\d\d)\b")
+
+def is_http_scheme(url: str) -> bool:
+    """gfal2's ``is_http_scheme``: the plugin's schemes, less the ``+3rd`` ones."""
+    return scheme_of(url) in HTTP_SCHEMES
 
 
 def local_path(url: str) -> str:
@@ -102,12 +121,16 @@ def local_path(url: str) -> str:
 
 
 def copy(plugin: HTTPPlugin, transfer: Transfer) -> None:
-    if scheme_of(transfer.source) == "file":
-        upload(plugin, transfer)
-    elif scheme_of(transfer.destination) == "file":
+    if scheme_of(transfer.destination) == "file":
+        transfer.event(ev.TRANSFER_ENTER, transfer.pair)
         download(plugin, transfer)
+        transfer.event(ev.TRANSFER_EXIT, transfer.pair)
     else:
-        between(plugin, transfer)
+        transfer.event(ev.PREPARE_ENTER, transfer.pair)
+        transfer.event(ev.PREPARE_EXIT, transfer.pair)
+        run_modes(plugin, transfer)
+        if transfer.params.evict:
+            _evict(plugin, transfer)
 
 
 def _deadline_timeout(transfer: Transfer, fallback: float) -> float:
@@ -115,13 +138,253 @@ def _deadline_timeout(transfer: Transfer, fallback: float) -> float:
     return fallback if left is None else max(left, 1.0)
 
 
+def _evict(plugin: HTTPPlugin, transfer: Transfer) -> None:
+    """``gfal-copy --evict``: release the source's disk copy, and say how that went."""
+    failed = plugin.tape.release([transfer.source], "")[0]
+    if failed is not None:
+        _log.info("Eviction request failed: %s", failed.message)
+    transfer.event("EVICT", "-1" if failed is not None else "0", side=ev.SOURCE)
+
+
 # ---------------------------------------------------------------------------
-# Upload
+# Choosing the modes
 # ---------------------------------------------------------------------------
+
+
+def _se_boolean(options: Options, url: str, key: str) -> bool | None:
+    """``key`` from ``url``'s own group, or ``None`` when that group does not set it."""
+    group = config_group(url)
+    if not options.has(group, key):
+        return None
+    try:
+        return bool(options.get_boolean(group, key))
+    except GError:
+        return None
+
+
+def _both_ends(plugin: HTTPPlugin, source: str, destination: str, key: str) -> bool:
+    """A boolean the endpoints' groups decide together (both must allow), else the plugin's."""
+    options = plugin.options
+    ends = [_se_boolean(options, url, key) for url in (source, destination)]
+    if ends != [None, None]:
+        return all(value is not False for value in ends)
+    return bool(options.boolean(plugin.option_group, key, True))
+
+
+def copy_mode(url: str) -> str | None:
+    """A ``copy_mode=pull|push`` query argument on ``url``."""
+    for key, value in parse(url).query_items():
+        if key == "copy_mode" and value in _QUERY_MODES:
+            return _QUERY_MODES[value]
+    return None
+
+
+class CopyMode:
+    """gfal2's ``HttpCopyMode``: where to start, and how far to fall back."""
+
+    def __init__(self, plugin: HTTPPlugin, source: str, destination: str) -> None:
+        self.fallback = True
+        self.streaming_only = True
+        self.streaming = True
+        if not is_http_scheme(source) or not _both_ends(
+            plugin, source, destination, "ENABLE_REMOTE_COPY"
+        ):
+            self.mode: str | None = STREAMED
+            return
+        self.streaming = _both_ends(plugin, source, destination, "ENABLE_STREAM_COPY")
+        forced = copy_mode(source) or copy_mode(destination)
+        if forced is not None:
+            _log.info("Extracted copy mode from query arguments: %s", forced)
+            self.mode, self.fallback, self.streaming_only = forced, False, False
+            return
+        self.fallback = _both_ends(plugin, source, destination, "ENABLE_FALLBACK_TPC_COPY")
+        options = plugin.options
+        chosen = None
+        for url in (source, destination):
+            chosen = chosen or _mode_named(options.string(config_group(url), "DEFAULT_COPY_MODE"))
+        if chosen is not None:
+            _log.info("Using storage specific copy mode configuration: %s", chosen)
+        else:
+            configured = options.string(plugin.option_group, "DEFAULT_COPY_MODE", PULL)
+            chosen = _mode_named(configured)
+            if chosen is None:
+                _log.warning(
+                    "Invalid Gfal2 configuration for 'DEFAULT_COPY_MODE'. "
+                    "Using default copy mode: %s",
+                    PULL,
+                )
+                chosen = PULL
+        self.mode, self.streaming_only = chosen, chosen == STREAMED
+
+    def next(self) -> None:
+        if self.mode == PULL:
+            self.mode = PUSH
+        elif self.mode == PUSH and self.streaming:
+            self.mode = STREAMED
+        else:
+            self.mode = None
+
+
+def _mode_named(name: str) -> str | None:
+    return name if name in _MODES else None
+
+
+def _should_fallback(code: int) -> bool:
+    return code not in (errno.ECANCELED, errno.EPERM, errno.ENOENT, errno.EACCES)
+
+
+# ---------------------------------------------------------------------------
+# The attempts
+# ---------------------------------------------------------------------------
+
+
+def run_modes(plugin: HTTPPlugin, transfer: Transfer) -> None:
+    """gfal2's loop over the copy modes, with its events and its final wording."""
+    modes = CopyMode(plugin, transfer.source, transfer.destination)
+    transfer.event(ev.TRANSFER_ENTER, transfer.pair)
+    tried: list[str] = []
+    while modes.mode is not None:
+        mode = modes.mode
+        transfer.event(ev.TRANSFER_TYPE, mode)
+        try:
+            if mode != STREAMED:
+                third_party(plugin, transfer, mode)
+            elif modes.streaming:
+                streamed(plugin, transfer)
+            else:
+                last = GError(
+                    "STREAMED DISABLED Only streamed copy possible but streaming is disabled",
+                    errno.EINVAL,
+                )
+                _log.warning("%s", last.message)
+                break
+            transfer.event(ev.TRANSFER_EXIT, transfer.pair)
+            return
+        except GError as exc:
+            _log.warning("Copy failed with mode %s: %s", mode, exc.message)
+            last = exc
+        _cleanup(plugin, transfer, last)
+        tried.append(mode)
+        modes.next()
+        # The deadline has passed: another mode would only time out too.
+        if not (modes.fallback and _should_fallback(last.code)) or transfer.remaining() == 0.0:
+            break
+    message = last.message
+    if tried:
+        message = f"ERROR: Copy failed ({', '.join(tried)}). Last attempt: {message}"
+    transfer.event(ev.TRANSFER_EXIT, message)
+    # Cleaned here, as gfal2 cleans, or deliberately kept: not the core's to remove.
+    transfer.owns_destination = False
+    raise GError(f"TRANSFER {message}", last.code)
+
+
+def _cleanup(plugin: HTTPPlugin, transfer: Transfer, error: GError) -> None:
+    """Remove what a failed attempt may have left - unless the destination was there before."""
+    if error.code == errno.EEXIST or not transfer.params.transfer_cleanup:
+        return
+    try:
+        plugin.unlink(transfer.destination)
+        code = 0
+    except GError as exc:
+        code = 0 if exc.code == errno.ENOENT else exc.code
+    transfer.event(ev.CLEANUP, str(code), side=ev.DESTINATION)
+
+
+def resolved(plugin: HTTPPlugin, url: str) -> str:
+    """``url`` on one of its host's addresses, by name, when ``[CORE] RESOLVE_DNS`` is on."""
+    if not plugin.options.boolean("CORE", "RESOLVE_DNS", False):
+        return url
+    parsed = parse(url)
+    host = parsed.host
+    try:
+        found = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        address = random.choice(found)[4]
+        name = socket.getnameinfo(address, socket.NI_NAMEREQD)[0]
+    except OSError as exc:
+        _log.warning("Could not resolve DNS alias %s: %s", host, exc)
+        return url
+    _log.info("Resolved url: %s => %s", host, name)
+    userinfo, at, place = parsed.netloc.rpartition("@")
+    return str(replace(parsed, netloc=userinfo + at + place.replace(host, name, 1)))
+
+
+# ---------------------------------------------------------------------------
+# Streamed
+# ---------------------------------------------------------------------------
+
+
+class _SourceError(GError):
+    """A failure reading the source during a streamed copy."""
+
+
+class _Tagged(PluginFile):
+    """The source of a streamed copy, its failures marked as the source's."""
+
+    def __init__(self, inner: PluginFile) -> None:
+        super().__init__(inner.url)
+        self._inner = inner
+
+    def readinto(self, buffer: memoryview | bytearray) -> int:
+        try:
+            return self._inner.readinto(buffer)
+        except GError as exc:
+            raise _SourceError(f"{exc.message} (source)", exc.code) from exc
+
+
+def _destination(exc: GError) -> GError:
+    """gfal2's ``<why> (destination)``, unless the source failed or the copy stopped."""
+    if isinstance(exc, _SourceError) or exc.code in (errno.ECANCELED, errno.ETIMEDOUT):
+        return exc
+    return GError(f"{exc.message} (destination)", exc.code)
+
+
+def _upload_headers(transfer: Transfer) -> dict[str, str]:
+    """``Content-MD5`` with the user's value as typed, when the target is checked by MD5."""
+    if (
+        int(transfer.checksum_mode) & _CHECKSUM_TARGET
+        and transfer.checksum_algorithm.lower() == "md5"
+        and transfer.user_checksum
+    ):
+        return {"Content-MD5": transfer.user_checksum}
+    return {}
+
+
+def streamed(plugin: HTTPPlugin, transfer: Transfer) -> None:
+    if scheme_of(transfer.source) == "file":
+        upload(plugin, transfer)
+        return
+    info = plugin.stat(transfer.source)
+    if info.is_dir():
+        raise GError(f"{transfer.source} is a directory", errno.EISDIR)
+    size = info.st_size
+    transfer.source_size = size
+    reader = HTTPReadFile(plugin, transfer.source, size)
+    try:
+        destination = resolved(plugin, transfer.destination)
+        writer = (
+            plugin.open(destination, O_WRONLY | O_CREAT | O_TRUNC, 0o644, size)
+            if plugin._multipart(destination)
+            else HTTPWriteFile(plugin, destination, size, _upload_headers(transfer))
+        )
+        try:
+            total = pump(transfer, _Tagged(reader), writer)
+            if total != size:
+                # Raised before the writer closes, so that it abandons the
+                # upload rather than completing a truncated one.
+                raise _SourceError(
+                    f"Short copy: {total} bytes transferred, the source has {size} (source)",
+                    errno.EIO,
+                )
+        finally:
+            writer.close()
+    except GError as exc:
+        raise _destination(exc) from None
+    finally:
+        reader.close()
 
 
 def upload(plugin: HTTPPlugin, transfer: Transfer) -> None:
-    transfer.event(ev.TRANSFER_TYPE, STREAMED)
+    """``file://`` to HTTP: one ``PUT``, its body sent with ``sendfile``."""
     path = local_path(transfer.source)
     try:
         handle = open(path, "rb")  # noqa: SIM115 - closed below, around a long call
@@ -135,12 +398,16 @@ def upload(plugin: HTTPPlugin, transfer: Transfer) -> None:
             transfer.add(count)
             transfer.check()
 
-        plugin._put_file(
-            transfer.destination,
-            FileBody(handle, 0, size, progress),
-            size,
-            timeout=_deadline_timeout(transfer, plugin.io_timeout()),
-        )
+        try:
+            plugin._put_file(
+                resolved(plugin, transfer.destination),
+                FileBody(handle, 0, size, progress),
+                size,
+                timeout=_deadline_timeout(transfer, plugin.io_timeout()),
+                headers=_upload_headers(transfer),
+            )
+        except GError as exc:
+            raise _destination(exc) from None
     transfer.progress(size, force=True)
 
 
@@ -265,162 +532,108 @@ def _parallel(plugin: HTTPPlugin, transfer: Transfer, fd: int, size: int, stream
 
 
 # ---------------------------------------------------------------------------
-# HTTP to HTTP
+# Third-party copy
 # ---------------------------------------------------------------------------
 
 
-def copy_modes(plugin: HTTPPlugin, source: str, destination: str) -> list[str]:
-    """The modes gfal2 would try for this pair, in order."""
-    options, group = plugin.options, plugin.option_group
-    raw = options.string(group, "DEFAULT_COPY_MODE", PULL).strip().lower()
-    default = _SPELLINGS.get(raw)
-    if default is None:
-        _log.warning("Invalid 'DEFAULT_COPY_MODE' %r; using %s", raw, PULL)
-        default = PULL
-    remote = options.boolean(group, "ENABLE_REMOTE_COPY", True)
-    forced = "+3rd" in scheme_of(source) or "+3rd" in scheme_of(destination)
-    stream = options.boolean(group, "ENABLE_STREAM_COPY", True) and not forced
-    if not remote:
-        default = STREAMED
-    chain = list(_ORDER[_ORDER.index(default) :])
-    if not options.boolean(group, "ENABLE_FALLBACK_TPC_COPY", True):
-        chain = [default]
-    if not stream:
-        chain = [mode for mode in chain if mode != STREAMED]
-    return chain
-
-
-def between(plugin: HTTPPlugin, transfer: Transfer) -> None:
-    modes = copy_modes(plugin, transfer.source, transfer.destination)
-    if not modes:
-        raise GError(
-            "STREAMED DISABLED Only streamed copy possible but streaming is disabled", errno.EPERM
-        )
-    tried: list[str] = []
-    last = GError("Copy failed", errno.EIO)
-    for mode in modes:
-        if tried:
-            # A failed attempt may have left part of a file behind.
-            _cleanup(plugin, transfer)
-        transfer.event(ev.TRANSFER_TYPE, mode)
-        try:
-            if mode == STREAMED:
-                streamed(plugin, transfer)
-            else:
-                third_party(plugin, transfer, mode)
-            return
-        except GError as exc:
-            _log.info("Copy failed with mode %s: %s", mode, exc.message)
-            tried.append(mode)
-            last = exc
-            # Neither a cancelled copy, one out of time, nor one refused because
-            # the file is already there gets anything from trying another way.
-            if exc.code in (errno.ECANCELED, errno.EEXIST) or transfer.remaining() == 0.0:
-                break
-    if last.code == errno.ECANCELED:
-        raise last
-    raise GError(
-        f"TRANSFER ERROR: Copy failed ({', '.join(tried)}). Last attempt: {last.message}",
-        last.code,
-    )
-
-
-def _cleanup(plugin: HTTPPlugin, transfer: Transfer) -> None:
-    """Remove what a failed attempt may have left, before the next one tries."""
-    if not transfer.params.transfer_cleanup:
-        return
-    try:
-        plugin.unlink(transfer.destination)
-        code = 0
-    except GError as exc:
-        code = 0 if exc.code == errno.ENOENT else exc.code
-    transfer.event(ev.CLEANUP, str(code), side=ev.DESTINATION)
-
-
-def streamed(plugin: HTTPPlugin, transfer: Transfer) -> None:
-    """GET piped into PUT, through the core's overlapped pump."""
-    info = plugin.stat(transfer.source)
-    if info.is_dir():
-        raise GError(f"{transfer.source} is a directory", errno.EISDIR)
-    size = info.st_size
-    transfer.source_size = size
-    reader = HTTPReadFile(plugin, transfer.source, size)
-    try:
-        writer = plugin.open(transfer.destination, O_WRONLY | O_CREAT | O_TRUNC, 0o644, size)
-        try:
-            total = pump(transfer, reader, writer)
-            if total != size:
-                # Raised before the writer closes, so that it abandons the
-                # upload rather than completing a truncated one.
-                raise GError(
-                    f"Short copy: {total} bytes transferred, the source has {size}", errno.EIO
-                )
-        finally:
-            writer.close()
-    finally:
-        reader.close()
+def _passive_credential(
+    plugin: HTTPPlugin, far: str, write: bool, transfer: Transfer
+) -> dict[str, str]:
+    """The headers that let the active end reach ``far`` (gfal2's ``get_tpc_params``)."""
+    headers: dict[str, str] = {}
+    scheme = scheme_of(far)
+    if scheme in ("cs3", "cs3s"):
+        token = plugin.options.string("BEARER", "TOKEN")
+        if token:
+            headers["TransferHeaderAuthorization"] = f"Bearer {token}"
+    elif scheme in HTTP_SCHEMES - {"s3", "s3s", "gcloud", "gclouds", "swift", "swifts"}:
+        token = _far_token(plugin, far, write, transfer)
+        if token:
+            headers["TransferHeaderAuthorization"] = f"Bearer {token}"
+            headers["Credential"] = "none"
+    if scheme in ("https", "davs"):
+        headers.setdefault("Credential", "gridsite")
+    else:
+        headers["Credential"] = "none"
+        headers["X-No-Delegate"] = "true"
+    return headers
 
 
 def _far_token(plugin: HTTPPlugin, far: str, write: bool, transfer: Transfer) -> str | None:
-    """The credential for the far endpoint, if it can be a token."""
-    found = url_token(parse(far)) or plugin.context.bearer_token(far)
+    """A user-set token for ``far``, or one its SE mints when ``RETRIEVE_BEARER_TOKEN`` says so."""
+    parsed = parse(far)
+    query = parsed.query_dict()
+    if "X-Amz-Signature" in query or "AWSAccessKeyId" in query:
+        return None
+    found = plugin.client.bearer(far, parsed)
     if found:
         return found
-    if not plugin.options.boolean(plugin.option_group, "RETRIEVE_BEARER_TOKEN", True):
+    retrieve = _se_boolean(plugin.options, far, "RETRIEVE_BEARER_TOKEN")
+    if retrieve is None:
+        retrieve = plugin.options.boolean(plugin.option_group, "RETRIEVE_BEARER_TOKEN", False)
+    if not retrieve or parsed.scheme not in ("https", "davs"):
         return None
-    if plugin.context.x509(far) is None or wire_scheme(scheme_of(far)) != "https":
-        return None
-    minutes = max(int(transfer.params.timeout) // 60 + 1, 2)
-    try:
-        return retrieve(plugin, far, "", minutes, write)
-    except GError as exc:
-        _log.info("(SEToken) Could not retrieve any token for %s: %s", far, exc.message)
-        return None
+    minutes = 2 * int(transfer.params.timeout) // 60 + 10
+    return se_token(plugin, far, write, minutes)
+
+
+def _checksum_header(mode: str, checks: int) -> dict[str, str]:
+    """``RequireChecksumVerification: false`` exactly where gfal2 sends it (for dCache)."""
+    side = _CHECKSUM_SOURCE if mode == PUSH else _CHECKSUM_TARGET
+    if checks & side or not checks:
+        return {"RequireChecksumVerification": "false"}
+    return {}
 
 
 def third_party(plugin: HTTPPlugin, transfer: Transfer, mode: str) -> None:
-    source, destination = transfer.source, transfer.destination
-    near, far = (destination, source) if mode == PULL else (source, destination)
+    near, far = (
+        (transfer.destination, transfer.source)
+        if mode == PULL
+        else (transfer.source, transfer.destination)
+    )
     params = transfer.params
-    headers: dict[str, str] = {}
-    signer = plugin.signer_for(far)
+    headers = _passive_credential(plugin, far, mode == PUSH, transfer)
+    signer = plugin.presigner_for(far)
     if signer is not None:
-        # An S3 endpoint joins a TPC through a pre-signed URL; it needs no token.
-        method = "GET" if mode == PULL else "PUT"
-        far_url = signer.presign(method, far, expires=max(int(params.timeout), 3600))
-        token = None
+        # An S3 or GCS endpoint joins a TPC through a pre-signed URL.
+        far_url = signer.presign("GET" if mode == PULL else "PUT", resolved(plugin, far))
+        headers["Copy-Flags"] = "NoHead"
     else:
-        far_url = wire_url(far)
-        token = _far_token(plugin, far, mode == PUSH, transfer)
+        far_url = wire_url(resolved(plugin, far))
     headers["Source" if mode == PULL else "Destination"] = far_url
     headers["X-Number-Of-Streams"] = str(params.nbstreams)
     headers["Secure-Redirection"] = "1"
-    delegating = (
-        token is None
-        and signer is None
-        and params.proxy_delegation
-        and plugin.context.x509(near) is not None
-        and wire_scheme(scheme_of(near)) == "https"
-    )
-    if token is not None:
-        headers["TransferHeaderAuthorization"] = f"Bearer {token}"
-    if not delegating:
-        headers["Credential"] = "none"
-        headers["X-No-Delegate"] = "true"
-    verify = transfer.checksum_mode != checksum_mode.none
-    headers["RequireChecksumVerification"] = "true" if verify else "false"
+    headers.update(_checksum_header(mode, int(transfer.checksum_mode)))
     if params.scitag:
         headers["SciTag"] = str(params.scitag)
-    if params.overwrite:
-        headers["Overwrite"] = "T"
     timeout = _deadline_timeout(transfer, 3600.0)
-    with plugin._request("COPY", near, headers=headers, timeout=timeout) as response:
-        if response.status not in (200, 201, 202):
-            raise status_error(response.status, response.reason)
+    active = resolved(plugin, near)
+    with plugin._request(
+        "COPY", active, headers=headers, timeout=timeout, cred_url=near
+    ) as response:
+        if response.status >= 300:
+            raise _copy_refused(response)
         endpoint = response.header("X-Delegate-To").split()
-        if delegating and endpoint:
+        if endpoint:
             delegate(plugin, endpoint[0], near)
         _follow(response, transfer)
+
+
+def _copy_refused(response: Response) -> GError:
+    """davix's words for a ``COPY`` the active endpoint turned down."""
+    status = response.status
+    if status == 404:
+        return GError("Could not COPY. File not found", errno.ENOENT)
+    if status == 403:
+        return GError("Could not COPY. Permission denied.", errno.EPERM)
+    if status == 501:
+        return GError("Could not COPY. The source service does not support it", errno.ENOSYS)
+    if status >= 405:
+        return GError("Could not COPY. The source service does not allow it", errno.ENOSYS)
+    if status == 400:
+        text = response.body().decode("utf-8", "replace")
+        return GError(f"Could not COPY. The server rejected the request: {text}", errno.EIO)
+    return GError(f"Could not COPY. Unknown error code: {status}", errno.EIO)
 
 
 def _follow(response: Response, transfer: Transfer) -> None:
@@ -430,20 +643,19 @@ def _follow(response: Response, transfer: Transfer) -> None:
     while True:
         line = response.readline(MAX_MARKER_LINE)
         if not line:
-            raise GError("Connection terminated abruptly; Status of TPC request unknown", ECOMM)
+            raise GError("Connection terminated abruptly; Status of TPC request unknown", errno.EIO)
         text = line.decode("utf-8", "replace").strip()
         lowered = text.lower()
         if lowered.startswith("success"):
             transfer.progress(sum(stripes.values()), force=True)
             return
-        if lowered.startswith(("failure", "failed", "aborted")):
-            detail = text.partition(":")[2].strip() or text
-            found = _QUOTED_STATUS.search(detail)
-            code = http_errno(int(found.group(1))) if found else ECOMM
-            raise GError(f"Transfer failure: {detail}", code)
-        if lowered == "perf marker":
+        if lowered.startswith("aborted"):
+            raise GError("Transfer aborted in the remote end", errno.ECANCELED)
+        if lowered.startswith(("failure", "failed")):
+            raise GError(f"Transfer {text}", errno.EIO)
+        if lowered.startswith("perf marker"):
             block = {}
-        elif lowered == "end":
+        elif lowered.startswith("end"):
             moved = block.get("stripe bytes transferred", "")
             if moved.isdigit():
                 index = block.get("stripe index", "0")

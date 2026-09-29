@@ -33,7 +33,8 @@ from typing import Any
 
 import pytest
 
-PACKAGE = "xgfalclient"
+#: Every package the project ships; each is held to the same rule.
+PACKAGES = ("xgfalclient", "gfal2", "gfal2_util")
 PROBE = "__condcov__"
 ENABLED = bool(os.environ.get("XGFAL_CONDCOV"))
 OUTCOMES = ((1, "true"), (0, "false"))
@@ -176,7 +177,7 @@ def _after_preamble(body: list[ast.stmt]) -> int:
 
 class _Finder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname: str, path: Sequence[str] | None, target: Any = None) -> Any:
-        if fullname != PACKAGE and not fullname.startswith(PACKAGE + "."):
+        if fullname.split(".")[0] not in PACKAGES:
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is None or not isinstance(spec.loader, importlib.machinery.SourceFileLoader):
@@ -185,21 +186,36 @@ class _Finder(importlib.abc.MetaPathFinder):
         return spec
 
 
-def _root() -> Path:
-    spec = importlib.machinery.PathFinder.find_spec(PACKAGE)
-    assert spec is not None and spec.submodule_search_locations
-    return Path(next(iter(spec.submodule_search_locations)))
+def _roots() -> list[Path]:
+    """The directory of each shipped package that is importable here."""
+    roots = []
+    for package in PACKAGES:
+        spec = importlib.machinery.PathFinder.find_spec(package)
+        if spec is not None and spec.submodule_search_locations:
+            roots.append(Path(next(iter(spec.submodule_search_locations))))
+    return roots
 
 
 def _relative(path: str) -> str:
-    return Path(path).relative_to(_root().parent).as_posix()
+    """``package/module.py``: the path below the directory holding the packages."""
+    return Path(path).relative_to(Path(path).parents[len(_package_parts(path))]).as_posix()
+
+
+def _package_parts(path: str) -> list[str]:
+    """The package directories between ``path`` and the directory holding its top package."""
+    parts = []
+    for parent in Path(path).parents:
+        if not (parent / "__init__.py").exists():
+            break
+        parts.append(parent.name)
+    return parts
 
 
 def install() -> None:
-    """Instrument ``xgfalclient``; must run before anything imports it."""
-    already = [name for name in sys.modules if name.split(".")[0] == PACKAGE]
+    """Instrument the shipped packages; must run before anything imports them."""
+    already = [name for name in sys.modules if name.split(".")[0] in PACKAGES]
     if already:
-        raise RuntimeError(f"condcov: {PACKAGE} was imported before instrumentation")
+        raise RuntimeError(f"condcov: {already[0]} was imported before instrumentation")
     sys.meta_path.insert(0, _Finder())
 
 
@@ -208,11 +224,10 @@ def install() -> None:
 
 def missing(hits: dict[str, set[int]]) -> tuple[list[tuple[str, Site, str]], int]:
     """Every probe short of an outcome, over every module of the package; and the probe count."""
-    root = _root()
     gaps = []
     total = 0
-    for path in sorted(root.rglob("*.py")):
-        relative = path.relative_to(root.parent).as_posix()
+    for path in sorted(path for root in _roots() for path in root.rglob("*.py")):
+        relative = _relative(str(path))
         _, sites = instrument(path.read_text("utf-8"), str(path))
         total += len(sites)
         seen = hits.get(relative, set())

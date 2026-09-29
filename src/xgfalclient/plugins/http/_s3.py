@@ -1,21 +1,27 @@
 """S3: AWS Signature Version 4, listings, and multipart uploads.
 
-gfal2 reaches S3 through davix with ``s3://`` and ``s3s://`` URLs and the
-``[S3]`` keys (``ACCESS_KEY``, ``SECRET_KEY``, optional ``TOKEN`` and
-``REGION``), or per-endpoint keys in an ``[S3:<HOST>]`` group - which also
-make a plain ``https://`` URL on that host an S3 one. ``ALTERNATE=true``
+gfal2 reaches S3 through davix with ``s3://`` and ``s3s://`` URLs. The keys
+come from three groups, most specific first, each setting found on its own
+(``ACCESS_KEY``/``SECRET_KEY`` as a pair, ``TOKEN``, ``REGION``,
+``ALTERNATE``): ``[S3:<HOST>]``, ``[S3:<HOST less its first label>]`` - the
+endpoint of a virtual-host bucket - and ``[S3]``. The old names
+``ACCESS_TOKEN``/``ACCESS_TOKEN_SECRET`` still work. ``ALTERNATE=true``
 selects path-style addressing (``s3://host/bucket/key``) over the default
 virtual-host style (``s3://bucket.host/key``); it matters here only for
-listings, which must know where the bucket ends and the key begins.
+listings and renames, which must know where the bucket ends and the key
+begins. Keys never make an ``https://`` URL an S3 one: gfal2 sends those
+unsigned, as WebDAV.
 
 Every request is signed with SigV4 (``hmac`` and ``hashlib``, nothing else).
 davix falls back to the older SigV2 when no region is configured; this does
 not - SigV2 is retired at AWS and every S3 implementation that matters takes
 V4 - and signs for ``us-east-1`` instead, which is what they all accept.
 
-S3 has no directories. ``mkdir`` succeeds without doing anything, a
-"directory" is a key prefix that something lives under, and a listing is
-``ListObjectsV2`` with ``/`` as the delimiter.
+S3 has no directories. As in davix, ``mkdir`` puts an empty ``<key>/``
+marker object, a "directory" is a key prefix that something lives under,
+modes are ``0755``, a listing is ``ListObjectsV2`` with ``/`` as the
+delimiter, and a rename is a server-side copy (``x-amz-copy-source``) and a
+delete.
 """
 
 from __future__ import annotations
@@ -37,8 +43,9 @@ from ...errors import GError
 from ...plugin import PluginFile
 from ...types import Stat
 from ...url import URL, parse
+from . import _swift
 from ._client import Body, FileBody, Target, status_error
-from ._dav import DIR_MODE, FILE_MODE, epoch, parse_xml
+from ._dav import epoch, parse_xml
 from ._gcloud import is_gcloud
 
 if TYPE_CHECKING:
@@ -60,6 +67,9 @@ DEFAULT_REGION = "us-east-1"
 MULTIPART_THRESHOLD = 1 << 30
 #: Part size for multipart uploads (S3's minimum is 5 MiB).
 PART_SIZE = 64 << 20
+#: An object's and a prefix's mode, as davix reports them.
+OBJECT_FILE_MODE = _swift.FILE_MODE
+OBJECT_DIR_MODE = _swift.DIR_MODE
 
 
 @dataclass(frozen=True)
@@ -73,31 +83,52 @@ class S3Keys:
         return f"S3Keys({self.access_key!r}, secret_key=<redacted>, region={self.region!r})"
 
 
-def _keys(options: Options, group: str) -> S3Keys | None:
-    access = options.string(group, "ACCESS_KEY")
-    secret = options.string(group, "SECRET_KEY")
-    if not access or not secret:
-        return None
-    region = options.string(group, "REGION") or options.string("S3", "REGION") or DEFAULT_REGION
-    return S3Keys(access, secret, options.string(group, "TOKEN"), region)
-
-
 def is_s3(url: URL) -> bool:
     return url.scheme.partition("+")[0] in ("s3", "s3s")
 
 
+def _groups(url: URL) -> list[str]:
+    """``S3:HOST``, ``S3:<host minus the bucket label>``, ``S3`` - davix's search order."""
+    host = url.host.upper()
+    groups = [f"S3:{host}"]
+    if "." in host:
+        groups.append(f"S3:{host.partition('.')[2]}")
+    return [*groups, "S3"]
+
+
 def s3_keys(options: Options, url: URL) -> S3Keys | None:
-    """The keys for ``url``: its host's group first, then ``[S3]`` for ``s3://``."""
-    for group in (f"S3:{url.host.upper()}", f"S3:{url.host}"):
-        found = _keys(options, group)
-        if found is not None:
-            return found
-    return _keys(options, "S3") if is_s3(url) else None
+    """The keys for ``url``, each setting from the most specific group that has it.
+
+    A group's pair counts only when both halves are there (else its legacy
+    ``ACCESS_TOKEN``/``ACCESS_TOKEN_SECRET``); ``TOKEN`` and ``REGION`` are
+    looked up on their own, so they may come from a broader group.
+    """
+    access = secret = token = region = ""
+    for group in _groups(url):
+        if not (access and secret):
+            access = options.string(group, "ACCESS_KEY") or access
+            secret = options.string(group, "SECRET_KEY") or secret
+            if not (access and secret):
+                access = options.string(group, "ACCESS_TOKEN")
+                secret = options.string(group, "ACCESS_TOKEN_SECRET")
+        token = token or options.string(group, "TOKEN")
+        region = region or options.string(group, "REGION")
+    if not (access and secret):
+        return None
+    return S3Keys(access, secret, token, region or DEFAULT_REGION)
+
+
+def _alternate(options: Options, group: str) -> bool | None:
+    try:
+        return bool(options.get_boolean(group, "ALTERNATE"))
+    except GError:
+        return None  # unset, or not a boolean
 
 
 def path_style(options: Options, url: URL) -> bool:
-    fallback = options.boolean("S3", "ALTERNATE", False)
-    return bool(options.boolean(f"S3:{url.host.upper()}", "ALTERNATE", fallback))
+    """``ALTERNATE`` from the first group that sets it (validly)."""
+    found = (_alternate(options, group) for group in _groups(url))
+    return next((value for value in found if value is not None), False)
 
 
 # ---------------------------------------------------------------------------
@@ -247,16 +278,24 @@ def split(plugin: HTTPPlugin, url: str) -> tuple[str, str]:
     return f"{base}/", path
 
 
-def list_objects(plugin: HTTPPlugin, url: str, *, limit: int = 0) -> list[tuple[str, Stat]]:
-    """A listing under ``url`` as a directory: ``(name, stat)`` pairs.
+def list_objects(plugin: HTTPPlugin, url: str) -> list[tuple[str, Stat]]:
+    """A listing under ``url`` as a directory: ``(name, stat)`` pairs."""
+    return _listing(plugin, url)[0]
 
-    S3 gets ``ListObjectsV2``; GCS's XML API gets the original marker-paged
-    listing, which is what davix sends it.
+
+def _listing(plugin: HTTPPlugin, url: str, *, limit: int = 0) -> tuple[list[tuple[str, Stat]], int]:
+    """The entries under ``url``, and how many keys and prefixes the store listed.
+
+    The count includes ``url``'s own ``<key>/`` marker, which is no entry
+    but still means the directory exists. S3 gets ``ListObjectsV2``; GCS's
+    XML API gets the original marker-paged listing, which is what davix
+    sends it.
     """
     bucket, key = split(plugin, url)
     v1 = is_gcloud(parse(url).scheme)
     prefix = f"{key.rstrip('/')}/" if key.strip("/") else ""
     entries: list[tuple[str, Stat]] = []
+    seen = 0
     token = ""
     while True:
         query: dict[str, str] = {"prefix": prefix, "delimiter": "/"}
@@ -270,12 +309,13 @@ def list_objects(plugin: HTTPPlugin, url: str, *, limit: int = 0) -> list[tuple[
         response = plugin._request("GET", listing, cred_url=url)
         payload = response.body()
         if response.status != 200:
-            raise status_error(response.status, response.reason)
+            raise status_error(response.status)
         root = parse_xml(payload, "bucket listing")
+        seen += len(_children(root, "CommonPrefixes")) + len(_children(root, "Contents"))
         for item in _children(root, "CommonPrefixes"):
             name = _child_text(item, "Prefix")[len(prefix) :].strip("/")
             if name:
-                entries.append((name, Stat(st_mode=DIR_MODE)))
+                entries.append((name, Stat(st_mode=OBJECT_DIR_MODE)))
         for item in _children(root, "Contents"):
             name = _child_text(item, "Key")[len(prefix) :]
             if name and "/" not in name:
@@ -284,7 +324,7 @@ def list_objects(plugin: HTTPPlugin, url: str, *, limit: int = 0) -> list[tuple[
                     (
                         name,
                         Stat(
-                            st_mode=FILE_MODE,
+                            st_mode=OBJECT_FILE_MODE,
                             st_size=int(size) if size.isdigit() else 0,
                             st_mtime=epoch(_child_text(item, "LastModified")),
                         ),
@@ -292,7 +332,7 @@ def list_objects(plugin: HTTPPlugin, url: str, *, limit: int = 0) -> list[tuple[
                 )
         token = _child_text(root, "NextMarker" if v1 else "NextContinuationToken")
         if limit or _child_text(root, "IsTruncated") != "true" or not token:
-            return entries
+            return entries, seen
 
 
 def stat(plugin: HTTPPlugin, url: str) -> Stat:
@@ -302,18 +342,30 @@ def stat(plugin: HTTPPlugin, url: str) -> Stat:
         response = plugin._request("HEAD", url)
         response.close()
         if response.status == 200:
+            if key.endswith("/") and not response.length:
+                return Stat(st_mode=OBJECT_DIR_MODE)  # a directory marker
             return Stat(
-                st_mode=FILE_MODE,
+                st_mode=OBJECT_FILE_MODE,
                 st_size=response.length or 0,
                 st_mtime=epoch(response.header("Last-Modified")),
             )
         if response.status != 404:
-            raise status_error(response.status, response.reason)
-        if not list_objects(plugin, url, limit=1):
-            raise status_error(404, response.reason)
-        return Stat(st_mode=DIR_MODE)
-    list_objects(plugin, url, limit=1)  # the bucket itself: exists if it lists
-    return Stat(st_mode=DIR_MODE)
+            raise status_error(response.status)
+        if not _listing(plugin, url, limit=1)[1]:
+            raise status_error(404)
+        return Stat(st_mode=OBJECT_DIR_MODE)
+    _listing(plugin, url, limit=1)  # the bucket itself: exists if it lists
+    return Stat(st_mode=OBJECT_DIR_MODE)
+
+
+def rename(plugin: HTTPPlugin, old: str, new: str) -> None:
+    """A server-side copy to ``new`` (``x-amz-copy-source``), then the original deleted."""
+    parsed = parse(old)
+    if is_gcloud(parsed.scheme) or path_style(plugin.options, parsed):
+        path = parsed.path
+    else:
+        path = f"/{parsed.host.partition('.')[0]}{parsed.path}"
+    _swift.rename(plugin, old, new, copy_header="x-amz-copy-source", source=path, ok=200)
 
 
 def checksum(plugin: HTTPPlugin, url: str, algorithm: str) -> str:
@@ -325,7 +377,7 @@ def checksum(plugin: HTTPPlugin, url: str, algorithm: str) -> str:
     response = plugin._request("HEAD", url, timeout=plugin.checksum_timeout())
     response.close()
     if response.status != 200:
-        raise status_error(response.status, response.reason)
+        raise status_error(response.status)
     wanted = algorithm.strip().lower()
     for item in response.header("x-goog-hash").split(","):
         name, _, value = item.strip().partition("=")
@@ -355,7 +407,7 @@ class Multipart:
         response = plugin._request("POST", self._with("uploads="), body=b"", cred_url=url)
         payload = response.body()
         if response.status != 200:
-            raise status_error(response.status, response.reason)
+            raise status_error(response.status)
         self.upload_id = _child_text(parse_xml(payload, "S3 response"), "UploadId")
         if not self.upload_id:
             raise GError(f"S3 did not return an upload id for {url}", errno.EPROTO)
@@ -375,7 +427,7 @@ class Multipart:
         )
         response.body()
         if response.status != 200:
-            raise status_error(response.status, response.reason)
+            raise status_error(response.status)
         self.parts.append(response.header("ETag"))
 
     def complete(self) -> None:
@@ -390,7 +442,7 @@ class Multipart:
         payload = response.body()
         # S3 can answer 200 and still carry an <Error> in the body.
         if response.status != 200 or b"<Error>" in payload:
-            raise status_error(response.status if response.status != 200 else 500, response.reason)
+            raise status_error(response.status if response.status != 200 else 500)
 
     def abort(self) -> None:
         try:

@@ -31,7 +31,7 @@ def test_stat_file_and_directory(hctx: xgfalclient.Gfal2Context, dav: WebDAVServ
     assert folder.st_mode == _stat.S_IFDIR | 0o777
     request = dav.requests[0]
     assert (request.method, request.header("Depth")) == ("PROPFIND", "0")
-    assert request.header("User-Agent").startswith("xgfalclient/")
+    assert request.header("User-Agent") == "gfal2/2.23.5"
 
 
 def test_stat_missing_is_worded_like_davix(
@@ -53,13 +53,26 @@ def test_forbidden_is_eperm_as_in_gfal2(hctx: xgfalclient.Gfal2Context, dav: Web
     )
 
 
-def test_unknown_status_uses_the_server_reason(
+def test_statuses_are_read_as_davix_reads_them(
     hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
 ) -> None:
     dav.fault("PROPFIND", status=418)
     with pytest.raises(GError) as caught:
         hctx.stat(dav.url("/data/x"))
-    assert caught.value.message == "HTTP 418 : I'm a Teapot "
+    assert (caught.value.code, caught.value.message) == (
+        errno.EIO,
+        "Result HTTP 418 : Unexpected server error: 418  after 1 attempts",
+    )
+    for status, code in ((400, errno.EHOSTDOWN), (409, errno.EEXIST), (507, errno.EIO)):
+        dav.fault("PROPFIND", status=status)
+        with pytest.raises(GError) as caught:
+            hctx.stat(dav.url("/data/x"))
+        assert caught.value.code == code
+    for status in (405, 423):  # refusals: davix does not call these a "Result"
+        dav.fault("PROPFIND", status=status)
+        with pytest.raises(GError) as caught:
+            hctx.stat(dav.url("/data/x"))
+        assert (caught.value.code, caught.value.message[:4]) == (errno.EPERM, "HTTP")
 
 
 def test_connection_refused(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -77,8 +90,8 @@ def test_stat_over_plain_http_falls_back_to_head(
     write(dav, "/data/f", b"12345")
     dav.webdav = False
     info = hctx.stat(dav.url("/data/f", scheme="http"))
-    assert (info.st_size, info.is_file()) == (5, True)
-    assert info.st_mtime > 0
+    # What davix makes of a HEAD: a 0755 file of that size, and no times.
+    assert (info.st_size, info.st_mode, info.st_mtime) == (5, _stat.S_IFREG | 0o755, 0)
     assert dav.methods() == ["PROPFIND", "HEAD"]
     with pytest.raises(GError) as caught:
         hctx.stat(dav.url("/data/missing", scheme="http"))
@@ -104,7 +117,10 @@ def test_empty_multistatus_is_a_protocol_error(
     )
     with pytest.raises(GError) as caught:
         hctx.stat(dav.url("/data"))
-    assert caught.value.code == errno.EPROTO
+    assert (caught.value.code, caught.value.message) == (
+        errno.EIO,
+        "Result Parsing Error: properties number < 1 after 1 attempts",
+    )
 
 
 def test_mkdir(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -119,7 +135,7 @@ def test_mkdir(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     with pytest.raises(GError) as caught:
         hctx.mkdir(dav.url("/data/a/b"), 0o755)
     assert caught.value.code == errno.ENOENT
-    assert caught.value.message.startswith("HTTP 409 : Conflict  with url")
+    assert caught.value.message.startswith("HTTP 409 : Conflict, File not Found  with url")
     dav.fault("MKCOL", status=403)
     with pytest.raises(GError) as caught:
         hctx.mkdir(dav.url("/data/c"), 0o755)
@@ -214,7 +230,7 @@ def test_unlink(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
         hctx.unlink(dav.url("/data"))
     assert caught.value.code == errno.EISDIR
     assert caught.value.message == (
-        f"DavPosix::unlink   {dav.url('/data')} is a directory, impossible to unlink"
+        f"DavPosix::unlink   {dav.url('/data')} is a directory, impossible to unlink\\n"
     )
     dav.fault("PROPFIND", status=403)
     with pytest.raises(GError) as caught:
@@ -224,7 +240,10 @@ def test_unlink(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     dav.fault("DELETE", status=423)
     with pytest.raises(GError) as caught:
         hctx.unlink(dav.url("/data/g"))
-    assert caught.value.code == errno.EBUSY
+    assert (caught.value.code, caught.value.message) == (
+        errno.EPERM,
+        f"DavPosix::unlink  HTTP 423 : Permission refused  with url {dav.url('/data/g')}",
+    )
 
 
 def test_bulk_unlink(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -301,17 +320,18 @@ def test_hostile_xml_is_refused(hctx: xgfalclient.Gfal2Context, dav: WebDAVServe
     )
     with pytest.raises(GError) as caught:
         hctx.listdir(dav.url("/data"))
-    assert caught.value.code == errno.EPROTO
+    assert caught.value.code == errno.EIO
     dav.fault("PROPFIND", status=207, body=b'<?xml version="1.0"?><!ENTITY a "aaaa"><x/>')
     with pytest.raises(GError) as caught:
         hctx.listdir(dav.url("/data"))  # an entity with no DOCTYPE around it is refused too
-    assert caught.value.code == errno.EPROTO
+    assert caught.value.code == errno.EIO
     dav.fault("PROPFIND", status=207, body=b'<D:multistatus xmlns:D="DAV:"/>')
     assert hctx.listdir(dav.url("/data")) == []  # nothing, not even the collection itself
     dav.fault("PROPFIND", status=207, body=b"<not xml")
     with pytest.raises(GError) as caught:
         hctx.listdir(dav.url("/data"))
-    assert "Malformed" in caught.value.message
+    assert caught.value.message.startswith("XML Parsing Error: ")
+    assert caught.value.code == errno.EIO
 
 
 def test_propstat_statuses(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -372,7 +392,7 @@ def test_access_and_lstat(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> 
     assert caught.value.code == errno.ENOENT
 
 
-def test_urls_are_quoted_and_tokens_kept_out_of_them(
+def test_urls_are_quoted_and_queries_kept(
     hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_path: Path
 ) -> None:
     write(dav, "/data/with space", b"x")
@@ -380,8 +400,8 @@ def test_urls_are_quoted_and_tokens_kept_out_of_them(
     assert dav.requests[-1].path == "/data/with%20space"
     assert hctx.stat(dav.url("/data/with%20space?x=1&authz=secret")).st_size == 1
     request = dav.requests[-1]
-    assert request.path == "/data/with%20space?x=1"
-    assert request.header("Authorization") == "Bearer secret"
+    assert request.path == "/data/with%20space?x=1&authz=secret"
+    assert request.header("Authorization") is None
 
 
 def test_invalid_url(hctx: xgfalclient.Gfal2Context) -> None:

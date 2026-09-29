@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 import xgfalclient
-from test_srm import GROUP, _fast_polls, fails, root, sctx, srm  # noqa: F401
+from test_srm import GROUP, _fast_polls, _no_bdii, fails, root, sctx, srm  # noqa: F401
 from xgfalclient.crypto.gsi import GSIError
 from xgfalclient.errors import ECOMM
 from xgfalclient.plugins.srm import soap

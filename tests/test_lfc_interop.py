@@ -63,9 +63,6 @@ FQDN = f"{SERVER}.{NETWORK}"
 KNOWN = {
     "checksum md5": "gfal2 answers with the stored Adler-32 whatever algorithm is asked; ENOTSUP",
     "readpp": "gfal2's readdir leaves d_type 0; the type is taken from the entry's mode",
-    "copy existing": "the core refuses an existing destination (EEXIST) unless overwrite; "
-    "gfal2's register-copy adds a replica (needs a core hook, see the report)",
-    "copy replicas": "follows from 'copy existing': the second replica was never registered",
     "open none": "same EBADF; the message names the missing replicas",
 }
 
@@ -181,7 +178,10 @@ def readpp(url):
     return sorted(out)
 
 def read_all(url):
-    return len(ctx.open(url, "r").read(100))
+    # Bytes read: python2's str is bytes, python3's is decoded (surrogateescape),
+    # and the mock's content is not text.
+    data = ctx.open(url, "r").read(100)
+    return len(data if isinstance(data, bytes) else data.encode("utf-8", "surrogateescape"))
 
 def copy(src, dst):
     return ctx.filecopy(ctx.transfer_parameters(), src, dst)

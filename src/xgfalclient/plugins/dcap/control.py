@@ -56,6 +56,9 @@ def socket_error(exc: BaseException, what: str) -> GError:
     """A ``GError`` for a failed socket call, keeping its ``errno``."""
     if isinstance(exc, TIMEOUTS):
         return GError(f"{what}: timed out", errno.ETIMEDOUT)
+    if isinstance(exc, socket.gaierror):
+        # Its errno is a getaddrinfo EAI_* code (-2, or 8 on macOS), not an errno.
+        return GError(f"{what}: {exc}", errno.EHOSTUNREACH)
     code = getattr(exc, "errno", None) or errno.EIO
     return GError(f"{what}: {exc}", code)
 

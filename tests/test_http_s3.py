@@ -21,6 +21,7 @@ from xgfalclient.plugin import O_CREAT, O_TRUNC, O_WRONLY
 from xgfalclient.plugins.http import _client, _gcloud, _s3
 from xgfalclient.testing.pki import test_key
 from xgfalclient.testing.webdav import S3, WebDAVServer
+from xgfalclient.url import parse
 
 WRITE = O_WRONLY | O_CREAT | O_TRUNC
 EMAIL = "svc@project.iam.gserviceaccount.com"
@@ -88,16 +89,26 @@ def test_s3_namespace(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
         hctx.listdir(s3url(s3, "/nobucket/"))
     assert caught.value.code == errno.ENOENT
     hctx.mkdir(s3url(s3, "/bucket/newdir"), 0o755)
+    put = s3.requests[-1]
+    assert (put.method, put.path, put.header("Content-Length")) == ("PUT", "/bucket/newdir/", "0")
+    assert hctx.stat(s3url(s3, "/bucket/newdir")).st_mode == 0o40755  # davix's mode
+    assert hctx.stat(s3url(s3, "/bucket/newdir/")).st_mode == 0o40755  # the marker itself
+    assert hctx.listdir(s3url(s3, "/bucket/newdir")) == []
     hctx.mkdir_rec(s3url(s3, "/bucket/x/y"), 0o755)
+    assert s3.requests[-1].path == "/bucket/x/y/"
+    assert hctx.stat(s3url(s3, "/bucket/top")).st_mode == 0o100755
+    s3.fault("HEAD", status=200, headers={"Content-Length": "3"}, body=b"abc")
+    assert hctx.stat(s3url(s3, "/bucket/x/")).st_mode == 0o100755  # "key/" with content
+    s3.fault("PUT", status=403)
+    with pytest.raises(GError) as caught:
+        hctx.mkdir(s3url(s3, "/bucket/refused"), 0o755)
+    assert caught.value.message == "HTTP 403 : Permission refused bucket creation failure"
     hctx.rmdir(s3url(s3, "/bucket/dir/sub"))
     with pytest.raises(GError) as caught:
         hctx.rmdir(s3url(s3, "/bucket/top"))
     assert caught.value.code == errno.ENOTDIR
     hctx.unlink(s3url(s3, "/bucket/top"))
     assert not s3.local("/bucket/top").exists()
-    with pytest.raises(GError) as caught:
-        hctx.rename(s3url(s3, "/bucket/dir/a"), s3url(s3, "/bucket/dir/b"))
-    assert caught.value.code == errno.ENOSYS
     write(s3, "/bucket/zero", b"")
     assert hctx.stat(s3url(s3, "/bucket/zero")).st_size == 0
     (s3.root / "void").mkdir()
@@ -107,6 +118,63 @@ def test_s3_namespace(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
     empty = b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"
     s3.fault("GET", path="/bucket?", status=200, body=empty)
     assert hctx.listdir(s3url(s3, "/bucket/dir")) == []
+
+
+def test_s3_streamed_into_parts(
+    hctx: xgfalclient.Gfal2Context,
+    s3: WebDAVServer,
+    dav2: WebDAVServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_s3, "MULTIPART_THRESHOLD", 1500)
+    monkeypatch.setattr(_s3, "PART_SIZE", 1000)
+    hctx.set_opt_string("HTTP PLUGIN", "DEFAULT_COPY_MODE", "streamed")
+    data = os.urandom(2500)
+    write(dav2, "/data/big", data)
+    hctx.filecopy(dav2.url("/data/big"), s3url(s3, "/bucket/big"))
+    assert s3.local("/bucket/big").read_bytes() == data
+    assert [r for r in s3.requests if "partNumber" in r.path]
+
+
+def test_s3_rename(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
+    """A server-side copy, then a delete: davix's S3 move."""
+    write(s3, "/bucket/dir/a", b"1")
+    hctx.rename(s3url(s3, "/bucket/dir/a"), s3url(s3, "/bucket/dir/b"))
+    assert s3.local("/bucket/dir/b").read_bytes() == b"1"
+    assert not s3.local("/bucket/dir/a").exists()
+    copy, delete = s3.requests[-2:]
+    assert (copy.method, copy.header("x-amz-copy-source")) == ("PUT", "/bucket/dir/a")
+    assert (delete.method, delete.path) == ("DELETE", "/bucket/dir/a")
+    with pytest.raises(GError) as caught:
+        hctx.rename(s3url(s3, "/bucket/dir/nope"), s3url(s3, "/bucket/dir/c"))
+    assert (caught.value.code, caught.value.message) == (
+        errno.EIO,
+        "Received code 404 when trying to copy file - will not perform deletion",
+    )
+    with pytest.raises(GError) as caught:
+        hctx.rename(s3url(s3, "/bucket/dir/b"), "s3://other.example/bucket/c")
+    assert caught.value.code == errno.ENOSYS
+    s3.fault("DELETE", status=403)
+    with pytest.raises(GError) as caught:
+        hctx.rename(s3url(s3, "/bucket/dir/b"), s3url(s3, "/bucket/dir/c"))
+    assert caught.value.code == errno.EPERM
+    hctx.set_opt_boolean("S3", "ALTERNATE", False)  # virtual-host style: the bucket is the host
+    assert _s3_copy_source(hctx, "s3://bkt.127.0.0.1:1/k") == "/bkt/k"
+
+
+def _s3_copy_source(context: xgfalclient.Gfal2Context, url: str) -> str:
+    seen: list[str] = []
+
+    def fake(plugin: object, old: str, new: str, **kwargs: object) -> None:
+        seen.append(str(kwargs["source"]))
+
+    original = _s3._swift.rename
+    _s3._swift.rename = fake  # type: ignore[assignment]
+    try:
+        _s3.rename(plugin(context), url, url)
+    finally:
+        _s3._swift.rename = original  # type: ignore[assignment]
+    return seen[0]
 
 
 def test_s3_listing_pages(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
@@ -203,23 +271,61 @@ def test_s3_bad_keys_and_tokens(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer
     assert caught.value.code == errno.EPERM
 
 
-def test_s3_keys_per_host_make_https_urls_s3(
-    hctx: xgfalclient.Gfal2Context, s3: WebDAVServer
-) -> None:
+def test_s3_keys_per_host(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
     hctx.remove_opt("S3", "ACCESS_KEY")
     group = "S3:127.0.0.1"
     hctx.set_opt_string(group, "ACCESS_KEY", "AKIDTEST")
     hctx.set_opt_string(group, "SECRET_KEY", "SECRETTEST")
     hctx.set_opt_string(group, "REGION", "eu-west-1")
-    hctx.set_opt_boolean(group, "ALTERNATE", True)
     s3.s3.region = "eu-west-1"  # type: ignore[union-attr]
     write(s3, "/bucket/f", b"xyz")
-    assert hctx.stat(s3.url("/bucket/f", scheme="http")).st_size == 3
+    assert hctx.stat(s3url(s3, "/bucket/f")).st_size == 3
     assert "eu-west-1" in s3.requests[-1].header("Authorization")
     hctx.remove_opt(group, "REGION")
     hctx.set_opt_string("S3", "REGION", "eu-west-1")  # the [S3] region, for want of the host's
-    assert hctx.stat(s3.url("/bucket/f", scheme="http")).st_size == 3
+    assert hctx.stat(s3url(s3, "/bucket/f")).st_size == 3
     assert "eu-west-1" in s3.requests[-1].header("Authorization")
+    # Keys make no https:// URL an S3 one: gfal2 sends it unsigned, as WebDAV.
+    with pytest.raises(GError):
+        hctx.stat(s3.url("/bucket/f", scheme="http"))
+    assert s3.requests[-1].header("Authorization") is None
+
+
+def test_s3_key_lookup_units(hctx: xgfalclient.Gfal2Context) -> None:
+    options = hctx.options
+    host = parse("s3://bucket.s3.example:9000/k")
+    assert _s3.s3_keys(options, host) is None
+    options.set_string("S3:BUCKET.S3.EXAMPLE", "ACCESS_TOKEN", "LEGACY")  # half a legacy pair
+    options.set_string("S3:BUCKET.S3.EXAMPLE", "TOKEN", "SESSION")
+    assert _s3.s3_keys(options, host) is None
+    options.set_string("S3:S3.EXAMPLE", "SECRET_KEY", "S")  # completes it on the next group
+    options.set_string("S3:S3.EXAMPLE", "TOKEN", "IGNORED")
+    keys = _s3.s3_keys(options, host)
+    assert keys is not None
+    assert (keys.access_key, keys.secret_key, keys.token) == ("LEGACY", "S", "SESSION")
+    assert keys.region == "us-east-1"
+    options.set_string("S3", "ACCESS_TOKEN", "HALF")  # half a legacy pair, last of all
+    assert _s3.s3_keys(options, parse("s3://elsewhere/k")) is None
+
+
+def test_s3_groups_and_legacy_names(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
+    """``[S3:<host less its first label>]`` - a virtual-host bucket's endpoint - and old names."""
+    hctx.remove_opt("S3", "ACCESS_KEY")
+    hctx.remove_opt("S3", "SECRET_KEY")
+    hctx.remove_opt("S3", "ALTERNATE")
+    write(s3, "/bucket/f", b"xyz")
+    hctx.set_opt_string("S3:0.0.1", "ACCESS_TOKEN", "AKIDTEST")  # 127.0.0.1 less "127."
+    hctx.set_opt_string("S3:0.0.1", "ACCESS_TOKEN_SECRET", "SECRETTEST")
+    hctx.set_opt_boolean("S3:0.0.1", "ALTERNATE", True)
+    hctx.set_opt_string("S3:127.0.0.1", "ALTERNATE", "neither")  # not a boolean: skipped
+    assert hctx.stat(s3url(s3, "/bucket/f")).st_size == 3
+    assert "Credential=AKIDTEST/" in s3.requests[-1].header("Authorization")
+    # The session token may come from a broader group than the keys.
+    s3.s3.token = "SESSION"  # type: ignore[union-attr]
+    hctx.set_opt_string("S3", "TOKEN", "SESSION")
+    assert hctx.stat(s3url(s3, "/bucket/f")).st_size == 3
+    keys = _s3.s3_keys(hctx.options, parse("s3://h/b"))
+    assert keys is None  # a host with no dot has no such group, and [S3] has no keys
 
 
 def test_s3_multipart(
@@ -304,8 +410,8 @@ def test_s3_multipart_failures(
     with pytest.raises(GError) as caught:
         writer.close()
     assert (caught.value.code, caught.value.message) == (
-        errno.EAGAIN,
-        "HTTP 503 : Service Unavailable ",
+        errno.EIO,
+        "HTTP 503 : Unexpected server error: 503 ",
     )
     uploads.clear()
     writer = plugin(hctx).open(url, WRITE, 0o644, 30)
@@ -349,6 +455,7 @@ def test_s3_tpc_with_presigned_urls(
     copy_request = next(r for r in dav2.requests if r.method == "COPY")
     assert "X-Amz-Signature=" in copy_request.header("Source")
     assert copy_request.header("Credential") == "none"
+    assert copy_request.header("Copy-Flags") == "NoHead"  # davix's hint for lcgdm-dav
     hctx.set_opt_string("HTTP PLUGIN", "DEFAULT_COPY_MODE", "3rd push")
     write(dav2, "/data/back", b"to s3")
     hctx.filecopy(dav2.url("/data/back"), s3url(s3, "/bucket/back"))
@@ -359,7 +466,7 @@ def test_presigned_url_is_not_signed_again(
     hctx: xgfalclient.Gfal2Context, s3: WebDAVServer
 ) -> None:
     write(s3, "/bucket/f", b"abc")
-    signer = hctx.plugin("davs://h/", "stat").signer_for(s3url(s3, "/bucket/f"))
+    signer = hctx.plugin("davs://h/", "stat").presigner_for(s3url(s3, "/bucket/f"))
     presigned = signer.presign("GET", s3url(s3, "/bucket/f"))
     response = hctx.plugin("davs://h/", "stat")._request("GET", presigned)
     assert (response.status, response.body()) == (200, b"abc")
@@ -390,6 +497,9 @@ def test_gcs(hctx: xgfalclient.Gfal2Context, gcs: WebDAVServer, tmp_path: Path) 
     assert gcs.local("/bucket/new").read_bytes() == b"to gcs"
     hctx.unlink(gcs.url("/bucket/new", scheme="gcloud"))
     hctx.mkdir(gcs.url("/bucket/newdir", scheme="gcloud"), 0o755)
+    hctx.rename(url, gcs.url("/bucket/d/moved", scheme="gcloud"))  # path-style, always
+    assert gcs.local("/bucket/d/moved").read_bytes() == b"aaa"
+    url = gcs.url("/bucket/d/moved", scheme="gcloud")
     gcs.fault("HEAD", status=200, headers={"x-goog-hash": "crc32c=!!!", "ETag": '"x-1"'})
     with pytest.raises(GError):
         hctx.checksum(url, "crc32c")

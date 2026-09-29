@@ -9,7 +9,12 @@ import pytest
 from xgfalclient.errors import ECOMM, GError
 from xgfalclient.plugins.srm import soap
 from xgfalclient.plugins.srm.client import FileStatus, Status, _same, match
-from xgfalclient.plugins.srm.transport import ifce_error, normalise_path, parse_surl
+from xgfalclient.plugins.srm.transport import (
+    ifce_error,
+    normalise_path,
+    parse_endpoint,
+    parse_surl,
+)
 
 # -- writing -------------------------------------------------------------------------
 
@@ -171,35 +176,62 @@ def test_format_time() -> None:
 
 def test_short_surl() -> None:
     surl = parse_surl("srm://se.example.org:8446/pnfs/data/f")
-    assert (surl.host, surl.port, surl.service, surl.path) == (
+    assert (surl.host, surl.port, surl.service, surl.path, surl.full) == (
         "se.example.org",
         8446,
         "/srm/managerv2",
         "/pnfs/data/f",
+        False,
     )
     assert surl.endpoint == "httpg://se.example.org:8446/srm/managerv2"
+    assert surl.key == ("se.example.org", 8446, "/srm/managerv2")
     assert surl.wire == "srm://se.example.org/pnfs/data/f"
     assert surl.parent().url == "srm://se.example.org:8446/pnfs/data"
     assert surl.parent().wire == "srm://se.example.org/pnfs/data"
     assert surl.join("g").url == "srm://se.example.org:8446/pnfs/data/f/g"
     assert parse_surl("srm://se/").parent().path == "/"
-    assert parse_surl("srm://se/f").port == 8443
+    # No port: gfal2's guess has none either, and gSOAP then connects to 80.
+    bare = parse_surl("srm://se/f")
+    assert (bare.port, bare.endpoint, bare.key) == (
+        0,
+        "httpg://se/srm/managerv2",
+        ("se", 80, "/srm/managerv2"),
+    )
+    # Paths are percent-decoded, as gfal2 decodes them for srm-ifce.
+    assert parse_surl("srm://se/a%20b%2Fc").path == "/a b/c"
+    assert parse_surl("srm://se/a%20b").wire == "srm://se/a b"
 
 
 def test_full_surl() -> None:
-    surl = parse_surl("srm://se:8443/srm/managerv2?SFN=/data/f&x=1")
-    assert (surl.service, surl.path, surl.full) == ("/srm/managerv2", "/data/f", True)
-    assert surl.wire == "srm://se/data/f"
+    surl = parse_surl("srm://se:8443/srm/managerv2?SFN=/data/f%20g")
+    assert (surl.service, surl.path, surl.full) == ("/srm/managerv2", "/data/f g", True)
+    assert surl.endpoint == "httpg://se:8443/srm/managerv2"
+    assert surl.wire == "srm://se/data/f g"
     assert surl.parent().url == "srm://se:8443/srm/managerv2?SFN=/data"
-    assert parse_surl("srm://se/other/service?SFN=/f").endpoint == "httpg://se:8443/other/service"
+    assert parse_surl("srm://se:1/x?SFN=/f&y=1").path == "/f&y=1"  # all of it, as gfal2
+    assert not parse_surl("srm://se:1/x?a=1&SFN=/f").full  # gfal2 wants "?SFN="
+    # Without a port (or a path after it), gfal2 does not read the service from the SURL.
+    other = parse_surl("srm://se/other/service?SFN=/f")
+    assert (other.full, other.endpoint, other.path) == (False, "httpg://se/srm/managerv2", "/f")
     bare = parse_surl("srm://se:8446?SFN=/f")
-    assert (bare.host, bare.port, bare.path) == ("se", 8446, "/f")
+    assert (bare.host, bare.port, bare.path, bare.full) == ("se", 8446, "/f", False)
     assert bare.endpoint == "httpg://se:8446/srm/managerv2"
+
+
+def test_endpoints() -> None:
+    surl = parse_surl("srm://se/f").with_endpoint("httpg://srm.se:8446/srm/v2/server")
+    assert (surl.endpoint, surl.key) == (
+        "httpg://srm.se:8446/srm/v2/server",
+        ("srm.se", 8446, "/srm/v2/server"),
+    )
+    assert parse_endpoint("https://se/x") == ("se", 443, "/x")
+    assert parse_endpoint("httpg://se") == ("se", 80, "/")
 
 
 def test_ipv6_surl() -> None:
     surl = parse_surl("srm://[::1]:9000/f")
-    assert surl.wire == "srm://[::1]/f" and surl.endpoint == "httpg://::1:9000/srm/managerv2"
+    assert surl.wire == "srm://[::1]/f" and surl.endpoint == "httpg://[::1]:9000/srm/managerv2"
+    assert surl.key == ("::1", 9000, "/srm/managerv2")
 
 
 @pytest.mark.parametrize("url", ["srm:///f", "http://h/f", "srm://h", "srm://h?SFN=f"])

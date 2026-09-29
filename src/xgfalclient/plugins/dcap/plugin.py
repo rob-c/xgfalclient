@@ -19,6 +19,20 @@ not have. :class:`KdcapPlugin` asks :mod:`xgfalclient.crypto.krb5` for one
 and, through :meth:`~xgfalclient.plugin.Plugin.available`, reports why not
 when there is none; any other implementation can be installed with
 :func:`.tunnel.register_tunnel`. gfal2 itself does not handle ``kdcap://``.
+
+Knowingly different from gfal2 and libdcap: a door that cannot be reached
+fails with the real ``errno`` - ``EHOSTUNREACH`` for a name that does not
+resolve, ``ECONNREFUSED``, ``ETIMEDOUT`` - where libdcap says ``ENOENT``
+("Can not create socket", "Unable to connect to server") or worse, and a
+door that refuses ``hello`` is ``EIO`` for every call. ``dcap://`` is
+matched without regard to case, as gfal2 matches it, and then refused
+unless it is lower case, as libdcap refuses it, but always with ``EINVAL``
+(gfal2's errno there is whatever was left over). Of libdcap's environment,
+``DCACHE_REPLY`` (the host announced for call-backs) and ``DCACHE_CBPORT``
+(``first[:last]``, the ports to listen on) are honoured; the rest tune
+libdcap's own buffers, debugging, tunnel libraries or pnfs-path lookups,
+none of which exist here. Writes are always libdcap's "unsafe" ones
+(``DCACHE_USE_UNSAFE``).
 """
 
 from __future__ import annotations

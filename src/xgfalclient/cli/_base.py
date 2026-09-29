@@ -37,6 +37,7 @@ from typing import IO, TYPE_CHECKING, Any, Callable, Optional, Union
 
 from .. import _log
 from ..errors import GError
+from ._utils import ls_colors
 
 if TYPE_CHECKING:
     from ..context import Gfal2Context
@@ -48,6 +49,7 @@ __all__ = [
     "Command",
     "Spec",
     "arg",
+    "exit_status",
     "main",
     "out",
     "surl",
@@ -72,17 +74,33 @@ def arg(*flags: str, **options: Any) -> Argument:
 
 
 class Spec:
-    """A command: what ``--help`` says, what it accepts, what it does."""
+    """A command: what ``--help`` says, what it accepts, what it does.
+
+    It has the shape of one of gfal2-util's ``execute_<name>`` methods - a
+    ``__name__``, a ``__doc__``, the ``arguments`` its ``@arg`` decorators
+    collect, and a call taking the command - so :meth:`Command.parse` and
+    :meth:`Command.execute` take either.
+    """
 
     def __init__(
-        self, doc: str, arguments: Sequence[Argument], run: Runner, return_code: int = -1
+        self,
+        name: str,
+        doc: str,
+        arguments: Sequence[Argument],
+        run: Runner,
+        return_code: int = -1,
     ) -> None:
-        self.doc = doc
+        self.name = name
+        self.__name__ = "execute_" + name
+        self.__doc__ = self.doc = doc
         self.arguments = list(arguments)
         self.run = run
         #: Where the exit status starts: ``gfal-rm`` starts at 0, so that an
         #: unexpected exception still exits 0 there, as it does in gfal2-util.
         self.return_code = return_code
+
+    def __call__(self, command: Command) -> int | None:
+        return self.run(command)
 
 
 def out(text: str) -> None:
@@ -148,9 +166,10 @@ class _VersionAction(argparse.Action):
         sys.exit(0)
 
 
-def build_parser(prog: str, spec: Spec) -> argparse.ArgumentParser:
-    command = prog.rsplit("-", 1)[-1]
-    description = f"Gfal util {command.upper()} command. {spec.doc}"
+def build_parser(
+    prog: str, command: str, doc: str, arguments: Sequence[Argument]
+) -> argparse.ArgumentParser:
+    description = f"Gfal util {command.upper()} command. {doc}"
     if not description.endswith("."):
         description += "."
     parser = argparse.ArgumentParser(
@@ -210,7 +229,7 @@ def build_parser(prog: str, spec: Spec) -> argparse.ArgumentParser:
         default=None,
         help="write Gfal2 library logs to the given file location",
     )
-    for flags, options in spec.arguments:
+    for flags, options in arguments:
         parser.add_argument(*flags, **options)
     return parser
 
@@ -361,21 +380,34 @@ def stdout_isatty() -> bool:
 
 
 class Command:
-    """One invocation: the parsed arguments, the context, and the outcome."""
+    """One invocation: gfal2-util's ``CommandBase``, method for method.
 
-    def __init__(self, prog: str, spec: Spec) -> None:
-        self.prog = prog
-        self.spec = spec
-        self.parser = build_parser(prog, spec)
-        self.params = argparse.Namespace()
+    ``parse(func, argv)`` builds the parser from ``func`` - a :class:`Spec`,
+    or an ``execute_<name>`` method as ``gfal2_util`` subclasses write them -
+    and ``execute(func)`` runs it, returning what gfal2-util's does: the
+    command's own return value (``None`` included), ``ETIMEDOUT`` or
+    ``EINTR``. :func:`main` turns that into an exit status.
+    """
+
+    def __init__(self) -> None:
         self.context: Gfal2Context
         self.progress_bar: Progress | None = None
-        self.return_code: int | None = spec.return_code
+        self.running = False
+        self.return_code: int | None = -1
+        self.prog = self.progr = ""
+        self.parser: argparse.ArgumentParser
+        self.params = argparse.Namespace()
 
-    def parse(self, argv: Sequence[str]) -> None:
-        self.params = self.parser.parse_args(list(argv))
+    def parse(self, func: Runner, a: Sequence[str]) -> None:
+        """Parse ``a[1:]`` for ``func``; ``a[0]`` is the program name."""
+        doc = (func.__doc__ or "").strip().split("\n")[0]
+        self.prog = self.progr = os.path.basename(a[0])
+        self.parser = build_parser(
+            self.prog, getattr(func, "__name__", "")[8:], doc, getattr(func, "arguments", [])
+        )
+        self.params = self.parser.parse_args(list(a[1:]))
 
-    def execute(self) -> int:
+    def execute(self, func: Runner) -> int | None:
         params = self.params
         if params.cert:
             if not params.key:
@@ -388,20 +420,22 @@ class Command:
             from .. import creat_context
 
             self.context = creat_context()
-            try:
-                apply_options(self.context, params)
-            except ValueError:
-                # gfal2-util lets this escape its main(): a traceback and status 1.
-                traceback.print_exc()
-                return 1
+            # A malformed -D escapes, as it escapes gfal2-util's: main() makes
+            # it a traceback and status 1.
+            apply_options(self.context, params)
             self.context.set_user_agent("gfal2-util", VERSION)
-            return self._run_threaded()
+            return self._run_threaded(func)
         finally:
             log.close()
 
-    def _run_threaded(self) -> int:
-        """Run the command in a daemon thread, which ``Ctrl-C`` and ``-t`` can abandon."""
-        worker = threading.Thread(target=self._executor, name="gfal-command", daemon=True)
+    def _run_threaded(self, func: Runner) -> int | None:
+        """Run the command in a daemon thread, which ``Ctrl-C`` and ``-t`` can abandon.
+
+        The thread is named as gfal2-util's unnamed one is on Python 3.9, for
+        the ``Exception in thread Thread-1:`` header of a traceback.
+        """
+        worker = threading.Thread(target=self.executor, args=(func,), name="Thread-1")
+        worker.daemon = True
         try:
             worker.start()
             timeout = self.params.timeout
@@ -412,8 +446,7 @@ class Command:
                 sys.stderr.write(f"Command timed out after {timeout} seconds!\n")
                 return errno.ETIMEDOUT
             self.context.free()
-            code = self.return_code
-            return 0 if code is None else code & 0xFF
+            return self.return_code
         except KeyboardInterrupt:
             return self._interrupted()
 
@@ -430,9 +463,10 @@ class Command:
             signal.signal(signal.SIGINT, previous)
         return errno.EINTR
 
-    def _executor(self) -> None:
+    def executor(self, func: Runner) -> None:
+        """Run ``func``, reporting how it failed: the body of the command thread."""
         try:
-            self.return_code = self.spec.run(self)
+            self.return_code = func(self)
         except GError as exc:
             sys.stdout.flush()
             sys.stderr.write(
@@ -442,10 +476,29 @@ class Command:
         except OSError as exc:
             if exc.errno != errno.EPIPE:
                 _thread_traceback()
+            else:
+                _silence_stdout()
         except SystemExit:
             pass  # parser.error() inside the command: argparse has printed why
         except Exception:
             _thread_traceback()
+
+
+def _silence_stdout() -> None:
+    """Point stdout at ``/dev/null`` once the reader of a pipe has gone.
+
+    gfal2-util runs unbuffered, so nothing is left to write at exit; here
+    the interpreter's last flush of ``sys.stdout`` would fail again and print
+    ``Exception ignored ... BrokenPipeError`` (and exit 120). This is what
+    the ``signal`` module's documentation recommends for ``SIGPIPE``.
+    """
+    try:
+        fd = sys.stdout.fileno()
+    except (AttributeError, ValueError):  # io.UnsupportedOperation is a ValueError
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, fd)
+    os.close(devnull)
 
 
 def _wait(worker: threading.Thread, timeout: float | None) -> None:
@@ -459,13 +512,20 @@ def _thread_traceback() -> None:
     sys.stderr.write(traceback.format_exc())
 
 
+def exit_status(code: int | None) -> int:
+    """What the process exits with, for what :meth:`Command.execute` returned."""
+    return 0 if code is None else code & 0xFF
+
+
 def main(command: str, spec: Spec, argv: Sequence[str] | None = None) -> int:
     """Run ``gfal-<command>`` with ``argv`` (default ``sys.argv[1:]``); the exit status."""
+    ls_colors()  # gfal2-util reads LS_COLORS (and warns) whatever the command
     args = list(sys.argv[1:] if argv is None else argv)
-    runner = Command(f"gfal-{command}", spec)
+    runner = Command()
+    runner.return_code = spec.return_code
     try:
-        runner.parse(args)
-        return runner.execute()
+        runner.parse(spec, [f"gfal-{command}", *args])
+        return exit_status(runner.execute(spec))
     except SystemExit as exc:  # --help, --version, a usage error
         return int(exc.code or 0)
     except Exception:  # what escapes gfal2-util's main(): a traceback and status 1

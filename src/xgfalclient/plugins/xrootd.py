@@ -26,15 +26,27 @@ checked against it:
   massages ``errno`` the way gfal2 does. Extended attributes are the four
   gfal2 invents (``xroot.cksum``, ``xroot.space``, ``xroot.xattr``,
   ``spacetoken``) plus ``user.status``; ``setxattr`` is ``ENOSYS``.
-* **Copies.** ``root`` to ``root`` is a third-party copy (``TRANSFER:TYPE`` is
-  ``3rd pull``); ``root`` to and from ``file://`` streams through this process
-  (``streamed``). A download runs on xrdclient's bulk data plane, pipelined
-  over ``nbstreams`` connections (two by default) and landed straight in the
-  file, which is where this is an order of magnitude faster than gfal2; an
-  upload is one handle, because xrootd admits one writer per file, with
-  several writes in flight on it and nothing copied on the way. Events
-  are in gfal2's ``xroot`` domain, and a failed copy ends with gfal2's
-  ``TRANSFER:EXIT`` (``Job finished, [ERROR] ...``).
+* **Copies.** gfal2 hands a copy to XrdCl whole, and so does this plugin
+  to itself: the core checks no destination and computes no checksum.
+  ``root`` to ``root`` is a third-party copy (``TRANSFER:TYPE`` ``3rd
+  pull``); any other pair of XRootD schemes is announced as ``streamed``, as
+  gfal2 announces a job XrdCl may run either way; ``root`` to and from
+  ``file://`` streams through this process. The events are XrdCl's: the
+  prepared URLs on ``TRANSFER:ENTER``, ``Job finished, [SUCCESS]`` or the
+  error on ``TRANSFER:EXIT``, ``EVICT`` after it (``-1`` for a local
+  source), and gfal2's own ``CLEANUP``. An existing destination is refused
+  by whoever holds it (``EEXIST``, nothing cleaned), a pull and an upload
+  make the destination's path and a download the local one, whatever
+  ``create_parent`` says. Checksums are XrdCl's ``checkSumMode``: no
+  ``CHECKSUM`` events, and a mismatch is ``EILSEQ`` (``[ERROR] CheckSum
+  error``). A pull from a source that cannot be opened, with
+  ``proxy_delegation`` on, is XrdCl's "Destination does not support
+  delegation" unless the destination advertises ``tpcdlg``. A download runs
+  on xrdclient's bulk data plane, pipelined over ``nbstreams`` connections
+  (two by default) and landed straight in the file, which is where this is
+  an order of magnitude faster than gfal2; an upload is one handle, because
+  xrootd admits one writer per file, with several writes in flight on it
+  and nothing copied on the way.
 
 Where gfal2 is wrong, this is not, and says so where it differs:
 ``gfal2_xrootd_set_error`` reports whatever the global ``errno`` happens to
@@ -42,7 +54,20 @@ hold rather than the code it was given, which is how ``chmod`` of a missing
 file comes back as ``EILSEQ``; the code given is used here. A timeout is
 ``ETIMEDOUT`` (``XrdPosix`` says ``ETIME``, gfal2's own map ``ESTALE``). A
 listing entry's mode keeps ``S_IFREG`` so that its ``d_type`` is ``DT_REG``,
-which gfal2 reports without the mode to match.
+which gfal2 reports without the mode to match. A local file's failure in a
+copy carries its real ``errno``: gfal2 passes XrdCl's ``kXR_*`` number on
+(3018 for an existing file), fails to see ``EEXIST`` in it, and deletes the
+local file it has just refused to overwrite; here the file is kept and
+nothing is cleaned. The ``CLEANUP`` after a failed download is ``0`` for a
+file that was never made, where gfal2 reports 3011.
+
+Not done, deliberately: ``[XROOTD PLUGIN] NORMALIZE_PATH=false`` (gfal2
+then sends ``root://h/p`` as the relative path ``p``, which a stock server
+refuses); ``PARALLEL_COPIES`` (a bulk copy runs one file at a time through
+the core); falling back from a pull to a stream for non-``root`` pairs
+(XrdCl's ``thirdParty=first``), which gfal2 does not do against a stock
+server either; delegating a proxy, for the pull or at login (``XrdSecGSIDELEGPROXY``), which
+xrdclient's GSI cannot (it refuses the server's ``kXGS_pxyreq``).
 """
 
 from __future__ import annotations
@@ -60,12 +85,15 @@ import threading
 import time
 import urllib.parse
 import uuid
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
 from .. import events as ev
 from .._compat import TIMEOUTS
+from ..checksum import checksums_match
+from ..enums import checksum_mode
 from ..errors import ECOMM, GError, not_supported_url
 from ..plugin import (
     O_ACCMODE_MASK,
@@ -77,7 +105,7 @@ from ..plugin import (
     StagingResult,
 )
 from ..types import Stat
-from ..url import scheme_of
+from ..url import parent, scheme_of
 
 if TYPE_CHECKING:
     from xrdclient import Config, FileSystem, StatInfo, XRootDURL
@@ -182,6 +210,7 @@ _READABLE, _WRITABLE, _POSC_PENDING, _BACKUP = 0x10, 0x20, 0x40, 0x80
 
 #: ``kXR_open`` options, spelled out so an open is one integer.
 _READ, _UPDATE, _NEW, _DELETE, _MKPATH = 0x0010, 0x0020, 0x0008, 0x0002, 0x0100
+_POSC = 0x1000
 
 #: How often a third-party copy's waiter wakes to check the clock, and how
 #: often it asks the destination how far the pull has got, in seconds.
@@ -204,6 +233,7 @@ UPLOAD_DEPTH = 4
 UPLOAD_BUFFERS = 4
 
 _KXR_DSTAT = 0x02
+_KXR_CANCEL = 0x01
 
 _modules: dict[str, Any] = {}
 
@@ -269,6 +299,8 @@ def describe(exc: BaseException) -> Failure:
     """Classify a failure from xrdclient (or the socket under it) as XrdCl would."""
     from xrdclient import errors as xe
 
+    if isinstance(exc, _CopyError):
+        return exc.failure
     detail = str(exc)
     if isinstance(exc, xe.ServerError):
         code = KXR_ERRNO.get(exc.code, errno.ENOMSG)
@@ -590,6 +622,10 @@ class XRootDPlugin(Plugin):
     option_group = "XROOTD PLUGIN"
     priority = 400
     event_domain = DOMAIN
+    # gfal2 hands a copy to XrdCl whole: see copy().
+    narrates_transfer = True
+    copy_manages_destination = True
+    copy_manages_checksums = True
 
     def __init__(self, context: Any) -> None:
         super().__init__(context)
@@ -598,8 +634,18 @@ class XRootDPlugin(Plugin):
         self._combined: dict[tuple[str, str], str] = {}
         self._targets: dict[tuple[object, ...], tuple[XRootDURL, str]] = {}
         #: Idle filesystems by (endpoint, config), each with when it was put back.
+        #: Never replaced, only emptied: :func:`_close_idle` holds it.
         self._idle: dict[tuple[str, int], list[tuple[float, FileSystem]]] = {}
         self._pid = os.getpid()
+        # A context is a cycle (it holds its plugins, they hold it), so one
+        # that is dropped is freed by the cycle collector - and a filesystem
+        # freed that way takes its socket with it: the collector finalizes the
+        # socket while xrdclient's Router.__del__ hands the session over it
+        # back to xrdclient's process-wide pool, whose next taker (any
+        # context's upload) then sends on a closed descriptor, EBADF. Held
+        # from here, the idle filesystems are never part of that garbage; they
+        # are closed properly, sockets intact, as soon as the plugin goes.
+        weakref.finalize(self, _close_idle, self._idle, self._lock)
 
     @classmethod
     def available(cls) -> str | None:
@@ -615,10 +661,7 @@ class XRootDPlugin(Plugin):
             self._configs.clear()
             self._targets.clear()
             combined, self._combined = self._combined, {}
-            idle, self._idle = self._idle, {}
-        for entries in idle.values():
-            for _, fs in entries:
-                fs.close()
+        _close_idle(self._idle, self._lock)
         for path in combined.values():
             try:
                 os.remove(path)
@@ -776,7 +819,8 @@ class XRootDPlugin(Plugin):
             if self._pid != os.getpid():
                 # A forked child must not touch its parent's sockets: forget
                 # them without closing, as xrdclient's own pool does.
-                self._idle, self._pid = {}, os.getpid()
+                self._idle.clear()
+                self._pid = os.getpid()
             entries = self._idle.get(key)
             while entries:
                 when, fs = entries.pop()
@@ -959,17 +1003,18 @@ class XRootDPlugin(Plugin):
         if offset or length:
             code = errno.ENOTSUP
             raise GError(f"XROOTD does not support partial checksums ({os.strerror(code)})", code)
-        lower = algorithm.lower()
-        wanted = lower if lower in ("adler32", "crc32", "md5") else algorithm
+        wanted = _checksum_name(algorithm)
+        try:
+            answer = self._checksum_answer(url, wanted)
+        except Exception as exc:
+            raise posix_error("Could not get the checksum", exc) from exc
+        return _checksum_value(answer, wanted)
+
+    def _checksum_answer(self, url: str, wanted: str) -> bytes:
+        """The server's answer to ``kXR_Qcksum`` for ``url``, asked for ``wanted``."""
         argument = self._file_url(url, **{"cks.type": wanted}).path_with_cgi
-        result = self._posix(url, "Could not get the checksum", lambda fs, _: fs.query(3, argument))
-        text = result.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
-        kind, space, value = text.partition(" ")
-        if not space:
-            raise GError("Could not get the checksum (Wrong format)", errno.EIO)
-        if kind.lower() != wanted.lower():
-            raise GError(f"Got '{kind}' while expecting '{wanted}'", errno.EIO)
-        return value.strip()
+        with self._fs(url) as (fs, _):
+            return bytes(fs.query(3, argument))
 
     def getxattr(self, url: str, name: str) -> str:
         description = f'Failed to get the xattr "{name}"'
@@ -1079,9 +1124,11 @@ class XRootDPlugin(Plugin):
         return [None for _ in urls]
 
     def abort_bring_online(self, urls: Sequence[str], token: str) -> list[GError | None]:
+        """``kXR_prepare`` with ``kXR_cancel``: the request id, then the files to withdraw."""
+        request = _requests().Prepare([token, *self._paths(urls, cgi=True)], _KXR_CANCEL)
         try:
             with self._fs(urls[0]) as (fs, _):
-                fs.cancel_prepare(token)
+                fs._router.execute(request)
         except Exception as exc:
             return _each(urls, describe(exc))
         return [None for _ in urls]
@@ -1095,38 +1142,161 @@ class XRootDPlugin(Plugin):
         return is_root(destination) and source.startswith("file://")
 
     def copy(self, transfer: Transfer) -> None:
+        """One job of XrdCl's copy process, as gfal2 sets it up and narrates it.
+
+        gfal2 hands the whole copy to XrdCl, so the core does none of it:
+        no existence check (``force`` decides, and the server answers
+        ``EEXIST``), no parent creation (a pull and an upload make the path
+        anyway, a download makes the local one), no ``CHECKSUM`` events (the
+        job verifies, and a mismatch is ``EILSEQ``), and the clean-up after a
+        failure is the plugin's own. ``TRANSFER:TYPE`` is ``3rd pull`` only
+        for ``root`` to ``root``, where gfal2 asks for a third-party copy
+        and nothing else; any other pair of XRootD schemes is a job XrdCl
+        may run either way, which gfal2 announces as ``streamed``.
+        """
         source, destination = transfer.source, transfer.destination
+        params = transfer.params
+        only = scheme_of(source) == "root" and scheme_of(destination) == "root"
+        transfer.event(
+            ev.TRANSFER_ENTER,
+            f"{self._job_url(source, params.src_spacetoken)} => "
+            f"{self._job_url(destination, params.dst_spacetoken)}",
+        )
+        transfer.event(ev.TRANSFER_TYPE, TYPE_PULL if only else TYPE_STREAMED)
         end = ""
         try:
+            verify = _Verification(self, transfer)
+            verify.before()
             if is_root(source) and is_root(destination):
-                self._third_party(transfer)
+                self._third_party(transfer, delegate=only and params.proxy_delegation)
             elif is_root(source):
                 end = "source"
                 self._download(transfer)
             else:
                 end = "destination"
                 self._upload(transfer)
-        except GError as exc:
-            transfer.event(ev.TRANSFER_EXIT, f"Job finished, {exc.message}")
-            raise
+            verify.after()
         except Exception as exc:
-            status = status_error("", exc, strerror=False, end=end)
-            # gfal2's copy process ends every job with an EXIT; the core only
-            # sends one for a copy that worked, so a failed one is said here.
-            transfer.event(ev.TRANSFER_EXIT, f"Job finished, {status.message}")
-            raise GError(
-                f"Error on XrdCl::CopyProcess::Run(): {status.message}", status.code
-            ) from exc
-        if transfer.params.evict and is_root(source):
-            failed = any(result is not None for result in self.release([source], ""))
+            if transfer.callback_error is not None:
+                raise  # a callback's own exception: the core hands it back as it was
+            self._copy_failed(transfer, exc, end)
+        transfer.event(ev.TRANSFER_EXIT, "Job finished, [SUCCESS] ")
+        if params.evict:
+            # gfal2 asks for any source, and a file:// one always fails.
+            failed = not is_root(source) or any(
+                result is not None for result in self.release([source], "")
+            )
             transfer.event(EVICT, str(-1 if failed else 0), side=ev.SOURCE)
+
+    def _copy_failed(self, transfer: Transfer, exc: Exception, end: str) -> NoReturn:
+        """End the job as XrdCl does, remove what it left, and raise gfal2's error."""
+        if isinstance(exc, GError):
+            code, text, error = exc.code, exc.message, exc
+        else:
+            status = status_error(
+                "", exc, strerror=False, end=exc.end if isinstance(exc, _CopyError) else end
+            )
+            code, text = status.code, status.message
+            error = GError(f"Error on XrdCl::CopyProcess::Run(): {text}", code)
+        # gfal2's copy process ends every job with an EXIT; the core only
+        # sends one for a copy that worked, so a failed one is said here.
+        transfer.event(ev.TRANSFER_EXIT, f"Job finished, {text}")
+        if transfer.params.transfer_cleanup and code != errno.EEXIST:
+            self._clean(transfer)
+        if error is exc:
+            raise exc
+        raise error from exc
+
+    def _clean(self, transfer: Transfer) -> None:
+        """``gfal_xrootd_copy_cleanup``: a destination already gone counts as removed.
+
+        A local device or FIFO is a sink the copy wrote into, not a file it
+        made, and is left alone (gfal2 would try to unlink ``/dev/null``).
+        """
+        destination = transfer.destination
+        if not is_root(destination) and _is_sink(local_path(destination)):
+            return
+        try:
+            self.context.unlink(destination)
+            status = 0
+        except GError as exc:
+            status = 0 if exc.code == errno.ENOENT else exc.code
+        transfer.event(ev.CLEANUP, str(status), side=ev.DESTINATION)
+
+    def _job_url(self, url: str, spacetoken: str) -> str:
+        """``url`` as XrdCl's copy job prints it, after gfal2's ``prepare_url``.
+
+        gfal2 gives the path three leading slashes and the ``XRD.*`` options,
+        a space token replaces whatever CGI there was (``svcClass``), and
+        XrdCl adds its intent, prints the port, and sorts the CGI; a local
+        file is on ``localhost``.
+        """
+        parsed = urllib.parse.urlsplit(url)
+        path = urllib.parse.unquote(parsed.path) or "///"
+        if not path.startswith("///"):
+            path = ("/" if path.startswith("//") else "//") + path
+        cgi: dict[str, str] = {}
+        if is_root(url):
+            host = parsed.hostname or ""
+            where = f"[{host}]" if ":" in host else host
+            user = f"{parsed.username}@" if parsed.username else ""
+            authority = f"{user}{where}:{parsed.port or 1094}"
+            cgi.update(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+            cgi.update(self._extra_cgi())
+        else:
+            authority = "localhost"
+        if spacetoken:
+            cgi = {"svcClass": spacetoken}
+        cgi["xrdcl.intent"] = "tpc"
+        query = "&".join(f"{key}={value}" for key, value in sorted(cgi.items()))
+        return f"{scheme_of(url)}://{authority}{path}?{query}"
 
     def _copy_url(self, url: str, spacetoken: str) -> XRootDURL:
         """A copy's URL: gfal2 names the space token as ``svcClass``."""
         return self._file_url(url, **({"svcClass": spacetoken} if spacetoken else {}))
 
-    def _third_party(self, transfer: Transfer) -> None:
-        """Destination pulls from source; this thread watches the clock.
+    def _third_party(self, transfer: Transfer, *, delegate: bool) -> None:
+        """Destination pulls from source, as XrdCl's third-party job has it.
+
+        The destination's path is made as the pull's open makes it, whatever
+        ``create_parent`` says: when the open finds no parent, the parent is
+        made and the pull asked once more. A source that cannot be opened
+        is, when delegation is on, a job XrdCl would hand to a destination
+        that pulls with the delegated proxy ("TPC lite"), which a stock one
+        cannot, and gfal2 says so rather than why the source failed.
+        """
+        params = transfer.params
+        source = self._copy_url(transfer.source, params.src_spacetoken)
+        target = self._copy_url(transfer.destination, params.dst_spacetoken)
+        config = self._config(transfer.destination)
+        try:
+            try:
+                result = self._pull(transfer, source, target, config)
+            except _import().errors.ServerError as exc:
+                if exc.path != target.path or exc.code != 3011:
+                    raise
+                try:
+                    self.mkdir_rec(parent(transfer.destination), 0o755)
+                except GError:
+                    raise exc from None
+                result = self._pull(transfer, source, target, config)
+        except _import().errors.ServerError as exc:
+            if exc.path == target.path:
+                raise _CopyError(describe(exc), "destination") from exc
+            if delegate and exc.path == source.path and not self._delegates(transfer.destination):
+                failure = Failure(
+                    errno.ENOTSUP,
+                    "[ERROR] Operation not supported",
+                    "Destination does not support delegation.",
+                )
+                raise _CopyError(failure, "") from exc
+            raise
+        transfer.progress(int(result.size), force=True)
+
+    def _pull(
+        self, transfer: Transfer, source: XRootDURL, target: XRootDURL, config: Config
+    ) -> Any:
+        """The rendezvous, in a worker; this thread watches the clock.
 
         The rendezvous blocks until the destination has the file, so it runs
         in a worker while this thread keeps ``transfer.check()`` honest -
@@ -1134,10 +1304,6 @@ class XRootDPlugin(Plugin):
         listening, reports progress from the size the destination has so far.
         """
         params = transfer.params
-        source = self._copy_url(transfer.source, params.src_spacetoken)
-        target = self._copy_url(transfer.destination, params.dst_spacetoken)
-        config = self._config(transfer.destination)
-        transfer.event(ev.TRANSFER_TYPE, TYPE_PULL)
         outcome: list[Any] = []
 
         def pull() -> None:
@@ -1148,7 +1314,9 @@ class XRootDPlugin(Plugin):
                         target,
                         config=config,
                         overwrite=bool(params.overwrite),
-                        posc=True,
+                        # XrdCl's pull opens the destination without it, its
+                        # upload with it: the server says "create" or "pcreate".
+                        posc=False,
                         timeout=transfer.remaining() or None,
                     )
                 )
@@ -1165,10 +1333,24 @@ class XRootDPlugin(Plugin):
             if watching and worker.is_alive() and time.monotonic() - asked >= TPC_PROGRESS:
                 asked = time.monotonic()
                 self._tpc_progress(transfer)
-        result = outcome[0]
+        result = outcome.pop()
         if isinstance(result, BaseException):
             raise result
-        transfer.progress(int(result.size), force=True)
+        return result
+
+    def _delegates(self, url: str) -> bool:
+        """``XrdCl::Utils::CheckTPCLite``: whether the server takes a delegated pull.
+
+        ``kXR_Qconfig`` of ``tpc tpcdlg`` answers each name on a line, and a
+        name echoed back is one the server has not set.
+        """
+        try:
+            with self._fs(url) as (fs, _):
+                answer = bytes(fs.query(7, "tpc tpcdlg"))
+        except Exception:
+            return False
+        lines = answer.split(b"\x00", 1)[0].decode("utf-8", "replace").split("\n")
+        return len(lines) > 1 and lines[1] not in ("", "tpcdlg") and not lines[1].startswith("0")
 
     def _tpc_progress(self, transfer: Transfer) -> None:
         """How much the destination holds, as the progress of a pull."""
@@ -1183,20 +1365,29 @@ class XRootDPlugin(Plugin):
 
         ``nbstreams`` connections each fetch their own span, pipelined and
         written at their own offsets; the progress callback is also where a
-        cancelled or timed-out copy is noticed.
+        cancelled or timed-out copy is noticed. The local path is made, as
+        XrdCl makes it, and an existing file is replaced only with
+        ``overwrite``. XrdCl opens the source first, so when the local file
+        cannot be made, the source is opened to see whether that is the
+        failure to report.
         """
         bulk = importlib.import_module("xrdclient.client.bulk")
         params = transfer.params
         source = self._copy_url(transfer.source, params.src_spacetoken)
         config = self._config(transfer.source)
-        transfer.event(ev.TRANSFER_TYPE, TYPE_STREAMED)
 
         def progress(done: int, total: int | None) -> None:
             transfer.progress(done)
             transfer.check()
 
         workers = params.nbstreams if params.nbstreams > 0 else None
-        fd = _local_open(local_path(transfer.destination))
+        try:
+            fd = _local_create(local_path(transfer.destination), overwrite=bool(params.overwrite))
+        except _CopyError:
+            probe = _import().File(source, config)
+            probe.open(_READ, 0)
+            probe.close()
+            raise
         try:
             try:
                 bulk.download(source, fd, config=config, progress=progress, workers=workers)
@@ -1228,18 +1419,20 @@ class XRootDPlugin(Plugin):
         """A local file to ``root://`` on one handle, reads and writes overlapped.
 
         The destination is created exclusively unless ``overwrite`` is set,
-        so a file that appeared since the core checked is still refused.
-        ``nbstreams`` does not apply: xrootd lets one writer at a time have a
-        file open (``kXR_FileLocked``), so there is no second connection to
-        spread an upload over.
+        and its path is made. ``nbstreams`` does not apply: xrootd lets one
+        writer at a time have a file open (``kXR_FileLocked``), so there is
+        no second connection to spread an upload over.
         """
         params = transfer.params
         source = local_path(transfer.source)
         target = self._copy_url(transfer.destination, params.dst_spacetoken)
         config = self._config(transfer.destination)
-        transfer.event(ev.TRANSFER_TYPE, TYPE_STREAMED)
-        size = os.stat(source).st_size
-        create = (_DELETE if params.overwrite else _NEW) | _MKPATH | _UPDATE
+        try:
+            size = os.stat(source).st_size
+        except OSError as exc:
+            raise _CopyError(_local_failure(exc), "source") from exc
+        # Persist on successful close, as XrdCl's upload asks.
+        create = (_DELETE if params.overwrite else _NEW) | _MKPATH | _UPDATE | _POSC
         moved = self._upload_serially(transfer, source, target, config, create)
         if moved != size:
             raise GError(f"Short copy: {moved} bytes transferred, the source has {size}", errno.EIO)
@@ -1250,7 +1443,10 @@ class XRootDPlugin(Plugin):
         from ..transfer import pump
         from .file import LocalFile
 
-        reader = LocalFile(transfer.source, source, os.O_RDONLY, 0)
+        try:
+            reader = LocalFile(transfer.source, source, os.O_RDONLY, 0)
+        except OSError as exc:
+            raise _CopyError(_local_failure(exc), "source") from exc
         try:
             handle = _import().File(target, config)
             handle.open(create, 0o644)
@@ -1272,6 +1468,70 @@ class XRootDPlugin(Plugin):
             return moved
         finally:
             reader.close()
+
+
+class _CopyError(Exception):
+    """A copy's failure worded as XrdCl words it, and the end it happened at."""
+
+    def __init__(self, failure: Failure, end: str) -> None:
+        super().__init__(failure.to_str)
+        self.failure = failure
+        self.end = end
+
+
+class _Verification:
+    """The checksum part of XrdCl's copy job, as gfal2 configures it.
+
+    ``source`` mode asks the source for its checksum, when no value was
+    given, and compares it with nothing; ``target`` compares the
+    destination's with the value given; ``both`` (``end2end``) compares it
+    with the value given or, failing one, the source's. The value loses its
+    leading zeros and its case first, and an algorithm left empty is
+    ``[XROOTD PLUGIN] COPY_CHECKSUM_TYPE``. A mismatch is ``EILSEQ``, and no
+    ``CHECKSUM`` event is sent.
+    """
+
+    def __init__(self, plugin: XRootDPlugin, transfer: Transfer) -> None:
+        self.plugin = plugin
+        self.transfer = transfer
+        self.mode = transfer.checksum_mode
+        self.algorithm = transfer.checksum_algorithm or plugin.checksum_type()
+        self.expected = transfer.user_checksum.lstrip("0").lower()
+
+    def before(self) -> None:
+        if self.mode in (checksum_mode.source, checksum_mode.both) and not self.expected:
+            self.expected = self._ask(self.transfer.source, "source")
+
+    def after(self) -> None:
+        if self.mode not in (checksum_mode.target, checksum_mode.both):
+            return
+        found = self._ask(self.transfer.destination, "destination")
+        if self.expected and not checksums_match(self.expected, found):
+            raise _CopyError(Failure(errno.EILSEQ, "[ERROR] CheckSum error", ""), "")
+
+    def _ask(self, url: str, end: str) -> str:
+        if not is_root(url):
+            try:
+                return str(self.plugin.context.checksum(url, self.algorithm))
+            except GError as exc:
+                raise _CopyError(
+                    Failure(exc.code, "[ERROR] Local error", exc.message), end
+                ) from exc
+        wanted = _checksum_name(self.algorithm)
+        try:
+            answer = self.plugin._checksum_answer(url, wanted)
+        except Exception as exc:
+            failure = describe(exc)
+            text = failure.to_str.rstrip("\n")
+            newline = "\n" if failure.to_str.endswith("\n") else ""
+            failure.to_str = f"{text} Got an error while querying the checksum!{newline}"
+            raise _CopyError(failure, end) from exc
+        try:
+            return _checksum_value(answer, wanted)
+        except GError as exc:
+            raise _CopyError(
+                Failure(exc.code, "[ERROR] Invalid response", exc.message), end
+            ) from exc
 
 
 #: ``kXR_write``'s request header: stream id, opcode, file handle, offset,
@@ -1463,15 +1723,67 @@ class _Upload:
         return buffer
 
 
-def _local_open(path: str) -> int:
+def _close_idle(
+    idle: dict[tuple[str, int], list[tuple[float, FileSystem]]], lock: threading.Lock
+) -> None:
+    """Close every idle filesystem, which hands its connection to xrdclient's pool."""
+    with lock:
+        entries = [fs for kept in idle.values() for _, fs in kept]
+        idle.clear()
+    for fs in entries:
+        fs.close()
+
+
+def _checksum_name(algorithm: str) -> str:
+    """gfal2's ``predefined_checksum_type_to_lower``: three names are lowered, others kept."""
+    lower = algorithm.lower()
+    return lower if lower in ("adler32", "crc32", "md5") else algorithm
+
+
+def _checksum_value(answer: bytes, wanted: str) -> str:
+    """The value in a ``kXR_Qcksum`` answer (``adler32 1a2b3c4d``), checked for its type."""
+    text = answer.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+    kind, space, value = text.partition(" ")
+    if not space:
+        raise GError("Could not get the checksum (Wrong format)", errno.EIO)
+    if kind.lower() != wanted.lower():
+        raise GError(f"Got '{kind}' while expecting '{wanted}'", errno.EIO)
+    return value.strip()
+
+
+def _local_failure(exc: OSError) -> Failure:
+    """A local file's ``OSError`` as XrdCl's ``errLocalError`` prints it."""
+    code = exc.errno or errno.EIO
+    return Failure(code, "[ERROR] Local error", "", f"[ERROR] Local error: {e2t(code)}: ")
+
+
+def _is_sink(path: str) -> bool:
+    """A device, FIFO or socket: written into, never created or removed."""
     try:
-        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        mode = os.stat(path).st_mode
+    except OSError:
+        return False
+    return _stat.S_IFMT(mode) in (_stat.S_IFCHR, _stat.S_IFIFO, _stat.S_IFSOCK)
+
+
+def _local_create(path: str, *, overwrite: bool) -> int:
+    """A download's local file, its directory made; one already there needs ``overwrite``."""
+    try:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except FileExistsError:
+            pass  # a file where the directory should be: the open says ENOTDIR
+        flags = os.O_WRONLY | os.O_CREAT
+        if overwrite:
+            return os.open(path, flags | os.O_TRUNC, 0o644)
+        try:
+            return os.open(path, flags | os.O_EXCL, 0o644)
+        except FileExistsError:
+            if not _is_sink(path):
+                raise
+            return os.open(path, os.O_WRONLY)
     except OSError as exc:
-        code = exc.errno or errno.EIO
-        raise GError(
-            f"Could not open destination: errno reported by local system call {os.strerror(code)}",
-            code,
-        ) from exc
+        raise _CopyError(_local_failure(exc), "destination") from exc
 
 
 def _entries(fs: FileSystem, path: str, *, brief: bool) -> list[tuple[str, Brief]]:

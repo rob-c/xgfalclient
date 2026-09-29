@@ -27,6 +27,7 @@ import select
 import socket
 import ssl
 import time
+from collections.abc import Callable
 
 from ...crypto.gsi import GSIError, SecurityContext
 from ...crypto.x509 import Credential
@@ -70,6 +71,8 @@ class Control:
         self.state: dict[str, str] = {}
         #: Set once the session can no longer be trusted to be in step.
         self.broken = False
+        #: Called with every complete reply, when set (gfal2's PASV plugin).
+        self.observer: Callable[[Reply], None] | None = None
         self._buffer = bytearray()
         self._lines: collections.deque[str] = collections.deque()
         self._partial: list[str] = []
@@ -189,6 +192,8 @@ class Control:
                 reply = Reply(int(code), self._partial)
                 self._partial = []
                 _log.debug("< %s", reply.lines)
+                if self.observer is not None:
+                    self.observer(reply)
                 return reply
 
     def reply(self) -> Reply:

@@ -78,7 +78,7 @@ class _Soap:
         root = parse_xml(payload, "delegation response") if payload.strip() else None
         fault = _find(root, "faultstring") if root is not None else None
         if response.status != 200 or root is None or fault is not None:
-            detail = fault or status_text(response.status, response.reason)
+            detail = fault or status_text(response.status)
             raise GError(f"Delegation to {self.endpoint} failed: {detail}", errno.EACCES)
         return root
 

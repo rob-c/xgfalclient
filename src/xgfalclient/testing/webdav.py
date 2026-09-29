@@ -16,8 +16,11 @@ What it answers:
   markers, with gridsite delegation (``X-Delegate-To``) when the client
   allows it and the server is told to want it;
 * the WLCG tape REST API (:class:`Tape`), macaroon and OAuth token
-  issuance, CDMI QoS, and an S3 dialect (:class:`S3`) that checks SigV4
-  signatures - header-signed and pre-signed - and does multipart uploads;
+  issuance, CDMI QoS (for the paths in :attr:`WebDAVServer.qos`), an S3
+  dialect (:class:`S3`) that checks SigV4 signatures - header-signed and
+  pre-signed - and does multipart uploads, directory markers and
+  server-side copies, and a Swift dialect (:class:`Swift`): ``X-Auth-Token``,
+  paths under ``/v1/<account>``, XML listings, ``X-Copy-From``;
 * authorisation: bearer tokens, Basic, and client certificates over TLS
   (``tls=pki.server_context()``);
 * fault injection (:meth:`WebDAVServer.fault`): a status, a dropped
@@ -56,7 +59,7 @@ from ..crypto.proxy import make_request, parse_request
 from ..crypto.x509 import load_certificates
 from .pki import test_key
 
-__all__ = ["WebDAVServer", "Fault", "Request", "S3", "Tape"]
+__all__ = ["WebDAVServer", "Fault", "Request", "S3", "Swift", "Tape"]
 
 _CHUNK = 4 << 20
 _DAV_NS = "DAV:"
@@ -70,6 +73,8 @@ class Request:
     path: str
     headers: dict[str, str]
     body: bytes = b""
+    #: The client certificate's subject, when one was presented.
+    subject: str = ""
 
     def header(self, name: str) -> str | None:
         for key, value in self.headers.items():
@@ -128,6 +133,16 @@ class S3:
     #: Speak GCS instead: V4 signed URLs checked against this service account.
     gcs_key: Any = None
     gcs_email: str = ""
+
+
+@dataclass
+class Swift:
+    """Swift dialect: containers under the root, reached as ``/v1/<account>/<container>``."""
+
+    #: The ``X-Auth-Token`` required; empty accepts any request.
+    token: str = ""
+    #: The account the paths are under (``AUTH_<project>`` for a project); empty for none.
+    account: str = ""
 
 
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -219,6 +234,7 @@ class WebDAVServer:
         self.oauth_endpoint: str | None = None
         self.tape: Tape | None = None
         self.s3: S3 | None = None
+        self.swift: Swift | None = None
         #: CDMI QoS state: path -> {"capabilitiesURI": ..., "target": ..., "allowed": [...]}
         self.qos: dict[str, dict[str, Any]] = {}
         #: TLS context for outbound TPC connections.
@@ -480,7 +496,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _precheck(self) -> bool:
         """Record, then faults, redirects and authorisation; ``True`` if answered."""
         self._checked = True
-        self._record = Request(self.command, self.path, dict(self.headers.items()))
+        self._record = Request(
+            self.command, self.path, dict(self.headers.items()), subject=self._client_subject()
+        )
         self.app._record(self._record)
         answered = self._intercept()
         if answered and self._has_body():
@@ -517,6 +535,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _refused(self) -> bool:
         app = self.app
         auth = self.headers.get("Authorization", "")
+        if app.swift is not None and app.swift.token:
+            if self.headers.get("X-Auth-Token") != app.swift.token:
+                self._reply(401, b"<html><h1>Unauthorized</h1></html>")
+                return True
+            return False
         if app.s3 is not None:
             if self._s3_verified():
                 return False
@@ -552,19 +575,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         method = self.command
         if path == "/.well-known/wlcg-tape-rest-api" or path.startswith("/api/v1/"):
             self._tape(path)
-        elif path in (
-            "/.well-known/oauth-authorization-server",
-            "/.well-known/openid-configuration",
-        ):
+        elif path.startswith("/.well-known/oauth-authorization-server"):
             self._oauth_discovery()
         elif path == "/token" and method == "POST":
             self._oauth_token()
         elif path == "/gridsite-delegation" and method == "POST":
             self._delegation()
-        elif "cdmi" in self.headers.get("Accept", "") or path.startswith("/cdmi_capabilities/"):
+        elif path in app.qos or path.startswith("/cdmi_capabilities/"):
             self._cdmi(path)
         elif app.s3 is not None:
             self._s3(path)
+        elif app.swift is not None:
+            self._swift(path)
         elif method == "POST" and self.headers.get("Content-Type", "").startswith(
             "application/macaroon-request"
         ):
@@ -658,7 +680,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _dav_get(self, path: str) -> None:
         target = self.app.local(path)
         if not target.is_file():
-            missing = not target.exists() or self.app.s3 is not None  # S3 has no directories
+            # Object stores have no directories to HEAD or GET.
+            missing = not target.exists() or self.app.s3 is not None or self.app.swift is not None
             self._reply(404 if missing else 403, b"not a file")
             return
         size = target.stat().st_size
@@ -694,7 +717,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._reply(405, b"is a directory")
             return
         if not target.parent.is_dir():
-            if self.app.s3 is None:
+            if self.app.s3 is None and self.app.swift is None:
                 self.close_connection = True
                 self._reply(409, b"parent missing")
                 return
@@ -719,7 +742,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._reply(200, b"OK", {"Connection": "Close"})
             return
         headers = {"Content-Type": "text/plain", "Transfer-Encoding": "chunked"}
-        delegate = self.app.delegation and self.headers.get("Credential") is None
+        delegate = self.app.delegation and self.headers.get("Credential", "gridsite") == "gridsite"
         if delegate:
             self.app._delegation_event.clear()
             headers["X-Delegate-To"] = f"{self.app.base}/gridsite-delegation"
@@ -997,10 +1020,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             )
             self._json(200, {"children": children})
             return
-        state = qos.get(path)
-        if state is None:
-            self._reply(404, b"no such object")
-            return
+        state = qos[path]
         if self.command == "PUT":
             request = json.loads(self._read_body())
             state["metadata"]["cdmi_capabilities_target"] = request["capabilitiesURI"]
@@ -1127,14 +1147,106 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             s3.uploads.pop(query["uploadId"], None)
             self._reply(204)
         elif method == "DELETE":
-            target = self.app.local(path)
-            if target.is_file():
-                target.unlink()
-            self._reply(204)
+            self._object_delete(path)
+        elif method == "PUT" and "x-amz-copy-source" in self.headers:
+            self._object_copy(self.headers["x-amz-copy-source"], path, 200)
+        elif method in ("PUT", "HEAD") and path.endswith("/"):
+            self._directory_marker(path)
         elif method in ("GET", "HEAD", "PUT"):
             getattr(self, f"_dav_{method.lower()}")(path)
         else:
             self._reply(405, b"<Error><Code>MethodNotAllowed</Code></Error>")
+
+    # -- Swift --------------------------------------------------------------------------------
+
+    def _swift(self, path: str) -> None:
+        swift = self.app.swift
+        assert swift is not None
+        root = f"/v1/{swift.account}" if swift.account else ""
+        if not path.startswith(root + "/"):
+            self._reply(404, b"<html><h1>Not Found</h1></html>")
+            return
+        path = path[len(root) :]
+        query = dict(
+            urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+        )
+        method = self.command
+        container, _, rest = path[1:].partition("/")
+        if method == "GET" and "prefix" in query:
+            self._swift_list(container, query)
+        elif method == "HEAD" and not rest:
+            self._reply(204 if self.app.local(path).is_dir() else 404)
+        elif method == "PUT" and "X-Copy-From" in self.headers:
+            self._object_copy(self.headers["X-Copy-From"], path, 201)
+        elif method in ("PUT", "HEAD") and path.endswith("/"):
+            self._directory_marker(path)
+        elif method == "DELETE":
+            self._object_delete(path)
+        elif method in ("GET", "HEAD", "PUT"):
+            getattr(self, f"_dav_{method.lower()}")(path)
+        else:
+            self._reply(405, b"method not allowed")
+
+    def _swift_list(self, container: str, query: dict[str, str]) -> None:
+        root = self.app.local("/" + container)
+        if not root.is_dir():
+            self._reply(404, b"<html><h1>Not Found</h1></html>")
+            return
+        prefix = query["prefix"]
+        keys = [key for key in _keys(root) if key.startswith(prefix)]
+        objects, prefixes = _rolled(keys, prefix, query.get("delimiter", ""))
+        if not objects and not prefixes:
+            self._reply(204)
+            return
+        body = [f'<?xml version="1.0" encoding="UTF-8"?><container name="{escape(container)}">']
+        for name in prefixes:
+            body.append(f'<subdir name="{escape(name)}"><name>{escape(name)}</name></subdir>')
+        for name in objects:
+            size, stamp = _object_info(root / name)
+            modified = time.strftime("%Y-%m-%dT%H:%M:%S.000000", time.gmtime(stamp))
+            body.append(
+                f"<object><name>{escape(name)}</name><hash>0</hash><bytes>{size}</bytes>"
+                f"<content_type>application/octet-stream</content_type>"
+                f"<last_modified>{modified}</last_modified></object>"
+            )
+        body.append("</container>")
+        self._reply(200, "".join(body).encode(), {"Content-Type": "application/xml"})
+
+    def _object_delete(self, path: str) -> None:
+        """An object store's ``DELETE``: a file, or an empty directory's marker."""
+        target = self.app.local(path)
+        if target.is_file():
+            target.unlink()
+        elif target.is_dir() and path.endswith("/") and not any(target.iterdir()):
+            target.rmdir()
+        elif self.app.swift is not None:
+            self._reply(404, b"<html><h1>Not Found</h1></html>")
+            return
+        self._reply(204)  # S3 deletes what is not there without complaint
+
+    def _directory_marker(self, path: str) -> None:
+        """``PUT``/``HEAD`` of ``key/``: an empty object standing for a directory."""
+        target = self.app.local(path)
+        if self.command == "PUT":
+            self._read_body()
+            target.mkdir(parents=True, exist_ok=True)
+            self._reply(201 if self.app.swift is not None else 200)
+        elif target.is_dir():
+            self._reply(200, length=0)
+        else:
+            self._reply(404, b"no such key")
+
+    def _object_copy(self, source: str, path: str, status: int) -> None:
+        """A server-side copy (``x-amz-copy-source``, ``X-Copy-From``) of ``/<bucket>/<key>``."""
+        self._read_body()
+        origin = self.app.local(urllib.parse.unquote(source))
+        if not origin.is_file():
+            self._reply(404, b"no such source")
+            return
+        target = self.app.local(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(origin.read_bytes())
+        self._reply(status, b"")
 
     def _s3_list(self, bucket: str, query: dict[str, str]) -> None:
         s3 = self.app.s3
@@ -1144,24 +1256,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._reply(404, b"<Error><Code>NoSuchBucket</Code></Error>")
             return
         prefix = query.get("prefix", "")
-        keys = sorted(
-            str(item.relative_to(root)).replace(os.sep, "/")
-            for item in root.rglob("*")
-            if item.is_file()
-        )
+        keys = _keys(root)
         keys = [key for key in keys if key.startswith(prefix)]
         v1 = "list-type" not in query
         start = int(query.get("marker" if v1 else "continuation-token") or 0)
         limit = min(int(query.get("max-keys") or s3.page_size), s3.page_size)
-        contents, prefixes = [], []
-        for key in keys:
-            rest = key[len(prefix) :]
-            if "/" in rest:
-                common = prefix + rest.split("/")[0] + "/"
-                if common not in prefixes:
-                    prefixes.append(common)
-            else:
-                contents.append(key)
+        contents, prefixes = _rolled(keys, prefix, "/")
         items = [("P", p) for p in prefixes] + [("K", k) for k in contents]
         page = items[start : start + limit]
         truncated = start + limit < len(items)
@@ -1172,10 +1272,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if kind == "P":
                 body.append(f"<CommonPrefixes><Prefix>{escape(name)}</Prefix></CommonPrefixes>")
             else:
-                stat = (root / name).stat()
-                modified = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(stat.st_mtime))
+                size, stamp = _object_info(root / name)
+                modified = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(stamp))
                 body.append(
-                    f"<Contents><Key>{escape(name)}</Key><Size>{stat.st_size}</Size>"
+                    f"<Contents><Key>{escape(name)}</Key><Size>{size}</Size>"
                     f"<LastModified>{modified}</LastModified></Contents>"
                 )
         body.append(f"<IsTruncated>{'true' if truncated else 'false'}</IsTruncated>")
@@ -1184,6 +1284,39 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             body.append(f"<{name}>{start + limit}</{name}>")
         body.append("</ListBucketResult>")
         self._reply(200, "".join(body).encode(), {"Content-Type": "application/xml"})
+
+
+def _object_info(local: Path) -> tuple[int, float]:
+    """``(size, mtime)`` of an object: a directory stands for an empty marker."""
+    info = local.stat()
+    return (0 if local.is_dir() else info.st_size), info.st_mtime
+
+
+def _rolled(keys: list[str], prefix: str, delimiter: str) -> tuple[list[str], list[str]]:
+    """``(objects, common prefixes)`` directly under ``prefix``, as a listing rolls them up."""
+    objects: list[str] = []
+    prefixes: list[str] = []
+    for key in keys:
+        rest = key[len(prefix) :]
+        if delimiter and delimiter in rest:
+            common = prefix + rest.split(delimiter)[0] + delimiter
+            if common not in prefixes:
+                prefixes.append(common)
+        else:
+            objects.append(key)
+    return objects, prefixes
+
+
+def _keys(root: Path) -> list[str]:
+    """The object keys under ``root``: its files, and ``dir/`` for each empty directory."""
+    found = []
+    for item in root.rglob("*"):
+        name = str(item.relative_to(root)).replace(os.sep, "/")
+        if item.is_file():
+            found.append(name)
+        elif not any(item.iterdir()):
+            found.append(name + "/")
+    return sorted(found)
 
 
 def _propfind_entry(href: str, local: Path) -> str:

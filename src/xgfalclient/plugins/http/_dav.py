@@ -35,7 +35,6 @@ __all__ = [
     "parse_multistatus",
     "parse_xml",
     "stat_for",
-    "want_digest",
 ]
 
 _DAV = "{DAV:}"
@@ -56,11 +55,12 @@ DIR_MODE = _stat.S_IFDIR | 0o777
 def parse_xml(payload: bytes, what: str = "WebDAV response") -> ET.Element:
     """Parse an XML body, refusing any document that carries a DTD."""
     if b"<!DOCTYPE" in payload or b"<!ENTITY" in payload:
-        raise GError(f"Refusing a {what} with a document type declaration", errno.EPROTO)
+        raise GError(f"Refusing a {what} with a document type declaration", errno.EIO)
     try:
         return ET.fromstring(payload)
     except ET.ParseError as exc:
-        raise GError(f"Malformed {what}: {exc}", errno.EPROTO) from exc
+        # davix's WebDavPropertiesParsingError, which gfal2 reports as EIO.
+        raise GError(f"XML Parsing Error: {what}: {exc}", errno.EIO) from exc
 
 
 def epoch(stamp: str) -> int:
@@ -134,11 +134,6 @@ def same_path(left: str, right: str) -> bool:
 _HEX = frozenset({"adler32", "crc32", "crc32c", "unixcksum", "cksum"})
 #: The RFC 3230 names that differ from the names users type.
 _ALIASES = {"sha": "sha1", "sha-1": "sha1", "sha-256": "sha256", "sha-512": "sha512"}
-
-
-def want_digest(algorithm: str) -> str:
-    """The ``Want-Digest`` value for ``algorithm``: lower-cased, as davix sends it."""
-    return algorithm.strip().lower()
 
 
 def _canonical(name: str) -> str:

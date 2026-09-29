@@ -23,6 +23,7 @@ from xgfalclient.creds import (
     find_bearer_token,
     find_ca_path,
     find_x509,
+    seed_options,
 )
 from xgfalclient.options import Options
 from xgfalclient.testing.pki import PKI
@@ -47,8 +48,8 @@ def test_store_longest_prefix_wins() -> None:
     assert store.get(BEARER, "https://se/other") == ("host", "https://se/")
     assert store.get(BEARER, "https://elsewhere/") == ("", "")
     assert len(store) == 3
-    store.delete(BEARER, "https://se/data/")
-    store.delete(BEARER, "https://never/")
+    assert store.delete(BEARER, "https://se/data/") is True
+    assert store.delete(BEARER, "https://never/") is False
     assert store.get(BEARER, "https://se/data/f") == ("host", "https://se/")
     store.clean()
     assert len(store) == 0
@@ -231,3 +232,70 @@ def test_store_prefix_must_end_on_a_directory() -> None:
     assert store.get(BEARER, "davs://hx/y") == ("", "")
     assert store.get(BEARER, "davs://h:443/x") == ("", "")
     assert store.get(BEARER, "davs://h/x") == ("h", "davs://h")
+
+
+def _seeded(env: dict[str, str]) -> tuple[str, str, str]:
+    options = Options(load_system=False)
+    seed_options(options, env)
+    return (
+        options.string("X509", "CERT"),
+        options.string("X509", "KEY"),
+        options.string("BEARER", "TOKEN"),
+    )
+
+
+def test_seed_options_follows_gfal2_order(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".globus").mkdir(parents=True)
+    assert _seeded({"BEARER_TOKEN": " t ", "X509_USER_PROXY": "/p"}) == ("", "", "t")
+    # The proxy variable is trusted without looking at the file.
+    assert _seeded({"X509_USER_PROXY": " /nowhere ", "HOME": str(home)}) == (
+        "/nowhere",
+        "/nowhere",
+        "",
+    )
+    assert _seeded({"X509_USER_CERT": "/c", "X509_USER_KEY": "/k"}) == ("/c", "/k", "")
+    assert _seeded({"X509_USER_CERT": "/c", "HOME": str(home)}) == ("", "", "")
+    for name in ("usercert.pem", "userkey.pem"):
+        (home / ".globus" / name).write_text("x")
+    assert _seeded({"HOME": str(home)}) == (
+        str(home / ".globus" / "usercert.pem"),
+        str(home / ".globus" / "userkey.pem"),
+        "",
+    )
+    (home / ".globus" / "userkey.pem").unlink()
+    assert _seeded({"HOME": str(home)}) == ("", "", "")
+    assert _seeded({}) == ("", "", "")
+
+
+def test_seed_options_default_proxy_and_real_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proxy = Path(f"/tmp/x509up_u{UNUSED_UID}")
+    try:
+        proxy.write_text("x")
+        assert _seeded({"X509_USER_CERT": "/c", "X509_USER_KEY": "/k"})[0] == str(proxy)
+    finally:
+        proxy.unlink()
+    monkeypatch.setenv("BEARER_TOKEN", "from-env")
+    options = Options(load_system=False)
+    seed_options(options)
+    assert options.string("BEARER", "TOKEN") == "from-env"
+
+
+def test_a_stale_seeded_certificate_is_passed_over(tmp_path: Path) -> None:
+    """A missing file copied in from the environment must not break token-only access."""
+    real = tmp_path / "proxy"
+    real.write_text("x")
+    for variable in ("X509_USER_PROXY", "X509_USER_CERT"):
+        env = {variable: str(tmp_path / "stale"), "HOME": str(tmp_path)}
+        options = Options(load_system=False)
+        seed_options(options, {**env, "X509_USER_KEY": "/k"})
+        assert find_x509(options, None, "", env) is None
+    # Configured by hand, a missing file is still presented (and fails loudly later).
+    options = Options(load_system=False)
+    options.set_string("X509", "CERT", str(tmp_path / "typo"))
+    assert find_x509(options, None, "", {"HOME": str(tmp_path)}) is not None
+    # Seeded and present: used as is.
+    options.set_string("X509", "CERT", str(real))
+    assert find_x509(options, None, "", {"X509_USER_PROXY": str(real)}) is not None

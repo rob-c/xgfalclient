@@ -1,4 +1,4 @@
-"""``HTTPPlugin``: gfal2's http plugin (davix) for ``http``, ``https``, ``dav``, ``davs``, ``s3``.
+"""``HTTPPlugin``: gfal2's http plugin (davix) for HTTP, WebDAV, S3, GCS, Swift and CS3.
 
 The namespace is WebDAV, request for request as davix sends it:
 
@@ -9,14 +9,41 @@ The namespace is WebDAV, request for request as davix sends it:
 ``unlink``  ``PROPFIND`` to see it is not a collection, then ``DELETE``
 ``rename``  ``MOVE`` with a ``Destination``
 ``listdir`` ``PROPFIND`` ``Depth: 1``, less the collection's own entry
-checksum    ``HEAD`` with ``Want-Digest`` (RFC 3230), then a one-byte ``GET``
+checksum    ``HEAD`` with ``Want-Digest`` (RFC 3230)
 ==========  ==================================================================
 
 ``chmod`` is not implemented, so it fails with ``EPROTONOSUPPORT`` as it does
-in gfal2. Error messages are davix's (``Result HTTP 404 : File not found
-after 1 attempts``) and so are the errno values, including ``EPERM`` for
-403. ``s3://`` URLs, and ``https://`` ones on a host with ``[S3:<HOST>]``
-keys, are S3 instead (:mod:`._s3`).
+in gfal2, and so do extended attributes and tape calls on anything but
+``http``, ``https``, ``dav`` and ``davs`` (gfal2's ``check_url``). Errors
+are worded, and numbered, as davix and gfal2 word and number them
+(:func:`~._client.status_error`): ``stat`` adds davix's ``Result ... after
+1 attempts`` to anything but a refusal, and ``mkdir``, ``unlink``,
+``rename`` and ``rmdir`` add `` with url <url>`` to anything but a 401 or
+a 403, which davix raises before it looks at the answer.
+
+``s3://`` and ``gcloud://`` URLs are object stores (:mod:`._s3`,
+:mod:`._gcloud`), and so are ``swift://`` ones (:mod:`._swift`). ``cs3://``
+(Reva) is plain HTTP with ``[BEARER] TOKEN``: its ``stat`` is a ``HEAD``,
+like the fallback for ``http://``, which davix answers with mode ``0755``,
+the size, and no times.
+
+Where this differs from gfal2, deliberately:
+
+* a checksum the ``HEAD`` did not carry is asked for once more with a
+  one-byte ``GET``, which some servers need before they compute one, and
+  a hex digest where RFC 3230 wants base64 is read as hex (davix decodes it
+  as base64 and reports garbage);
+* ``open`` for reading *and* writing is ``ENOTSUP``: an HTTP object cannot
+  be both at once (davix lets the open through and fails later);
+* a ``token_retrieve`` or TPC token is not fetched before every other HTTPS
+  operation the way gfal2 does with ``RETRIEVE_BEARER_TOKEN`` (a macaroon
+  ``POST`` ahead of each ``PROPFIND``): the X.509 proxy that would ask for
+  it authenticates the operation just as well;
+* ``[HTTP PLUGIN] METALINK`` is not read (there is no Metalink support), nor
+  are davix's ``LOG_LEVEL``, ``LOG_SENSITIVE`` and ``LOG_CONTENT``: the plugin's
+  diagnostics go to the ``gfal2`` logger instead;
+* ``User-Agent`` is the context's (``<agent>/<version> gfal2/2.23.5``),
+  without the `` neon/0.0.29`` that davix's HTTP library appends.
 
 Tape (the WLCG Tape REST API), tokens, copies and QoS live in their own
 modules; this class is the dispatch surface gfal2's API lands on.
@@ -29,34 +56,34 @@ import binascii
 import errno
 import logging
 import posixpath
+import re
+import stat as _stat
+import string
 import urllib.parse
 from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING
 
-from ...errors import GError, unsupported
+from ...errors import GError
 from ...plugin import O_ACCMODE_MASK, O_RDONLY, O_WRONLY, Plugin, PluginFile, StagingResult
 from ...types import Stat
 from ...url import URL, parent, parse, scheme_of
-from . import _copy, _gcloud, _qos, _s3, _token
+from . import _copy, _gcloud, _qos, _s3, _swift, _token
 from ._client import (
+    MKDIR,
     Auth,
     FileBody,
     HTTPClient,
     HTTPStatusError,
     Response,
     Signer,
-    TransportError,
     status_error,
     wire_url,
 )
 from ._dav import (
-    FILE_MODE,
     PROPFIND_BODY,
     digest_value,
-    epoch,
     parse_multistatus,
     same_path,
-    want_digest,
 )
 from ._io import HTTPReadFile, HTTPWriteFile, check_upload
 from ._tape import TAPE_XATTRS, TapeREST
@@ -69,18 +96,44 @@ __all__ = ["HTTPPlugin"]
 
 _log = logging.getLogger("gfal2")
 
+#: The schemes gfal2's ``check_url`` allows xattrs and tape calls on.
+TAPE_SCHEMES = frozenset({"http", "https", "dav", "davs"})
+#: Operations limited to :data:`TAPE_SCHEMES`.
+TAPE_OPERATIONS = frozenset(
+    {
+        "getxattr",
+        "setxattr",
+        "listxattr",
+        "bring_online",
+        "bring_online_poll",
+        "release",
+        "abort_bring_online",
+        "archive_poll",
+    }
+)
+#: What davix splits an ``ETag`` on, looking for an MD5 in it.
+_ETAG_SPLIT = re.compile(r"[&;\\/\"']")
+#: What davix makes of a file it only knows from a ``HEAD``.
+HEAD_MODE = _stat.S_IFREG | 0o755
+
 
 def _result(exc: GError, prefix: str = "") -> GError:
     """davix's wording for a failed ``stat``: ``Result <why> after 1 attempts``.
 
-    davix retries a 404 and a connection failure, and says so; any other
-    status it reports as it came.
+    davix's retry layer says so about everything but a refusal (403, 405,
+    423), which it gives up on at once.
     """
-    if isinstance(exc, TransportError) or (isinstance(exc, HTTPStatusError) and exc.status == 404):
+    if exc.code != errno.EPERM:
         return GError(f"{prefix}Result {exc.message} after 1 attempts", exc.code)
     if prefix:
         return GError(f"{prefix}{exc.message}", exc.code)
     return exc
+
+
+def _decorated(status: int, url: str, *, prefix: str = "", scope: str = "") -> HTTPStatusError:
+    """A failed ``DELETE``/``MKCOL``/``MOVE``: `` with url <url>``, but not for 401 or 403."""
+    suffix = "" if status in (401, 403) else f" with url {url}"
+    return status_error(status, prefix=prefix, suffix=suffix, scope=scope)
 
 
 def _collection(url: str) -> str:
@@ -88,6 +141,18 @@ def _collection(url: str) -> str:
     parsed = parse(url)
     path = parsed.path or "/"
     return str(parsed.with_path(path if path.endswith("/") else path + "/"))
+
+
+def _kind(url: str) -> str:
+    """``s3`` (S3 and GCS), ``swift``, ``cs3``, or ``dav`` for everything WebDAV."""
+    scheme = scheme_of(url).partition("+")[0]
+    if scheme in ("s3", "s3s", "gcloud", "gclouds"):
+        return "s3"
+    if scheme in ("swift", "swifts"):
+        return "swift"
+    if scheme in ("cs3", "cs3s"):
+        return "cs3"
+    return "dav"
 
 
 class HTTPPlugin(Plugin):
@@ -107,10 +172,15 @@ class HTTPPlugin(Plugin):
         "davs+3rd",
         "gcloud",
         "gclouds",
+        "swift",
+        "swifts",
+        "cs3",
+        "cs3s",
     )
     option_group = "HTTP PLUGIN"
     priority = 100
     event_domain = "http_plugin"
+    narrates_transfer = True
 
     def __init__(self, context: Gfal2Context) -> None:
         super().__init__(context)
@@ -122,6 +192,11 @@ class HTTPPlugin(Plugin):
     def close(self) -> None:
         self.client.close()
 
+    def handles(self, url: str, operation: str) -> bool:
+        if operation in TAPE_OPERATIONS:
+            return scheme_of(url) in TAPE_SCHEMES
+        return super().handles(url, operation)
+
     # -- plumbing ------------------------------------------------------------------
 
     def io_timeout(self) -> float:
@@ -131,27 +206,26 @@ class HTTPPlugin(Plugin):
         return float(self.options.integer("CORE", "CHECKSUM_TIMEOUT", 1800))
 
     def _signer(self, url: URL) -> Signer | None:
-        if _gcloud.is_gcloud(url.scheme):
+        if _swift.is_swift(url.scheme):
+            return _swift.SwiftSigner(_swift.swift_keys(self.options, url))
+        return self.presigner_for(str(url))
+
+    def presigner_for(self, url: str) -> Signer | None:
+        """What signs requests for (and pre-signs) an S3 or GCS ``url``, if it has keys."""
+        parsed = parse(url)
+        if _gcloud.is_gcloud(parsed.scheme):
             found = self._gcloud.get(self.options)
             return _gcloud.GCloudSigner(found) if found is not None else None
-        keys = _s3.s3_keys(self.options, url)
+        keys = _s3.s3_keys(self.options, parsed) if _s3.is_s3(parsed) else None
         return _s3.S3Signer(keys) if keys is not None else None
 
-    def signer_for(self, url: str) -> Signer | None:
-        return self._signer(parse(url))
-
     def _s3(self, url: str) -> bool:
-        """Whether ``url`` is an object store (S3 or GCS) rather than WebDAV."""
-        parsed = parse(url)
-        return (
-            _s3.is_s3(parsed)
-            or _gcloud.is_gcloud(parsed.scheme)
-            or _s3.s3_keys(self.options, parsed) is not None
-        )
+        """Whether ``url`` is an S3 or GCS object store."""
+        return _kind(url) == "s3"
 
     def _multipart(self, url: str) -> bool:
         """Whether a large upload to ``url`` must go in parts (S3, not GCS)."""
-        return self._s3(url) and not _gcloud.is_gcloud(scheme_of(url))
+        return _s3.is_s3(parse(url))
 
     def _request(
         self,
@@ -182,14 +256,21 @@ class HTTPPlugin(Plugin):
         response = self._request("GET", url, headers=headers, timeout=timeout)
         if response.status not in (200, 206, 416):
             response.close()
-            raise status_error(response.status, response.reason)
+            raise status_error(response.status)
         return response
 
-    def _put_file(self, url: str, body: FileBody, size: int, timeout: float | None = None) -> None:
+    def _put_file(
+        self,
+        url: str,
+        body: FileBody,
+        size: int,
+        timeout: float | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         if size > _s3.MULTIPART_THRESHOLD and self._multipart(url):
             _s3.upload_file(self, url, body)
             return
-        check_upload(self._request("PUT", url, body=body, timeout=timeout))
+        check_upload(self._request("PUT", url, body=body, timeout=timeout, headers=headers))
 
     # -- stat ----------------------------------------------------------------------
 
@@ -200,8 +281,13 @@ class HTTPPlugin(Plugin):
             raise _result(exc) from None
 
     def _stat(self, url: str) -> Stat:
-        if self._s3(url):
+        kind = _kind(url)
+        if kind == "s3":
             return _s3.stat(self, url)
+        if kind == "swift":
+            return _swift.stat(self, url)
+        if kind == "cs3":
+            return self._head_stat(url)
         if scheme_of(url).startswith("http"):
             try:
                 return self._propfind_stat(url)
@@ -214,44 +300,35 @@ class HTTPPlugin(Plugin):
         response = self._request("PROPFIND", url, headers={"Depth": "0"})
         payload = response.body()
         if response.status not in (200, 207):
-            raise status_error(response.status, response.reason)
+            raise status_error(response.status)
         entries = parse_multistatus(payload)
         if not entries:
-            raise GError(f"The PROPFIND response for {url} has no entries", errno.EPROTO)
+            raise GError("Parsing Error: properties number < 1", errno.EIO)
         return entries[0][1]
 
     def _head_stat(self, url: str) -> Stat:
+        """davix's plain-HTTP ``stat``: a regular file, ``0755``, its size, and no times."""
         response = self._request("HEAD", url)
         response.close()
-        if response.status != 200:
-            raise status_error(response.status, response.reason)
-        return Stat(
-            st_mode=FILE_MODE,
-            st_size=response.length or 0,
-            st_mtime=epoch(response.header("Last-Modified")),
-        )
+        if response.status >= 300:
+            raise status_error(response.status)
+        return Stat(st_mode=HEAD_MODE, st_size=response.length or 0)
 
     # -- namespace -----------------------------------------------------------------
 
     def mkdir(self, url: str, mode: int) -> None:
-        if self._s3(url):
-            return  # S3 has no directories to make
+        if _kind(url) in ("s3", "swift"):
+            _swift.mkdir(self, url)
+            return
         response = self._request("MKCOL", url)
         response.body()
-        if response.status in (200, 201, 204):
-            return
-        suffix = f" with url {url}"
-        if response.status == 405:
-            raise status_error(
-                405, phrase="Method Not Allowed, File Exist", suffix=suffix, code=errno.EEXIST
-            )
-        if response.status == 409:
-            raise status_error(409, phrase="Conflict", suffix=suffix, code=errno.ENOENT)
-        raise status_error(response.status, response.reason)
+        if response.status not in (200, 201, 204):
+            raise _decorated(response.status, url, scope=MKDIR)
 
     def mkdir_rec(self, url: str, mode: int) -> None:
         """One ``MKCOL`` when that is enough (XrdHttp makes parents); else walk up."""
-        if self._s3(url):
+        if _kind(url) in ("s3", "swift"):
+            self.mkdir(url, mode)  # a marker object needs no parents
             return
         try:
             self.mkdir(url, mode)
@@ -280,18 +357,8 @@ class HTTPPlugin(Plugin):
         target = _collection(url)
         response = self._request("DELETE", target)
         response.body()
-        if response.status in (200, 202, 204):
-            return
-        prefix = "DavPosix::rmdir  "
-        if response.status == 409:
-            raise status_error(
-                409,
-                phrase="Conflict, File Exist",
-                prefix=prefix,
-                suffix=f" with url {target}",
-                code=errno.EEXIST,
-            )
-        raise status_error(response.status, response.reason, prefix=prefix)
+        if response.status not in (200, 202, 204):
+            raise _decorated(response.status, target, prefix="DavPosix::rmdir  ")
 
     def unlink(self, url: str) -> None:
         prefix = "DavPosix::unlink  "
@@ -300,19 +367,24 @@ class HTTPPlugin(Plugin):
         except GError as exc:
             raise _result(exc, prefix) from None
         if info.is_dir():
-            raise GError(f"{prefix} {url} is a directory, impossible to unlink", errno.EISDIR)
+            raise GError(f"{prefix} {url} is a directory, impossible to unlink\\n", errno.EISDIR)
         response = self._request("DELETE", url)
         response.body()
         if response.status not in (200, 202, 204):
-            raise status_error(response.status, response.reason, prefix=prefix)
+            raise _decorated(response.status, url, prefix=prefix)
 
     def rename(self, old: str, new: str) -> None:
-        if self._s3(old):
-            raise unsupported("rename", old)
+        kind = _kind(old)
+        if kind == "s3":
+            _s3.rename(self, old, new)
+            return
+        if kind == "swift":
+            _swift.rename_swift(self, old, new)
+            return
         response = self._request("MOVE", old, headers={"Destination": wire_url(new)})
         response.body()
         if response.status not in (200, 201, 204):
-            raise status_error(response.status, response.reason, suffix=f" with url {old}")
+            raise _decorated(response.status, old)
 
     def opendir(self, url: str) -> Iterator[tuple[str, Stat | None]]:
         return iter(self._list(url))
@@ -321,8 +393,11 @@ class HTTPPlugin(Plugin):
         return [name for name, _ in self._list(url)]
 
     def _list(self, url: str) -> list[tuple[str, Stat | None]]:
-        if self._s3(url):
+        kind = _kind(url)
+        if kind == "s3":
             return self._s3_list(url)
+        if kind == "swift":
+            return _swift.list_objects(self, url)
         response = self._request(
             "PROPFIND",
             url,
@@ -331,7 +406,7 @@ class HTTPPlugin(Plugin):
         )
         payload = response.body()
         if response.status not in (200, 207):
-            raise status_error(response.status, response.reason)
+            raise status_error(response.status)
         entries = parse_multistatus(payload)
         own = urllib.parse.unquote(parse(url).path)
         mine = next((i for i, (path, _) in enumerate(entries) if same_path(path, own)), 0)
@@ -375,14 +450,16 @@ class HTTPPlugin(Plugin):
         if self._s3(url):
             return _s3.checksum(self, url, algorithm)
         timeout = self.checksum_timeout()
-        want = {"Want-Digest": want_digest(algorithm)}
+        want = {"Want-Digest": algorithm}
         response = self._request("HEAD", url, headers=want, timeout=timeout)
         response.close()
-        if response.status != 200:
-            raise status_error(response.status, response.reason)
-        value = digest_value(response.header("Digest"), algorithm)
-        if not value and algorithm.strip().lower() == "md5":
-            value = _content_md5(response.header("Content-MD5"))
+        if response.status >= 300:
+            raise status_error(response.status)
+        md5 = algorithm.strip().lower() == "md5"
+        value = _content_md5(response.header("Content-MD5")) if md5 else ""
+        value = value or digest_value(response.header("Digest"), algorithm)
+        if not value and md5:
+            value = _etag_md5(response.header("ETag"))
         if not value:
             # Some servers only compute a digest for a GET; one byte of it will do.
             probe = self._request(
@@ -420,7 +497,7 @@ class HTTPPlugin(Plugin):
         timeout: int,
         is_async: bool,
     ) -> tuple[list[StagingResult], str]:
-        return self.tape.bring_online(urls, metadata, timeout, is_async)
+        return self.tape.bring_online(urls, metadata)
 
     def bring_online_poll(self, urls: Sequence[str], token: str) -> list[StagingResult]:
         return self.tape.poll(urls, token)
@@ -461,12 +538,16 @@ class HTTPPlugin(Plugin):
     # -- copies --------------------------------------------------------------------------
 
     def copy_check(self, source: str, destination: str) -> bool:
-        """Every pair with an HTTP end: TPC, uploads, and parallel downloads."""
-        mine = set(self.schemes)
-        src, dst = scheme_of(source), scheme_of(destination)
-        if src in mine:
-            return dst in mine or destination.startswith("file:///")
-        return dst in mine and source.startswith("file:///")
+        """gfal2's claim: an HTTP destination (no ``+3rd``) from HTTP or ``file://``.
+
+        Unlike gfal2 it also takes HTTP to ``file://``, for the parallel
+        ranged download (:mod:`._copy`); a ``+3rd`` URL is left to the core's
+        streamed copy, as gfal2 leaves it.
+        """
+        src, dst = _copy.is_http_scheme(source), _copy.is_http_scheme(destination)
+        if dst:
+            return src or source.startswith("file://")
+        return src and destination.startswith("file:///")
 
     def copy(self, transfer: Transfer) -> None:
         _copy.copy(self, transfer)
@@ -480,3 +561,11 @@ def _content_md5(value: str) -> str:
         return base64.b64decode(value.strip(), validate=True).hex()
     except (binascii.Error, ValueError):
         return ""
+
+
+def _etag_md5(etag: str) -> str:
+    """The first 32-hex-digit token of an ``ETag``: davix's last resort for MD5 (S3's ETag)."""
+    for token in _ETAG_SPLIT.split(etag):
+        if len(token) == 32 and all(char in string.hexdigits for char in token):
+            return token
+    return ""

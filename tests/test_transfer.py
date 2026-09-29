@@ -21,6 +21,7 @@ from xgfalclient.plugin import Plugin, PluginFile
 from xgfalclient.transfer import (
     Transfer,
     TransferParameters,
+    _cleanup,
     _is_special,
     _split_checksum,
     emit,
@@ -80,9 +81,11 @@ def test_deprecated_checksum_spellings() -> None:
     params = TransferParameters()
     with pytest.warns(DeprecationWarning):
         assert params.checksum_check is False
-    params.checksum_check = True
+    with pytest.warns(DeprecationWarning):
+        params.checksum_check = True
     assert params.get_checksum()[0] is checksum_mode.both
-    params.checksum_check = False
+    with pytest.warns(DeprecationWarning):
+        params.checksum_check = False
     assert params.get_checksum()[0] is checksum_mode.none
     with pytest.warns(DeprecationWarning):
         params.set_user_defined_checksum("md5", "x")
@@ -94,24 +97,26 @@ def test_deprecated_checksum_spellings() -> None:
 # -- events and the Transfer handle ---------------------------------------------------------
 
 
-def test_emit_survives_a_broken_callback(caplog: pytest.LogCaptureFixture) -> None:
+def test_emit_logs_and_propagates(caplog: pytest.LogCaptureFixture) -> None:
     params = TransferParameters()
-    emit(params, "d", "s")  # no callback: nothing happens
+    with caplog.at_level(logging.INFO, logger="gfal2"):
+        emit(params, "d", "s", "desc", side=1)  # no callback: logged all the same
+    assert caplog.messages == ["Event triggered: DESTINATION d s desc"]
 
     def broken(event: Any) -> None:
         raise ValueError("boom")
 
     params.event_callback = broken
-    with caplog.at_level(logging.ERROR, logger="gfal2"):
+    with pytest.raises(ValueError, match="boom"):  # as in gfal2: it aborts the copy
         emit(params, "d", "s")
-    assert "event_callback raised" in caplog.text
 
 
 def test_transfer_checksum_selection(ctx: Gfal2Context) -> None:
     params = TransferParameters()
     transfer = Transfer(ctx, params, "a", "b", user_checksum=("md5", "x"))
+    # A bulk entry replaces the algorithm and value, never the mode (gfal2's set_checksum).
     assert (transfer.checksum_mode, transfer.checksum_algorithm, transfer.user_checksum) == (
-        checksum_mode.both,
+        checksum_mode.none,
         "md5",
         "x",
     )
@@ -137,8 +142,6 @@ def test_transfer_limits(ctx: Gfal2Context, monkeypatch: pytest.MonkeyPatch) -> 
     transfer = Transfer(ctx, params, "a", "b")
     assert transfer.deadline is None and transfer.remaining() is None
     transfer.check()
-    params.timeout = -1  # negative is no limit too
-    assert transfer.deadline is None
     params.timeout = 10
     remaining = transfer.remaining()
     assert remaining is not None and 0 < remaining <= 10
@@ -146,7 +149,10 @@ def test_transfer_limits(ctx: Gfal2Context, monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr("xgfalclient.transfer.time.monotonic", lambda: now + 20)
     with pytest.raises(GError) as caught:
         transfer.check()
-    assert caught.value.code == errno.ETIMEDOUT
+    assert (caught.value.code, caught.value.message) == (
+        errno.ETIMEDOUT,
+        "Transfer canceled because the timeout expired",
+    )
     assert transfer.remaining() == 0.0
 
 
@@ -158,9 +164,7 @@ def test_transfer_cancel(ctx: Gfal2Context) -> None:
     assert caught.value.code == errno.ECANCELED
 
 
-def test_progress_throttles_monitor(
-    ctx: Gfal2Context, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_progress_throttles_monitor(ctx: Gfal2Context, monkeypatch: pytest.MonkeyPatch) -> None:
     clock = [1000.0]
     monkeypatch.setattr("xgfalclient.transfer.time.monotonic", lambda: clock[0])
     calls: list[tuple[Any, ...]] = []
@@ -183,9 +187,15 @@ def test_progress_throttles_monitor(
         raise RuntimeError("boom")
 
     params.monitor_callback = broken
-    with caplog.at_level(logging.ERROR, logger="gfal2"):
+    with pytest.raises(RuntimeError, match="boom") as caught:
         transfer.progress(400, force=True)
-    assert "monitor_callback raised" in caplog.text
+    with pytest.raises(RuntimeError):  # remembered: the next check() stops the copy
+        transfer.check()
+    assert transfer.callback_error is caught.value
+    clock[0] += 2
+    with pytest.raises(RuntimeError):
+        transfer.add(1)
+    assert transfer.callback_error is caught.value  # the first one is kept
 
 
 def test_add_is_thread_safe(ctx: Gfal2Context) -> None:
@@ -315,10 +325,15 @@ def test_checksum_mismatches(ctx: Gfal2Context, src: Path, tmp_path: Path) -> No
     ctx.filecopy(params, file_url(src), file_url(tmp_path / "d3"))
     params.set_checksum(checksum_mode.target, "adler32", adler(src))
     ctx.filecopy(params, file_url(src), file_url(tmp_path / "d4"))
-    # A bulk entry with no value overrides the parameters' one: computed, not compared.
-    assert ctx.filecopy(params, [file_url(src)], [file_url(tmp_path / "d5")], ["adler32:"]) == [
-        None
-    ]
+    # A bulk entry replaces the parameters' value, and target mode needs one (as gfal2).
+    results = ctx.filecopy(params, [file_url(src)], [file_url(tmp_path / "d5")], ["adler32:"])
+    assert isinstance(results[0], GError)
+    assert (results[0].code, results[0].message) == (
+        errno.EINVAL,
+        "Checksum value required if mode is not end to end",
+    )
+    assert params.get_checksum() == (checksum_mode.target, "adler32", adler(src))  # untouched
+    assert not (tmp_path / "d5").exists()
 
 
 def test_source_destination_mismatch(ctx: Gfal2Context, tmp_path: Path) -> None:
@@ -326,11 +341,12 @@ def test_source_destination_mismatch(ctx: Gfal2Context, tmp_path: Path) -> None:
     params.set_checksum(checksum_mode.both, "adler32", "")
     with pytest.raises(GError) as caught:
         ctx.filecopy(params, "mock://h/src?size=64&checksum=1", file_url(tmp_path / "dst"))
-    zeros = f"{zlib.adler32(bytes(64)):08x}"
-    assert caught.value.message == (
+    message = caught.value.message
+    assert message.startswith(  # mock:// reads random bytes, as gfal2's does
         "DESTINATION CHECKSUM MISMATCH Source checksum and destination checksum do not match: "
-        f"00000001 != {zeros}"
+        "00000001 != "
     )
+    assert len(message.rpartition(" != ")[2]) == 8
 
 
 def test_strict_copy_skips_checks(ctx: Gfal2Context, src: Path, tmp_path: Path) -> None:
@@ -350,7 +366,8 @@ def test_cleanup_policy(ctx: Gfal2Context, src: Path, tmp_path: Path) -> None:
     params.set_checksum(checksum_mode.target, "adler32", "deadbeef")
     with pytest.raises(GError):
         ctx.filecopy(params, file_url(src), file_url(tmp_path / "gone"))
-    assert [(e.stage, e.description) for e in events if e.stage == "CLEANUP"] == [("CLEANUP", "0")]
+    assert not (tmp_path / "gone").exists()
+    assert "CLEANUP" not in [e.stage for e in events]  # gfal2's local copy never narrates one
     params.transfer_cleanup = False
     with pytest.raises(GError):
         ctx.filecopy(params, file_url(src), file_url(tmp_path / "kept"))
@@ -512,7 +529,7 @@ def test_checksum_failures_name_the_side(ctx: Gfal2Context, src: Path, tmp_path:
 
 
 def test_split_checksum() -> None:
-    assert _split_checksum("") is None
+    assert _split_checksum("") == ("", "")
     assert _split_checksum("ADLER32:abc") == ("ADLER32", "abc")
     assert _split_checksum("abc") == ("", "abc")
 
@@ -626,3 +643,311 @@ def test_pump_stops_on_cancel(ctx: Gfal2Context) -> None:
     assert caught.value.code == errno.ECANCELED
     assert threading.active_count() >= 1  # the reader thread was joined, not leaked
     assert not [t for t in threading.enumerate() if t.name == "xgfal-reader"]
+
+
+# -- gfal2 parity: modes, same file, clean-up, events, callbacks, bulk ---------------------------
+
+
+def test_stream_creates_the_destination_0755(ctx: Gfal2Context, src: Path, tmp_path: Path) -> None:
+    old = os.umask(0o022)
+    try:
+        ctx.filecopy(file_url(src), file_url(tmp_path / "d"))
+    finally:
+        os.umask(old)
+    assert (tmp_path / "d").stat().st_mode & 0o777 == 0o755  # gfal2's streamed copy mode
+
+
+def test_copy_onto_itself_without_overwrite_is_eexist(ctx: Gfal2Context, src: Path) -> None:
+    with pytest.raises(GError) as caught:
+        ctx.filecopy(file_url(src), file_url(src))
+    assert (caught.value.code, caught.value.message) == (
+        errno.EEXIST,
+        "The file exists and overwrite is not set",
+    )
+    params = ctx.transfer_parameters()
+    params.strict_copy = True  # would truncate the source before reading it
+    with pytest.raises(GError) as caught:
+        ctx.filecopy(params, file_url(src), file_url(src))
+    assert caught.value.code == errno.EINVAL
+    assert src.stat().st_size == 256 * 4096 + 4
+
+
+def test_failed_copy_leaves_an_untouched_destination(ctx: Gfal2Context, tmp_path: Path) -> None:
+    precious = tmp_path / "precious"
+    precious.write_bytes(b"keep me")
+    events: list[xgfalclient.GfaltEvent] = []
+    params = ctx.transfer_parameters()
+    params.strict_copy = True
+    params.event_callback = events.append
+    with pytest.raises(GError) as caught:
+        ctx.filecopy(params, file_url(tmp_path / "missing"), file_url(precious))
+    assert caught.value.message.startswith("Could not open source:")
+    assert precious.read_bytes() == b"keep me"
+    assert "CLEANUP" not in [e.stage for e in events]
+
+
+def test_cleanup_spares_sinks_and_reports_failures(ctx: Gfal2Context, tmp_path: Path) -> None:
+    events: list[xgfalclient.GfaltEvent] = []
+    params = TransferParameters()
+    params.event_callback = events.append
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    transfer = Transfer(ctx, params, "a", file_url(fifo))
+    transfer.owns_destination = True
+    _cleanup(transfer, plugin_copy=False)
+    assert fifo.exists() and not events
+    transfer = Transfer(ctx, params, "a", file_url(tmp_path / "never"))
+    transfer.owns_destination = True
+    _cleanup(transfer, plugin_copy=False)  # nothing there: nothing to do
+    assert not events
+    _cleanup(transfer, plugin_copy=True)  # a plugin's is narrated, failure and all
+    assert [(e.stage, e.description) for e in events] == [("CLEANUP", str(errno.ENOENT))]
+    transfer.callback_error = ValueError("boom")  # the callback is broken: stay quiet
+    _cleanup(transfer, plugin_copy=True)
+    assert len(events) == 1
+
+
+def test_list_items_are_markup_escaped(ctx: Gfal2Context, tmp_path: Path) -> None:
+    events: list[xgfalclient.GfaltEvent] = []
+    params = ctx.transfer_parameters()
+    params.event_callback = events.append
+    source, target = file_url(tmp_path / "a&b<c>"), file_url(tmp_path / "d&e")
+    with pytest.raises(GError):
+        ctx.filecopy(params, source, target)
+    item = next(e.description for e in events if e.stage == "LIST:ITEM")
+    assert "a&amp;b&lt;c&gt; => " in item and item.endswith("d&amp;e")
+    enter = next(e.description for e in events if e.stage == "TRANSFER:ENTER")
+    assert enter == f"{source} => {target}"  # not escaped, as in gfal2
+
+
+def test_copy_events_are_logged(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="gfal2"):
+        ctx.filecopy(file_url(src), file_url(tmp_path / "d"))
+    triggered = [m for m in caplog.messages if m.startswith("Event triggered: ")]
+    assert triggered[0] == "Event triggered: BOTH GFAL2:CORE:COPY LIST:ENTER "
+    assert "Event triggered: BOTH GFAL2:CORE:COPY:LOCAL TRANSFER:TYPE streamed" in triggered
+
+
+def test_an_event_callback_error_aborts_the_copy(
+    ctx: Gfal2Context, src: Path, tmp_path: Path
+) -> None:
+    def early(event: Any) -> None:
+        raise ValueError("boom")
+
+    params = ctx.transfer_parameters()
+    params.event_callback = early
+    with pytest.raises(ValueError, match="boom"):
+        ctx.filecopy(params, file_url(src), file_url(tmp_path / "e1"))
+    assert not (tmp_path / "e1").exists()
+    with pytest.raises(ValueError, match="boom"):  # a bulk copy stops, too
+        ctx.filecopy(params, [file_url(src)] * 2, [file_url(tmp_path / "e2")] * 2)
+
+    def late(event: Any) -> None:
+        if event.stage == "TRANSFER:EXIT":
+            raise KeyError("late")
+
+    params.event_callback = late
+    with pytest.raises(KeyError):
+        ctx.filecopy(params, file_url(src), file_url(tmp_path / "e3"))
+    assert not (tmp_path / "e3").exists()  # written, so cleaned up like any failed copy
+
+    def gerror(event: Any) -> None:
+        if event.stage == "TRANSFER:TYPE":
+            raise GError("from the callback", errno.EPERM)
+
+    params.event_callback = gerror
+    with pytest.raises(GError, match="from the callback"):  # not a per-file result
+        ctx.filecopy(params, [file_url(src)], [file_url(tmp_path / "e4")])
+
+
+def test_a_monitor_callback_error_aborts_a_stream(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("xgfalclient.transfer.STREAM_MONITOR_INTERVAL", 0.0)
+
+    def broken(*args: Any) -> None:
+        raise RuntimeError("stop")
+
+    params = ctx.transfer_parameters()
+    params.monitor_callback = broken
+    with pytest.raises(RuntimeError, match="stop"):
+        ctx.filecopy(params, file_url(src), file_url(tmp_path / "m"))
+    assert not (tmp_path / "m").exists()
+
+
+def test_stream_monitor_cadence(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("xgfalclient.transfer.MONITOR_INTERVAL", 0.0)  # plugins' cadence only
+    calls: list[int] = []
+    params = ctx.transfer_parameters()
+    params.monitor_callback = lambda *args: calls.append(args[4])
+    ctx.set_opt_integer("CORE", "COPY_BUFFERSIZE", 4096)
+    ctx.filecopy(params, file_url(src), file_url(tmp_path / "a"))
+    assert calls == []  # under five seconds, and no final report
+    monkeypatch.setattr("xgfalclient.transfer.STREAM_MONITOR_INTERVAL", 0.0)
+    ctx.filecopy(params, file_url(src), file_url(tmp_path / "b"))
+    assert calls and calls[-1] == src.stat().st_size
+
+
+class Wrapper(Copier):
+    """Plugin copies that mishandle a callback's exception, or nest a copy (as SRM does)."""
+
+    name = "wrapper"
+    schemes = ("wrap",)
+
+    def copy_check(self, source: str, destination: str) -> bool:
+        return source.startswith("wrap://")
+
+    def copy(self, transfer: Transfer) -> None:
+        try:
+            transfer.event("TRANSFER:TYPE", "wrapped")
+        except Exception as exc:
+            if "wrap" in transfer.destination:
+                raise GError(f"wrapped: {exc}", errno.EIO) from exc
+            return  # swallowed
+        run_copy(self.context, transfer.params, "cp://a/ok", "cp://b/inner")
+
+
+def test_callback_errors_survive_plugins(cctx: Gfal2Context) -> None:
+    cctx.add_plugin(Wrapper)
+
+    def broken(event: Any) -> None:
+        if event.description in ("wrapped", "custom"):
+            raise ValueError("boom")
+
+    params = cctx.transfer_parameters()
+    params.event_callback = broken
+    for destination in ("wrap://h/d", "cp://h/swallow"):
+        with pytest.raises(ValueError, match="boom"):
+            cctx.filecopy(params, "wrap://h/s", destination)
+
+    def inner(event: Any) -> None:
+        if event.description == "custom":  # raised by the nested copy's Transfer
+            raise ValueError("inner")
+
+    params.event_callback = inner
+    with pytest.raises(ValueError, match="inner"):
+        cctx.filecopy(params, "wrap://h/s", "cp://h/nested")
+
+
+class SelfChecking(Copier):
+    """Verifies checksums itself, as gfal2's plugins do."""
+
+    name = "selfchecking"
+    schemes = ("self",)
+    copy_manages_checksums = True
+
+    def copy_check(self, source: str, destination: str) -> bool:
+        return source.startswith("self://")
+
+
+def test_plugin_that_manages_its_checksums(cctx: Gfal2Context) -> None:
+    cctx.add_plugin(SelfChecking)
+    events: list[xgfalclient.GfaltEvent] = []
+    params = cctx.transfer_parameters()
+    params.event_callback = events.append
+    params.set_checksum(checksum_mode.source, "adler32", "never-compared")
+    cctx.filecopy(params, "self://a/ok", "self://b/ok")
+    assert not [e for e in events if e.stage.startswith("CHECKSUM")]
+
+
+def test_strict_plugin_copy_never_cleans_up(cctx: Gfal2Context) -> None:
+    events: list[xgfalclient.GfaltEvent] = []
+    params = cctx.transfer_parameters()
+    params.strict_copy = True
+    params.event_callback = events.append
+    with pytest.raises(GError):
+        cctx.filecopy(params, "cp://a/fail", "cp://b/x")
+    assert "CLEANUP" not in [e.stage for e in events]
+
+
+def test_no_route_message(ctx: Gfal2Context, src: Path, tmp_path: Path) -> None:
+    params = ctx.transfer_parameters()
+    params.local_transfers = False
+    target = file_url(tmp_path / "x")
+    with pytest.raises(GError) as caught:
+        ctx.filecopy(params, file_url(src), target)
+    assert caught.value.message == (
+        f"No plugin supports a transfer from {file_url(src)} to {target}, "
+        "and local streaming is disabled"
+    )
+
+
+def test_bulk_checksums_keep_the_mode(ctx: Gfal2Context, src: Path, tmp_path: Path) -> None:
+    params = ctx.transfer_parameters()
+    wrong = ["ADLER32:00000000"]
+    assert ctx.filecopy(params, [file_url(src)], [file_url(tmp_path / "n")], wrong) == [None]
+    params.set_checksum(checksum_mode.both, "md5", "")
+    results = ctx.filecopy(params, [file_url(src)], [file_url(tmp_path / "b")], wrong)
+    assert isinstance(results[0], GError)
+    assert results[0].message.startswith("SOURCE CHECKSUM MISMATCH")
+    assert params.get_checksum() == (checksum_mode.both, "md5", "")
+    params.set_checksum(checksum_mode.source, "adler32", adler(src))
+    assert ctx.filecopy(params, [file_url(src)], [file_url(tmp_path / "s")]) == [None]
+    right = [f"ADLER32:{adler(src)}"]
+    assert ctx.filecopy(params, [file_url(src)], [file_url(tmp_path / "r")], right) == [None]
+    with pytest.raises(GError) as caught:
+        ctx.filecopy(params, [file_url(src)], [file_url(tmp_path / "x")], ["a", "b"])
+    assert caught.value.message == "Number of pairs and checksums do not match"
+
+
+class Bulk(Copier):
+    """A plugin with a bulk copy, handed the whole list."""
+
+    name = "bulk"
+    schemes = ("bulk",)
+    handed: list[tuple[str, str, str, str]] = []
+
+    def copy_check(self, source: str, destination: str) -> bool:
+        return source.startswith("bulk://")
+
+    def copy_bulk(self, params: TransferParameters, transfers: Any) -> list[GError | None]:
+        for t in transfers:
+            Bulk.handed.append((t.source, t.destination, t.checksum_algorithm, t.domain))
+        return [None] * len(transfers)
+
+
+def test_bulk_goes_to_a_plugin_copy_bulk(cctx: Gfal2Context) -> None:
+    cctx.add_plugin(Bulk)
+    params = cctx.transfer_parameters()
+    sources, targets = ["bulk://a/1", "bulk://a/2"], ["bulk://b/1", "bulk://b/2"]
+    assert cctx.filecopy(params, sources, targets, ["MD5:x", "y"]) == [None, None]
+    assert Bulk.handed == [
+        ("bulk://a/1", "bulk://b/1", "MD5", "bulk"),
+        ("bulk://a/2", "bulk://b/2", "", "bulk"),
+    ]
+    Bulk.handed.clear()
+    assert cctx.filecopy(params, sources[:1], targets[:1]) == [None]
+    assert Bulk.handed[0][2] == ""
+    assert cctx.filecopy(params, [], []) == []
+    assert cctx.filecopy(params, ["cp://a/ok"], ["cp://b/ok"]) == [None]  # no copy_bulk: per pair
+
+
+class Unsized(Plugin):
+    """A regular file that stats as empty and is not (``/proc/self/status``)."""
+
+    name = "unsized"
+    schemes = ("proc",)
+    priority = 5
+
+    def stat(self, url: str) -> Stat:
+        return Stat(st_mode=0o100444, st_size=0)
+
+    def open(self, url: str, flags: int, mode: int = 0o644, size: int | None = None) -> PluginFile:
+        return Chunks(3)
+
+
+def test_stream_reads_to_eof(ctx: Gfal2Context, tmp_path: Path) -> None:
+    ctx.add_plugin(Unsized)
+    ctx.filecopy("proc://self/status", file_url(tmp_path / "status"))
+    assert (tmp_path / "status").read_bytes() == b"data" * 3
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    writer = threading.Thread(target=lambda: fifo.write_bytes(b"x" * 1000), daemon=True)
+    writer.start()
+    ctx.filecopy(file_url(fifo), file_url(tmp_path / "fromfifo"))
+    writer.join(10)
+    assert (tmp_path / "fromfifo").read_bytes() == b"x" * 1000

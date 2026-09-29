@@ -122,6 +122,7 @@ _SURL = arg("surl", action="store", type=surl, nargs="?", help="Site URL")
 
 SPECS = {
     "bringonline": Spec(
+        "bringonline",
         "Execute bring online",
         [
             arg(
@@ -152,8 +153,11 @@ SPECS = {
         bringonline,
     ),
     # "Execute bring online" is gfal2-util's (copied) description of archivepoll too.
-    "archivepoll": Spec("Execute bring online", [_POLLING, _FROM_FILE, _SURL], archivepoll),
+    "archivepoll": Spec(
+        "archivepoll", "Execute bring online", [_POLLING, _FROM_FILE, _SURL], archivepoll
+    ),
     "evict": Spec(
+        "evict",
         "Evict file from a disk buffer",
         [
             arg("file", action="store", type=surl, help="URI to the file to be evicted"),
@@ -168,3 +172,5 @@ SPECS = {
         evict,
     ),
 }
+#: gfal2-util's deprecated name for bringonline; run() prints the notice first.
+SPECS["legacy-bringonline"] = SPECS["bringonline"]

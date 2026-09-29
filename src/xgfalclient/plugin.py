@@ -22,9 +22,9 @@ import errno
 import logging
 import os
 from collections.abc import Iterator, Sequence
-from typing import TYPE_CHECKING, Any, ClassVar, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Union
 
-from .errors import GError, unsupported
+from .errors import GError, from_oserror, unsupported
 from .types import Stat
 from .url import scheme_of
 
@@ -36,6 +36,7 @@ __all__ = [
     "Plugin",
     "PluginFile",
     "StagingResult",
+    "DirEntry",
     "OPERATIONS",
     "O_RDONLY",
     "O_WRONLY",
@@ -60,6 +61,11 @@ O_ACCMODE_MASK = os.O_WRONLY | os.O_RDWR
 #: A per-URL staging outcome: ``True`` is on disk now, ``False`` is still
 #: queued, and a ``GError`` is a failure for that URL alone.
 StagingResult = Union[bool, GError]
+
+#: One ``opendir`` entry: ``(name, stat-or-None)``, or ``(name, stat-or-None,
+#: d_type)`` when the listing knows the entry's own type - a symbolic link is
+#: ``DT_LNK`` there, though its stat describes the target.
+DirEntry = Union[tuple[str, Optional[Stat]], tuple[str, Optional[Stat], int]]
 
 #: Every overridable operation, by method name.
 OPERATIONS = (
@@ -159,8 +165,8 @@ class PluginFile:
             target = end + offset
         else:
             raise GError(f"Invalid whence {whence}", errno.EINVAL)
-        if target < 0:
-            raise GError("Invalid argument", errno.EINVAL)
+        if target < 0:  # worded as gfal2's file plugin reports lseek's EINVAL
+            raise from_oserror(OSError(errno.EINVAL, "Invalid argument"))
         self.position = target
         return target
 
@@ -203,6 +209,9 @@ class Plugin:
     #: LFC registers another replica), so the core neither refuses, deletes
     #: nor cleans up the destination.
     copy_manages_destination: ClassVar[bool] = False
+    #: True if :meth:`copy` verifies source/destination checksums itself
+    #: (gfal2's gridftp and srm plugins do), so the core must not.
+    copy_manages_checksums: ClassVar[bool] = False
 
     def __init__(self, context: Gfal2Context) -> None:
         self.context = context
@@ -254,7 +263,8 @@ class Plugin:
 
     # -- namespace ---------------------------------------------------------------
 
-    def access(self, url: str, mode: int) -> None:
+    def access(self, url: str, mode: int) -> int | None:
+        """``None`` (or ``0``) for accessible; gfal2's mock answers ``1``, passed through."""
         raise NotImplementedError
 
     def chmod(self, url: str, mode: int) -> None:
@@ -280,8 +290,8 @@ class Plugin:
     def rmdir(self, url: str) -> None:
         raise NotImplementedError
 
-    def opendir(self, url: str) -> Iterator[tuple[str, Stat | None]]:
-        """Entries as ``(name, stat-or-None)``; ``None`` when a listing is names only."""
+    def opendir(self, url: str) -> Iterator[DirEntry]:
+        """Entries as ``(name, stat-or-None[, d_type])``; ``None`` when a listing is names only."""
         raise NotImplementedError
 
     def listdir(self, url: str) -> list[str]:

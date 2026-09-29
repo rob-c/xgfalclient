@@ -999,7 +999,8 @@ def test_release_and_abort(ctx: xgfalclient.Gfal2Context, server: FakeServer, ba
     assert ctx.release(base + "/data/a.txt") == 0
     assert server.evicted == ["/data/a.txt"]
     assert ctx.abort_bring_online([base + "/data/a.txt"], "prep-0001") == [None]
-    assert server.cancelled_prepares == ["prep-0001"]
+    # gfal2 names the files after the request id: withdraw these, not the lot.
+    assert server.cancelled_prepares == ["prep-0001\n/data/a.txt"]
     _reply(server, c.kXR_prepare, 3010)
     assert ctx.release([base + "/data/a.txt"], "")[0].message == (
         "[ERROR] Error response: permission denied"
@@ -1314,30 +1315,6 @@ def test_an_upload_refuses_a_reply_to_a_write_it_did_not_send() -> None:
     assert upload.torn and upload.inflight == {1: (0, 1)}
 
 
-def test_an_upload_refuses_a_destination_that_appeared(
-    ctx: xgfalclient.Gfal2Context,
-    plugin: XRootDPlugin,
-    server: FakeServer,
-    base: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    (tmp_path / "src").write_bytes(b"new")
-    real = xgfalclient.transfer._prepare_destination
-    monkeypatch.setattr(
-        xgfalclient.transfer, "_prepare_destination", lambda t: server.add_file("/raced", b"x")
-    )
-    failure = _gerror(
-        ctx.filecopy, ctx.transfer_parameters(), f"file://{tmp_path}/src", base + "/raced"
-    )
-    assert failure.code == errno.EEXIST
-    assert failure.message == (
-        "Error on XrdCl::CopyProcess::Run(): [ERROR] Server responded with an error: [3018] "
-        "already exists: /raced (destination)\n"
-    )
-    monkeypatch.setattr(xgfalclient.transfer, "_prepare_destination", real)
-
-
 def test_an_upload_that_comes_up_short_fails(
     ctx: xgfalclient.Gfal2Context, base: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1373,14 +1350,54 @@ def test_a_download_of_a_missing_file(
     ) in seen
 
 
-def test_a_download_into_a_missing_directory(
+def test_a_download_makes_its_local_directory(
     ctx: xgfalclient.Gfal2Context, base: str, tmp_path: Path
 ) -> None:
+    ctx.filecopy(ctx.transfer_parameters(), base + "/data/a.txt", f"file://{tmp_path}/no/x")
+    assert (tmp_path / "no" / "x").read_bytes() == HELLO  # as XrdCl makes it, unasked
+
+
+def test_a_local_destination_that_cannot_be_made(
+    ctx: xgfalclient.Gfal2Context, base: str, tmp_path: Path
+) -> None:
+    (tmp_path / "file").write_bytes(b"")
     params = ctx.transfer_parameters()
-    params.transfer_cleanup = False
-    failure = _gerror(ctx.filecopy, params, base + "/data/a.txt", f"file://{tmp_path}/no/x")
+    seen = _events(params)
+    failure = _gerror(ctx.filecopy, params, base + "/data/a.txt", f"file://{tmp_path}/file/x")
+    assert failure.code == errno.ENOTDIR
+    assert failure.message == (
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Local error: not a directory:  (destination)"
+    )
+    assert (1, "xroot", "CLEANUP", str(errno.ENOTDIR)) in seen
+    # XrdCl opens the source first: when both are wrong, the source is the news.
+    failure = _gerror(ctx.filecopy, params, base + "/nothing", f"file://{tmp_path}/file/x")
     assert failure.code == errno.ENOENT
-    assert failure.message.startswith("Could not open destination")
+    assert failure.message.endswith("no such file or directory: /nothing (source)\n")
+
+
+def test_a_download_onto_an_existing_file_needs_overwrite(
+    ctx: xgfalclient.Gfal2Context, base: str, tmp_path: Path
+) -> None:
+    (tmp_path / "x").write_bytes(b"keep me")
+    params = ctx.transfer_parameters()
+    seen = _events(params)
+    failure = _gerror(ctx.filecopy, params, base + "/data/a.txt", f"file://{tmp_path}/x")
+    assert failure.code == errno.EEXIST
+    assert failure.message == (
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Local error: file exists:  (destination)"
+    )
+    # gfal2 reports 3018 here, fails to recognise it as EEXIST and deletes the
+    # file it refused to overwrite; the file is kept, and nothing is cleaned.
+    assert (tmp_path / "x").read_bytes() == b"keep me"
+    assert not [event for event in seen if event[2] == "CLEANUP"]
+
+
+def test_a_download_into_a_sink(ctx: xgfalclient.Gfal2Context, base: str) -> None:
+    ctx.filecopy(ctx.transfer_parameters(), base + "/data/a.txt", "file:///dev/null")
+    params = ctx.transfer_parameters()
+    seen = _events(params)
+    assert _gerror(ctx.filecopy, params, base + "/nothing", "file:///dev/null").code == 2
+    assert not [event for event in seen if event[2] == "CLEANUP"]  # never unlinked
 
 
 def test_a_destination_error_without_an_errno(
@@ -1400,7 +1417,8 @@ def test_a_destination_error_without_an_errno(
     failure = _gerror(ctx.filecopy, params, base + "/data/a.txt", "file://" + target)
     assert failure.code == errno.EIO
     assert failure.message == (
-        "Could not open destination: errno reported by local system call " + os.strerror(errno.EIO)
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Local error: input/output error:  "
+        "(destination)"
     )
 
 
@@ -1465,8 +1483,8 @@ def test_evicting_the_source_after_a_copy(
     ctx.filecopy(params, base + "/data/a.txt", f"file://{tmp_path}/a")
     assert (0, "xroot", "EVICT", "-1") in seen
     (tmp_path / "up").write_bytes(b"u")
-    ctx.filecopy(params, f"file://{tmp_path}/up", base + "/up")  # a local source is not evicted
-    assert seen.count((0, "xroot", "EVICT", "-1")) == 1
+    ctx.filecopy(params, f"file://{tmp_path}/up", base + "/up")
+    assert seen.count((0, "xroot", "EVICT", "-1")) == 2  # gfal2 tries a local one, and fails
 
 
 # -- third-party copies ----------------------------------------------------------------
@@ -1564,17 +1582,61 @@ def test_progress_is_quiet_until_the_destination_exists(
     assert transfer.transferred == 0
 
 
-def test_a_pull_that_fails(
+def test_a_pull_from_a_missing_source(
     ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
 ) -> None:
-    failure = _gerror(
-        ctx.filecopy, ctx.transfer_parameters(), _url(server) + "/nothing", _url(target) + "/x"
+    params = ctx.transfer_parameters()
+    seen = _events(params)
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/nothing", _url(target) + "/x")
+    # With delegation on, XrdCl leaves the source to a destination that can
+    # pull with the delegated proxy; a stock one cannot, and that is the news.
+    assert failure.code == errno.ENOTSUP
+    assert failure.message == (
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Operation not supported: "
+        "Destination does not support delegation."
     )
+    assert (1, "xroot", "CLEANUP", "0") in seen
+    params.proxy_delegation = False
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/nothing", _url(target) + "/x")
     assert failure.code == errno.ENOENT
     assert failure.message == (
         "Error on XrdCl::CopyProcess::Run(): [ERROR] Server responded with an error: [3011] "
         "no such file or directory: /nothing\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("answer", "delegates"),
+    [("1\n1", True), ("1\ntpcdlg", False), ("1\n0", False), ("1\n", False), ("1", False)],
+)
+def test_whether_a_destination_takes_a_delegated_pull(
+    plugin: XRootDPlugin, target: FakeServer, answer: str, delegates: bool
+) -> None:
+    target.config_values["tpc tpcdlg"] = answer
+    assert plugin._delegates(_url(target) + "/x") is delegates
+    _reply(target, c.kXR_query, 3000)
+    assert plugin._delegates(_url(target) + "/x") is False
+
+
+def test_a_pull_the_destination_fails_is_its_answer(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    _reply(target, c.kXR_sync, 3007, "pull failed")
+    failure = _gerror(
+        ctx.filecopy, ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/x"
+    )
+    assert failure.code == errno.EIO
+    assert failure.message.endswith("[3007] pull failed\n")  # no side named, as in XrdCl
+
+
+def test_a_destination_that_delegates_hears_about_the_source(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    target.config_values["tpc tpcdlg"] = "1\ngsi"
+    failure = _gerror(
+        ctx.filecopy, ctx.transfer_parameters(), _url(server) + "/nothing", _url(target) + "/x"
+    )
+    assert failure.code == errno.ENOENT  # this client cannot delegate: the source is the news
 
 
 def test_a_pull_can_be_cancelled(
@@ -1592,3 +1654,257 @@ def test_a_pull_can_be_cancelled(
     assert failure.code == errno.ECANCELED
     assert (2, "xroot", "TRANSFER:EXIT", "Job finished, Transfer canceled") in seen
     assert time.monotonic() - started < 1.5
+
+
+def test_a_pull_is_narrated_as_xrdcls_copy_job(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    Puller(server, target)
+    params = ctx.transfer_parameters()
+    params.evict = True
+    seen = _events(params)
+    ctx.filecopy(params, _url(server) + "/data/a.txt", _url(target) + "/pulled")
+    source, destination = _url(server).rstrip("/"), _url(target).rstrip("/")
+    assert [event[2:] for event in seen if event[1] == "xroot"] == [
+        (
+            "TRANSFER:ENTER",
+            f"{source}///data/a.txt?xrdcl.intent=tpc => {destination}///pulled?xrdcl.intent=tpc",
+        ),
+        ("TRANSFER:TYPE", "3rd pull"),
+        ("TRANSFER:EXIT", "Job finished, [SUCCESS] "),
+        ("EVICT", "0"),
+    ]
+    assert not [event for event in seen if event[2].startswith("CHECKSUM")]
+
+
+def test_a_copy_jobs_urls(ctx: xgfalclient.Gfal2Context, plugin: XRootDPlugin) -> None:
+    job = plugin._job_url
+    assert job("root://h//p", "") == "root://h:1094///p?xrdcl.intent=tpc"
+    assert job("root://u@h:1095/p?b=2&a=1", "") == ("root://u@h:1095///p?a=1&b=2&xrdcl.intent=tpc")
+    assert job("xroot://[::1]:1094////p%20q", "") == "xroot://[::1]:1094////p q?xrdcl.intent=tpc"
+    assert job("root://h", "") == "root://h:1094///?xrdcl.intent=tpc"
+    assert job("root:///p", "") == "root://:1094///p?xrdcl.intent=tpc"
+    # A space token replaces the CGI there was, as XrdCl's SetParams does.
+    assert job("root://h//p?authz=x", "T0") == "root://h:1094///p?svcClass=T0&xrdcl.intent=tpc"
+    assert job("file:///tmp/f", "") == "file://localhost///tmp/f?xrdcl.intent=tpc"
+    ctx.set_opt_string("XROOTD PLUGIN", "XRD.WANTPROT", "gsi;unix")
+    assert job("roots://h//p", "") == "roots://h:1094///p?xrd.wantprot=gsi,unix&xrdcl.intent=tpc"
+
+
+def test_a_copy_between_other_xrootd_schemes_is_announced_as_streamed(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    Puller(server, target)
+    params = ctx.transfer_parameters()
+    seen = _events(params)
+    source = "xroot" + _url(server)[4:]
+    ctx.filecopy(params, source + "/data/a.txt", _url(target) + "/pulled")
+    assert target.contents("/pulled") == HELLO
+    assert (2, "xroot", "TRANSFER:TYPE", "streamed") in seen
+
+
+def test_a_pull_makes_the_destinations_path(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    Puller(server, target)
+    ctx.filecopy(ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/n/d/x")
+    assert target.contents("/n/d/x") == HELLO  # create_parent unset, as XrdCl ignores it
+    _reply(target, c.kXR_mkdir, 3010)
+    params = ctx.transfer_parameters()
+    params.transfer_cleanup = False
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/m/x")
+    assert failure.code == errno.ENOENT  # the open's own answer, not the mkdir's
+    assert failure.message.endswith("no such file or directory: /m (destination)\n")
+
+
+def test_a_pull_onto_an_existing_file_is_the_destinations_answer(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    target.add_file("/there", b"old")
+    params = ctx.transfer_parameters()
+    seen = _events(params)
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/there")
+    assert failure.code == errno.EEXIST
+    assert failure.message == (
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Server responded with an error: [3018] "
+        "already exists: /there (destination)\n"
+    )
+    assert target.contents("/there") == b"old"
+    assert not [event for event in seen if event[2] == "CLEANUP"]
+
+
+def test_an_upload_onto_an_existing_file(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, base: str, tmp_path: Path
+) -> None:
+    (tmp_path / "src").write_bytes(b"new")
+    failure = _gerror(
+        ctx.filecopy, ctx.transfer_parameters(), f"file://{tmp_path}/src", base + "/data/a.txt"
+    )
+    assert failure.code == errno.EEXIST
+    assert failure.message == (
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Server responded with an error: [3018] "
+        "already exists: /data/a.txt (destination)\n"
+    )
+    assert server.contents("/data/a.txt") == HELLO
+
+
+def test_an_upload_of_a_local_file_that_is_not_there(
+    ctx: xgfalclient.Gfal2Context, base: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    params = ctx.transfer_parameters()
+    seen = _events(params)
+    failure = _gerror(ctx.filecopy, params, f"file://{tmp_path}/none", base + "/up")
+    assert failure.code == errno.ENOENT
+    assert failure.message == (
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Local error: no such file or directory:  "
+        "(source)"
+    )
+    assert (1, "xroot", "CLEANUP", "0") in seen  # removing what is not there is no failure
+    (tmp_path / "src").write_bytes(b"x")
+    from xgfalclient.plugins import file as local
+
+    def refused(*args: Any) -> None:
+        raise PermissionError(errno.EACCES, "no")
+
+    monkeypatch.setattr(local.LocalFile, "__init__", refused)
+    failure = _gerror(ctx.filecopy, params, f"file://{tmp_path}/src", base + "/up")
+    assert failure.code == errno.EACCES
+    assert failure.message.endswith("Local error: permission denied:  (source)")
+
+
+def test_a_clean_up_that_fails_says_why(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, base: str, tmp_path: Path
+) -> None:
+    params = ctx.transfer_parameters()
+    params.set_checksum(checksum_mode.target, "adler32", "1")
+    seen = _events(params)
+    (tmp_path / "src").write_bytes(b"abc")
+    _reply(server, c.kXR_rm, 3010)
+    failure = _gerror(ctx.filecopy, params, f"file://{tmp_path}/src", base + "/up")
+    assert failure.code == errno.EILSEQ
+    assert (1, "xroot", "CLEANUP", str(errno.EACCES)) in seen
+
+
+def test_a_copy_verifies_checksums_as_xrdcl_does(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, base: str, tmp_path: Path
+) -> None:
+    (tmp_path / "src").write_bytes(HELLO)
+    up = f"file://{tmp_path}/src"
+    params = ctx.transfer_parameters()
+    params.overwrite = True
+    seen = _events(params)
+    params.set_checksum(checksum_mode.both, "ADLER32", "00" + ADLER_HELLO.upper())
+    ctx.filecopy(params, up, base + "/c")
+    params.set_checksum(checksum_mode.source, "adler32", "deadbeef")
+    ctx.filecopy(params, up, base + "/c")  # only the target is ever compared
+    params.set_checksum(checksum_mode.target, "adler32", "0")  # nothing left to compare
+    ctx.filecopy(params, up, base + "/c")
+    params.set_checksum(checksum_mode.both, "", "")  # COPY_CHECKSUM_TYPE
+    ctx.filecopy(params, base + "/c", f"file://{tmp_path}/back")
+    assert not [event for event in seen if event[2].startswith("CHECKSUM")]
+    for mode in (checksum_mode.target, checksum_mode.both):
+        params.set_checksum(mode, "adler32", "deadbeef")
+        failure = _gerror(ctx.filecopy, params, up, base + "/c")
+        assert (failure.code, failure.message) == (
+            errno.EILSEQ,
+            "Error on XrdCl::CopyProcess::Run(): [ERROR] CheckSum error",
+        )
+        assert seen[-2:] == [
+            (2, "xroot", "TRANSFER:EXIT", "Job finished, [ERROR] CheckSum error"),
+            (1, "xroot", "CLEANUP", "0"),
+        ]
+
+
+def test_a_source_checksum_that_cannot_be_asked_for(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, base: str, tmp_path: Path
+) -> None:
+    params = ctx.transfer_parameters()
+    params.set_checksum(checksum_mode.both, "sha256", "")
+    _reply(server, c.kXR_query, 3012, "sha256 checksum not supported.")
+    failure = _gerror(ctx.filecopy, params, base + "/data/a.txt", f"file://{tmp_path}/b")
+    assert failure.code == errno.EFAULT
+    assert failure.message == (
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Server responded with an error: [3012] "
+        "sha256 checksum not supported. Got an error while querying the checksum! (source)\n"
+    )
+
+
+def test_a_checksum_query_that_times_out(
+    ctx: xgfalclient.Gfal2Context, base: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def slow(*args: Any) -> bytes:
+        raise TimeoutError("too slow")
+
+    monkeypatch.setattr(XRootDPlugin, "_checksum_answer", slow)
+    params = ctx.transfer_parameters()
+    params.set_checksum(checksum_mode.both, "adler32", "")
+    failure = _gerror(ctx.filecopy, params, base + "/data/a.txt", f"file://{tmp_path}/x")
+    assert (failure.code, failure.message) == (
+        errno.ETIMEDOUT,
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Operation expired: too slow "
+        "Got an error while querying the checksum! (source)",
+    )
+
+
+def test_checksums_the_local_end_cannot_make(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, base: str, tmp_path: Path
+) -> None:
+    params = ctx.transfer_parameters()
+    params.set_checksum(checksum_mode.both, "sha256", "")
+    failure = _gerror(ctx.filecopy, params, base + "/data/a.txt", f"file://{tmp_path}/x")
+    assert failure.code == errno.ENOSYS
+    assert failure.message == (
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Local error: Checksum type sha256 not "
+        "supported for local files (destination)"
+    )
+
+
+def test_a_checksum_answer_that_makes_no_sense(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, base: str, tmp_path: Path
+) -> None:
+    _ok(server, c.kXR_query, b"garbage\x00")
+    params = ctx.transfer_parameters()
+    params.set_checksum(checksum_mode.both, "adler32", "")
+    failure = _gerror(ctx.filecopy, params, base + "/data/a.txt", f"file://{tmp_path}/x")
+    assert failure.code == errno.EIO
+    assert failure.message == (
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Invalid response: "
+        "Could not get the checksum (Wrong format) (source)"
+    )
+
+
+def test_a_callback_that_raises_ends_the_copy_as_it_was_raised(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    base: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("xgfalclient.transfer.MONITOR_INTERVAL", 0.0)
+    server.add_file("/big", os.urandom(1 << 20))
+    params = ctx.transfer_parameters()
+
+    def refuse(*args: Any) -> None:
+        raise KeyError("stop")
+
+    params.monitor_callback = refuse
+    seen = _events(params)
+    with pytest.raises(KeyError):
+        ctx.filecopy(params, base + "/big", f"file://{tmp_path}/big")
+    assert not [event for event in seen if event[2] == "TRANSFER:EXIT"]
+
+
+def test_a_dropped_context_closes_its_idle_filesystems(server: FakeServer, base: str) -> None:
+    """Not the cycle collector: it would finalize the socket under a pooled session (EBADF)."""
+    import gc
+
+    context = xgfalclient.creat_context()
+    context.stat(base + "/data/a.txt")
+    found = context.plugin(base + "/data/a.txt", "stat")
+    assert isinstance(found, XRootDPlugin)
+    [(_, fs)] = [entry for kept in found._idle.values() for entry in kept]
+    router: Any = fs._router
+    assert router._session is not None
+    del found, context, fs
+    gc.collect()
+    assert router._session is None  # handed back to xrdclient's pool, socket and all

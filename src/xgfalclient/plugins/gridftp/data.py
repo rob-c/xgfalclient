@@ -558,17 +558,20 @@ class DataTransfer:
         *,
         active: bool = False,
         done: threading.Event | None = None,
+        getput: bool = False,
     ) -> Reply:
         """Set up the data channel, send ``command``, and see it through.
 
         ``done`` (MODE E receive) says the data is complete even if some of
-        the connections the client offered were never used.
+        the connections the client offered were never used. ``getput`` is a
+        GridFTP v2 ``GET``/``PUT ...;pasv;`` command, which asks for the
+        passive address itself: the server answers ``127`` with it.
         """
         control = self.control
         addresses: list[tuple[str, int]] = []
         if active:
             self._listener = listener = open_active(control, ipv6=options.ipv6)
-        else:
+        elif not getput:
             addresses = passive(control, options)
         try:
             control.send(command)

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import xgfalclient
-from test_srm import GROUP, _fast_polls, fails, root, sctx, srm  # noqa: F401
+from test_srm import GROUP, _fast_polls, _no_bdii, fails, root, sctx, srm  # noqa: F401
 from xgfalclient.errors import GError
 from xgfalclient.plugins.srm import plugin as srm_plugin
 from xgfalclient.testing.srm import SRMServer
@@ -205,7 +205,8 @@ def test_copy_failures(sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Pat
     )
     error = fails(errno.ENOENT, sctx.filecopy, srm.url("/data/f"), srm.url("/no/dir/c"))
     assert error.message.startswith("DESTINATION SRM_PUT_TURL error on the turl  request : ")
-    assert srm.operations()[-2:] == ["srmReleaseFiles", "srmRm"]  # released, cleaned up
+    # No PUT request to abort, nothing written: only the GET is released, as in gfal2.
+    assert srm.operations()[-2:] == ["srmPrepareToPut", "srmReleaseFiles"]
     p, _ = params(dst_spacetoken="NOPE")
     error = fails(
         xgfalclient.plugins.srm.soap.EBADR, sctx.filecopy, p, srm.url("/data/f"), srm.url("/data/c")
@@ -230,8 +231,8 @@ def test_copy_transfer_failure_aborts(
     p, _ = params(timeout=5)
     with pytest.raises(GError):
         sctx.filecopy(p, srm.url("/data/f"), srm.url("/data/c"))
-    ops = srm.operations()
-    assert "srmAbortRequest" in ops and ops[-2:] == ["srmReleaseFiles", "srmRm"]
+    # The PUT is aborted and whatever it left removed, then the GET released.
+    assert srm.operations()[-3:] == ["srmAbortRequest", "srmRm", "srmReleaseFiles"]
 
 
 def test_copy_putdone_failure(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
@@ -268,19 +269,239 @@ def test_copy_monitor(
 
 def test_copy_check(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
     plugin = sctx.plugin(srm.url("/f"), "copy")
+    # gfal2's check: an SRM end, and anything with a scheme at the other.
     assert plugin.copy_check("srm://a/f", "srm://b/f")
     assert plugin.copy_check("file:///f", "srm://b/f")
-    assert not plugin.copy_check("srm://a/f", "davs://b/f")
+    assert plugin.copy_check("srm://a/f", "davs://b/f")
+    assert plugin.copy_check("anything:x", "srm://b/f")
+    assert not plugin.copy_check("srm://a/f", "/local/path")
+    assert not plugin.copy_check("/local/path", "srm://b/f")
     assert not plugin.copy_check("file:///a", "file:///b")
 
 
-def test_https_goes_first_for_https_ends() -> None:
-    order = srm_plugin._for_other_end
-    assert order(["gsiftp", "root", "https"], "srm://a/f", "https://b/f") == [
-        "https",
+def test_the_other_ends_protocol_goes_first() -> None:
+    order = srm_plugin._reorder
+    assert order(["gsiftp", "root", "https"], "https://b/f") == ["https", "root", "gsiftp"]
+    assert order(["gsiftp", "https"], "davs://b/f") == ["https", "gsiftp"]
+    assert order(["file", "gsiftp", "root", "https"], "root://b/f") == [
         "root",
         "gsiftp",
+        "file",
+        "https",
     ]
-    assert order(["gsiftp", "https"], "davs://b/f", "srm://a/f") == ["https", "gsiftp"]
-    assert order(["gsiftp", "root"], "srm://a/f", "https://b/f") == ["gsiftp", "root"]
-    assert order(["gsiftp", "https"], "srm://a/f", "root://b/f") == ["gsiftp", "https"]
+    assert order(["gsiftp", "root"], "https://b/f") == ["gsiftp", "root"]
+    assert order(["gsiftp", "https"], "srm://a/f") == ["gsiftp", "https"]
+    assert order(["gsiftp"], "/no/scheme") == ["gsiftp"]
+
+
+GOOD = "1e720467"  # ADLER32 of "hello world\n"
+
+
+def test_copy_onto_an_existing_file(
+    sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Path
+) -> None:
+    """No existence check: srmPrepareToPut refuses, as it does for gfal2."""
+    (root / "data" / "c").write_bytes(b"old")
+    p, events = params()
+    error = fails(errno.EEXIST, sctx.filecopy, p, srm.url("/data/f"), srm.url("/data/c"))
+    assert error.message == (
+        "DESTINATION SRM_PUT_TURL error on the turl  request : [SE][PrepareToPut]"
+        "[SRM_DUPLICATION_ERROR] The file exists "
+    )
+    assert (root / "data" / "c").read_bytes() == b"old" and "CLEANUP" not in events.stages()
+    assert srm.operations() == ["srmLs", "srmPrepareToGet", "srmPrepareToPut", "srmReleaseFiles"]
+    # With overwrite: srmRm first, which may find nothing.
+    p, events = params(overwrite=True)
+    sctx.filecopy(p, srm.url("/data/f"), srm.url("/data/c"))
+    assert ("DEST", "SRM", "OVERWRITE", f"Deleted {srm.url('/data/c')}") in events.seen
+    sctx.filecopy(p, srm.url("/data/f"), srm.url("/data/d"))
+    srm.inject("srmRm", srm.status_reply("srmRm", "SRM_AUTHORIZATION_FAILURE", "no"))
+    error = fails(errno.EACCES, sctx.filecopy, p, srm.url("/data/f"), srm.url("/data/c"))
+    assert error.message.startswith("DESTINATION OVERWRITE ")
+
+
+def test_copy_parent_failures(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
+    p, _ = params(create_parent=True)
+    with pytest.raises(GError) as caught:
+        sctx.filecopy(p, srm.url("/data/f"), srm.url("/data/f/x/c"))
+    assert caught.value.message.startswith("DESTINATION MAKE_PARENT srm-ifce err: ")
+    error = fails(errno.EINVAL, sctx.filecopy, p, srm.url("/data/f"), srm.url("/"))
+    assert error.message == f"DESTINATION MAKE_PARENT Invalid srm url {srm.url('/')}"
+
+
+def test_copy_checksums(
+    sctx: xgfalclient.Gfal2Context,
+    srm: SRMServer,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    both, source, target = (
+        xgfalclient.checksum_mode.both,
+        xgfalclient.checksum_mode.source,
+        xgfalclient.checksum_mode.target,
+    )
+    src, dst = srm.url("/data/f"), srm.url("/data/c")
+    p, events = params(overwrite=True)
+    p.set_checksum(source, "ADLER32", "deadbeef")
+    error = fails(errno.EIO, sctx.filecopy, p, src, dst)
+    assert error.message == (
+        "SOURCE CHECKSUM MISMATCH User defined checksum and source checksum do not match "
+        f"deadbeef != {GOOD}"
+    )
+    # Inside PREPARE, as in gfal2.
+    assert events.stages()[3:6] == ["PREPARE:ENTER", "CHECKSUM:ENTER", "CHECKSUM:EXIT"]
+    p, events = params(overwrite=True)
+    p.set_checksum(target, "ADLER32", "deadbeef")
+    error = fails(errno.EIO, sctx.filecopy, p, src, dst)
+    assert error.message == (
+        "TRANSFER CHECKSUM MISMATCH User defined checksum and destination checksums do not "
+        f"match deadbeef != {GOOD}"
+    )
+    assert ("DEST", "SRM", "CLEANUP", "0") in events.seen and not (root / "data" / "c").exists()
+    p, events = params(overwrite=True)
+    p.set_checksum(both, "ADLER32", GOOD)
+    sctx.filecopy(p, src, dst)
+    assert events.stages().count("CHECKSUM:ENTER") == 2
+    # The destination checksum against the source's.
+    plugin = sctx.plugin(src, "copy")
+    real = plugin._checksum_of
+
+    def bad_destination(url: str, algorithm: str, fallback: bool) -> str:
+        return "0badf00d" if url == dst else real(url, algorithm, fallback)
+
+    monkeypatch.setattr(plugin, "_checksum_of", bad_destination)
+    p, _ = params(overwrite=True)
+    p.set_checksum(both, "ADLER32", "")
+    error = fails(errno.EIO, sctx.filecopy, p, src, dst)
+    assert error.message == (
+        f"TRANSFER CHECKSUM MISMATCH Source and destination checksums do not match {GOOD} != "
+        "0badf00d"
+    )
+    monkeypatch.setattr(plugin, "_checksum_of", lambda url, a, f: "" if url == dst else GOOD)
+    error = fails(errno.EINVAL, sctx.filecopy, p, src, dst)
+    assert error.message == "DESTINATION CHECKSUM Empty destination checksum"
+
+    def failing(url: str, algorithm: str, fallback: bool) -> str:
+        if not fallback:
+            return ""  # srmLs alone never fails a copy
+        raise GError("broken", errno.EIO)
+
+    monkeypatch.setattr(plugin, "_checksum_of", failing)
+    assert fails(errno.EIO, sctx.filecopy, p, src, dst).message == "SOURCE CHECKSUM broken"
+    sctx.set_opt_boolean(GROUP, "ALLOW_EMPTY_SOURCE_CHECKSUM", True)  # target only now
+    p.set_checksum(both, "ADLER32", GOOD)
+    assert fails(errno.EIO, sctx.filecopy, p, src, dst).message == "DESTINATION CHECKSUM broken"
+
+
+def test_copy_checksum_without_fallback(
+    sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Path, tmp_path: Path
+) -> None:
+    """Without the SOURCE bit only srmLs is asked, and nothing is no failure."""
+    target = xgfalclient.checksum_mode.target
+    p, _ = params(overwrite=True)
+    p.set_checksum(target, "ADLER32", GOOD)
+    sctx.filecopy(p, srm.url("/data/f"), srm.url("/data/c"))
+    srm.checksum_type = "MD5"  # not the type asked for: nothing, then the user's value
+    sctx.filecopy(p, srm.url("/data/f"), srm.url("/data/c"))
+    local = tmp_path / "l"
+    local.write_bytes(b"hello world\n")
+    sctx.filecopy(p, f"file://{local}", srm.url("/data/d"))  # a local source has no srmLs
+    p, _ = params(overwrite=True)
+    p.set_checksum(target, "ADLER32", GOOD)
+    error = fails(errno.ENOENT, sctx.filecopy, p, srm.url("/nope"), srm.url("/data/e"))
+    assert error.message.startswith("SOURCE SRM_GET_TURL ")  # srmLs failed quietly first
+    p, _ = params(overwrite=True)
+    p.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")
+    sctx.filecopy(p, f"file://{local}", srm.url("/data/g"))  # a local source's own checksum
+
+
+def test_copy_cleanup_to_a_local_file(
+    sctx: xgfalclient.Gfal2Context,
+    srm: SRMServer,
+    root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = tmp_path / "out"
+    p, events = params()
+    p.set_checksum(xgfalclient.checksum_mode.target, "ADLER32", "deadbeef")
+    fails(errno.EIO, sctx.filecopy, p, srm.url("/data/f"), f"file://{local}")
+    assert not local.exists() and ("DEST", "SRM", "CLEANUP", "0") in events.seen
+    # A local file that is there already is the core's to refuse, and stays.
+    local.write_bytes(b"mine")
+    p, events = params()
+    fails(errno.EEXIST, sctx.filecopy, p, srm.url("/data/f"), f"file://{local}")
+    assert local.read_bytes() == b"mine" and "CLEANUP" not in events.stages()
+    # ... and a failure before anything moved leaves it alone, where gfal2 removes it.
+    p, events = params(overwrite=True)
+    p.set_checksum(xgfalclient.checksum_mode.source, "ADLER32", "deadbeef")
+    fails(errno.EIO, sctx.filecopy, p, srm.url("/data/f"), f"file://{local}")
+    assert local.read_bytes() == b"mine"
+    # Nothing to remove is no failure.
+    p, events = params()
+    fails(errno.ENOENT, sctx.filecopy, p, srm.url("/data/f"), f"file://{tmp_path}/no/dir")
+    assert ("DEST", "SRM", "CLEANUP", "0") in events.seen
+    # A clean-up that fails says so in its event.
+    real = sctx.unlink
+
+    def unlink(url: str) -> int:
+        if url.startswith("file:"):
+            raise GError("Permission denied", errno.EACCES)
+        return real(url)
+
+    monkeypatch.setattr(sctx, "unlink", unlink)
+    p, events = params(overwrite=True)
+    p.set_checksum(xgfalclient.checksum_mode.target, "ADLER32", "deadbeef")
+    fails(errno.EIO, sctx.filecopy, p, srm.url("/data/f"), f"file://{tmp_path}/new")
+    assert ("DEST", "SRM", "CLEANUP", str(errno.EACCES)) in events.seen
+
+
+def test_copy_without_cleanup(sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Path) -> None:
+    srm.protocols = {"file": f"file://{root}", "gsiftp": "gsiftp://localhost:1"}
+    sctx.set_opt_string_list(GROUP, "TURL_3RD_PARTY_PROTOCOLS", ["gsiftp"])
+    p, events = params(timeout=5, transfer_cleanup=False)
+    with pytest.raises(GError):
+        sctx.filecopy(p, srm.url("/data/f"), srm.url("/data/c"))
+    # The request is still aborted (gfal2 leaves it pending), but nothing is removed.
+    assert srm.operations()[-2:] == ["srmAbortRequest", "srmReleaseFiles"]
+    p, events = params(transfer_cleanup=False)
+    p.set_checksum(xgfalclient.checksum_mode.target, "ADLER32", "deadbeef")
+    sctx.set_opt_string_list(GROUP, "TURL_3RD_PARTY_PROTOCOLS", ["file"])
+    fails(errno.EIO, sctx.filecopy, p, srm.url("/data/f"), srm.url("/data/d"))
+    assert (root / "data" / "d").exists() and "CLEANUP" not in events.stages()
+
+
+def test_copy_fail_nearline_is_exact(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
+    sctx.set_opt_boolean(GROUP, "COPY_FAIL_NEARLINE", True)
+    srm.set_locality("/data/f", "NONE")
+    sctx.filecopy(srm.url("/data/f"), srm.url("/data/c"))
+    srm.set_locality("/data/f", "LOST")
+    error = fails(errno.EIDRM, sctx.filecopy, srm.url("/data/f"), srm.url("/data/d"))
+    assert "[PrepareToGet][SRM_FILE_LOST]" in error.message
+
+
+def test_copy_asks_for_the_other_ends_protocol_first(
+    sctx: xgfalclient.Gfal2Context, srm: SRMServer, tmp_path: Path
+) -> None:
+    sctx.set_opt_string_list(GROUP, "TURL_3RD_PARTY_PROTOCOLS", ["gsiftp", "root", "file"])
+    sctx.filecopy(srm.url("/data/f"), f"file://{tmp_path}/x")
+    get = next(body.decode() for op, body in srm.log if op == "srmPrepareToGet")
+    assert get.index("<stringArray>file</stringArray>") < get.index(
+        "<stringArray>gsiftp</stringArray>"
+    )
+
+
+def test_copy_callback_failure_rolls_back(
+    sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Path
+) -> None:
+    """An event callback that raises stops the copy; the PUT is still rolled back."""
+
+    def callback(event: xgfalclient.GfaltEvent) -> None:
+        if event.stage == "PREPARE:EXIT":
+            raise RuntimeError("stop")
+
+    p, _ = params()
+    p.event_callback = callback
+    with pytest.raises(RuntimeError):
+        sctx.filecopy(p, srm.url("/data/f"), srm.url("/data/c"))
+    assert srm.operations()[-3:] == ["srmAbortRequest", "srmRm", "srmReleaseFiles"]

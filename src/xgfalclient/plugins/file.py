@@ -5,7 +5,13 @@ Only ``file:///absolute/path`` is accepted; gfal2 refuses a host part
 plugin words them (``errno reported by local system call ...``), and the
 checksum types are the three it supports - ADLER32, MD5 and CRC32, the last
 printed in decimal, as gfal2 prints it. Directory listings include ``.`` and
-``..`` because ``readdir`` does.
+``..`` because ``readdir`` does, and their stats follow symbolic links, as
+gfal2's (a ``stat`` per entry) do: a link shows as what it points to, and a
+dangling link fails the long listing with ``ENOENT``, as it does in gfal2.
+
+Files ``ctx.open`` creates are ``0744`` before the umask, the mode gfal2's
+``open`` passes; a FIFO or other unseekable file is read and written in
+order rather than by offset, so the core can stream from ``/proc`` and pipes.
 """
 
 from __future__ import annotations
@@ -19,8 +25,8 @@ from collections.abc import Callable, Iterator
 from typing import Any, TypeVar
 
 from ..errors import GError, from_oserror
-from ..plugin import Plugin, PluginFile
-from ..types import Stat
+from ..plugin import DirEntry, Plugin, PluginFile
+from ..types import DT_UNKNOWN, Stat, dtype_for_mode
 from ..url import scheme_of
 
 __all__ = ["FilePlugin", "LocalFile", "local_path"]
@@ -36,7 +42,10 @@ def local_path(url: str) -> str:
 
 
 class LocalFile(PluginFile):
-    """An open local file: unbuffered, positional, GIL-releasing I/O."""
+    """An open local file: unbuffered, positional, GIL-releasing I/O.
+
+    Errors are worded as gfal2's file plugin words them.
+    """
 
     def __init__(self, url: str, path: str, flags: int, mode: int) -> None:
         super().__init__(url)
@@ -50,31 +59,41 @@ class LocalFile(PluginFile):
         return self._raw.fileno()
 
     def read(self, size: int) -> bytes:
-        data = os.pread(self.fileno(), size, self.position)
-        self.position += len(data)
-        return data
+        buffer = bytearray(size)
+        count = self.readinto(buffer)
+        del buffer[count:]
+        return bytes(buffer)
 
     def readinto(self, buffer: memoryview | bytearray) -> int:
-        self._raw.seek(self.position)
-        count = self._raw.readinto(buffer) or 0
+        if self._seekable:  # by position; a pipe has none and is read in order
+            _os(self._raw.seek, self.position)
+        count: int = _os(self._raw.readinto, buffer) or 0
         self.position += count
         return count
 
     def pread(self, offset: int, size: int) -> bytes:
-        return os.pread(self.fileno(), size, offset)
+        return _os(os.pread, self.fileno(), size, offset)  # type: ignore[no-any-return]
 
     def pwrite(self, data: bytes | bytearray | memoryview, offset: int) -> int:
         view = memoryview(data)
         done = 0
         while done < len(view):
             if self._seekable:
-                done += os.pwrite(self.fileno(), view[done:], offset + done)
+                done += _os(os.pwrite, self.fileno(), view[done:], offset + done)
             else:
-                done += os.write(self.fileno(), view[done:])
+                done += _os(os.write, self.fileno(), view[done:])
         return done
 
+    def lseek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        # The real lseek(2), for its errors (EINVAL, ESPIPE on a pipe); the
+        # descriptor's offset is synced first, as reads go by position.
+        fd = self.fileno()
+        _os(os.lseek, fd, self.position, os.SEEK_SET)
+        self.position = _os(os.lseek, fd, offset, whence)
+        return self.position
+
     def size(self) -> int:
-        return os.fstat(self.fileno()).st_size
+        return _os(os.fstat, self.fileno()).st_size
 
     def close(self) -> None:
         if not self.closed:
@@ -107,10 +126,20 @@ class FilePlugin(Plugin):
         return Stat.from_os(_os(os.lstat, local_path(url)))
 
     def access(self, url: str, mode: int) -> None:
+        # os.access only says yes or no; access(2)'s errno is recovered in
+        # its order: the path (ENOENT, ENOTDIR, ELOOP...), then the mode
+        # word, then a read-only filesystem, then the permission bits.
         path = local_path(url)
-        if not os.access(path, mode):
-            code = errno.ENOENT if not os.path.lexists(path) else errno.EACCES
-            raise from_oserror(OSError(code, os.strerror(code)))
+        _os(os.stat, path)
+        if mode & ~(os.R_OK | os.W_OK | os.X_OK):
+            code = errno.EINVAL
+        elif os.access(path, mode):
+            return
+        elif mode & os.W_OK and _os(os.statvfs, path).f_flag & os.ST_RDONLY:
+            code = errno.EROFS
+        else:
+            code = errno.EACCES
+        raise from_oserror(OSError(code, os.strerror(code)))
 
     def chmod(self, url: str, mode: int) -> None:
         _os(os.chmod, local_path(url), mode)
@@ -137,28 +166,34 @@ class FilePlugin(Plugin):
         destination = local_path(target) if target.startswith("file://") else target
         _os(os.symlink, destination, local_path(link))
 
-    def opendir(self, url: str) -> Iterator[tuple[str, Stat | None]]:
+    def opendir(self, url: str) -> Iterator[DirEntry]:
         path = local_path(url)
         entries = list(_os(os.scandir, path))
         return self._entries(path, entries)
 
-    def _entries(
-        self, path: str, entries: list[os.DirEntry[str]]
-    ) -> Iterator[tuple[str, Stat | None]]:
+    def _entries(self, path: str, entries: list[os.DirEntry[str]]) -> Iterator[DirEntry]:
         yield ".", self.stat("file://" + path)
         yield "..", self.stat("file://" + os.path.join(path, ".."))
         for entry in entries:
+            # d_type is the entry's own, as readdir reports it: a link is DT_LNK
+            # although its stat (followed, as gfal2's) describes the target.
             try:
-                yield entry.name, Stat.from_os(entry.stat(follow_symlinks=False))
+                kind = dtype_for_mode(entry.stat(follow_symlinks=False).st_mode)
             except OSError:
-                yield entry.name, None  # vanished since the listing was taken
+                kind = DT_UNKNOWN  # vanished since the listing was taken
+            try:
+                yield entry.name, Stat.from_os(entry.stat()), kind
+            except OSError:
+                # Dangling, looping, or vanished: a long listing stats it
+                # again and fails as gfal2's does.
+                yield entry.name, None, kind
 
     def listdir(self, url: str) -> list[str]:
         return [".", "..", *(entry.name for entry in _os(os.scandir, local_path(url)))]
 
     # -- I/O ---------------------------------------------------------------------
 
-    def open(self, url: str, flags: int, mode: int = 0o644, size: int | None = None) -> PluginFile:
+    def open(self, url: str, flags: int, mode: int = 0o744, size: int | None = None) -> PluginFile:
         try:
             return LocalFile(url, local_path(url), flags, mode)
         except OSError as exc:
@@ -186,7 +221,7 @@ class FilePlugin(Plugin):
         return list(_os(lister, local_path(url)))
 
     def checksum(self, url: str, algorithm: str, offset: int, length: int) -> str:
-        kind = algorithm.strip().lower()
+        kind = algorithm.lower()
         if kind not in ("adler32", "crc32", "md5"):
             raise GError(f"Checksum type {algorithm} not supported for local files", errno.ENOSYS)
         # os.open, not open(): like gfal2, a directory opens and then fails to

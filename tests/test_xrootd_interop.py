@@ -200,7 +200,10 @@ def run(mod, tag):
             [e.side, e.domain, e.stage, e.description]
             if e.stage == "TRANSFER:TYPE" else [e.side, e.domain, e.stage])
         for k, v in kw.items():
-            setattr(p, k, v)
+            if k == "checksum":
+                p.set_checksum(mod.checksum_mode.target, "ADLER32", v)
+            else:
+                setattr(p, k, v)
         try:
             ctx.filecopy(p, s, d)
             result = "ok"
@@ -218,6 +221,10 @@ def run(mod, tag):
     t("tpc size", lambda: ctx.stat(R + "/tpc.bin").st_size)
     copy("tpc parent", R + "/up.bin", R2 + "/new/deep/tpc.bin", create_parent=True)
     copy("missing source", R + "/nothere", "file:///tmp/x_%s.bin" % tag)
+    copy("tpc no parent", R + "/up.bin", R2 + "/new2/deep/tpc.bin")
+    copy("tpc missing source", R + "/nothere", R2 + "/nothere.bin")
+    copy("tpc bad checksum", R + "/up.bin", R2 + "/bad.bin", checksum="deadbeef")
+    copy("tpc exists", R + "/up.bin", R2 + "/tpc.bin")
     return out
 
 
@@ -263,7 +270,9 @@ def serving() -> Iterator[tuple[str, Path]]:
             "run", "-d", "--rm", "--name", name,
             "-p", "127.0.0.1::1094",
             "-e", "PYTHONPYCACHEPREFIX=/tmp/pyc",
-            "-v", f"{ROOT / 'src'}:/src/xgfalclient/src:ro",
+            # The package alone: src/ also holds the gfal2 shim, which would
+            # shadow the real gfal2 and compare this package with itself.
+            "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
             "-v", f"{_xrdclient_src()}:/src/xrdclient/src:ro",
             "-v", f"{io_dir}:/io",
             IMAGE, "sleep", "infinity",

@@ -136,6 +136,7 @@ def token(cmd: Command) -> int:
 
 SPECS = {
     "mkdir": Spec(
+        "mkdir",
         "Makes directories. By default, it sets file mode 0755.",
         [
             arg("-m", "--mode", action="store", type=int, default=755, help="display hidden files"),
@@ -150,11 +151,13 @@ SPECS = {
         mkdir,
     ),
     "save": Spec(
+        "save",
         "Reads from stdin and writes to a file. If the file exists, it will be overwritten",
         [arg("file", action="store", type=surl, help="uri of the file to be written")],
         save,
     ),
     "cat": Spec(
+        "cat",
         "Sends to stdout the contents of files",
         [
             arg(
@@ -174,6 +177,7 @@ SPECS = {
         cat,
     ),
     "xattr": Spec(
+        "xattr",
         "Gets or set the extended attributes of files and directories",
         [
             arg("file", action="store", type=surl, help="file uri"),
@@ -187,6 +191,7 @@ SPECS = {
         xattr,
     ),
     "sum": Spec(
+        "sum",
         "Calculates the checksum of a file",
         [
             arg(
@@ -205,11 +210,13 @@ SPECS = {
         checksum,
     ),
     "stat": Spec(
+        "stat",
         "Stats a file",
         [arg("file", action="store", type=surl, help="uri of the file to be stat")],
         stat_,
     ),
     "rename": Spec(
+        "rename",
         "Renames files or directories",
         [
             arg("source", action="store", type=surl, help="original file name"),
@@ -218,6 +225,7 @@ SPECS = {
         rename,
     ),
     "chmod": Spec(
+        "chmod",
         "Change the permissions of a file",
         [
             arg("mode", action="store", type=str, help="new mode, in octal"),
@@ -231,6 +239,7 @@ SPECS = {
         chmod,
     ),
     "token": Spec(
+        "token",
         "Retrieve a SE-issued token",
         [
             arg("--issuer", action="store", type=str, help="token issuer URL"),

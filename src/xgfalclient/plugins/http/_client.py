@@ -26,14 +26,18 @@ the plugin needs, on nothing but :mod:`http.client`:
   the three Python-level wrappers ``HTTPResponse.readinto`` goes through for
   each record. That time is spent holding the GIL, and parallel download
   streams otherwise queue for it;
-* credentials are gfal2's, in gfal2's order: a token in the URL
-  (``authz=``/``access_token=``), then the context's bearer token, then S3
-  keys, then ``USER``/``PASSWD`` for Basic auth - and otherwise the X.509
-  proxy in the TLS handshake. A request that carries a token does not also
-  present the proxy, again as gfal2 does.
+* credentials are gfal2's (``get_credentials``): the X.509 proxy is
+  presented in every TLS handshake, whatever else is sent, and on top of it
+  ``s3``/``gcloud`` requests are signed, ``swift`` ones carry the
+  ``X-Auth-Token``, ``cs3`` ones ``[BEARER] TOKEN``, and HTTP/WebDAV ones the
+  bearer token found for the URL - a URL-prefix credential, then one keyed
+  by the bare host name (FTS sets those), then ``[BEARER] TOKEN`` - or else
+  ``USER``/``PASSWD`` Basic auth. A token in the URL's query (``authz=``)
+  is left where it is, as davix leaves it.
 
 HTTP statuses are *not* raised here: every caller words its own errors the
-way gfal2 does for that operation, with :func:`status_error`.
+way gfal2 does for that operation, with :func:`status_error`, which reads a
+status as davix's ``httpcodeToDavixError`` and gfal2's ``davix2errno`` do.
 """
 
 from __future__ import annotations
@@ -55,7 +59,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, BinaryIO, Protocol, Union, cast
 
 from ..._compat import TIMEOUTS
-from ...errors import ECOMM, GError, errno_for_http
+from ...creds import BEARER
+from ...errors import ECOMM, GError
 from ...url import URL, parse, scheme_of
 
 if TYPE_CHECKING:
@@ -63,6 +68,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BLOCK",
+    "OBJECT_STORES",
     "Body",
     "FileBody",
     "HTTPClient",
@@ -70,7 +76,8 @@ __all__ = [
     "Response",
     "Target",
     "TransportError",
-    "http_errno",
+    "config_group",
+    "davix_status",
     "status_error",
     "status_text",
     "transport_error",
@@ -89,30 +96,23 @@ CONTINUE_WAIT = 1.0
 #: Redirect statuses, and how many hops are followed before giving up.
 REDIRECTS = frozenset({301, 302, 303, 307, 308})
 MAX_REDIRECTS = 10
+#: Schemes whose requests are signed (or carry a Swift token) instead of a bearer token.
+OBJECT_STORES = frozenset({"s3", "s3s", "gcloud", "gclouds", "swift", "swifts"})
 #: Idle connections kept per endpoint.
 MAX_IDLE = 16
-#: Query keys that carry a bearer token and never go on the wire in the URL.
-TOKEN_KEYS = ("authz", "access_token")
-
 _WIRE = {
     "http": "http",
     "dav": "http",
     "s3": "http",
     "gcloud": "http",
+    "swift": "http",
+    "cs3": "http",
     "https": "https",
     "davs": "https",
     "s3s": "https",
     "gclouds": "https",
-}
-
-#: The words davix uses for the statuses gfal2 users see most, so messages
-#: read ``HTTP 404 : File not found`` exactly as they do with gfal2.
-_PHRASES = {
-    401: "Authentication Error",
-    403: "Permission refused",
-    404: "File not found",
-    405: "Method Not Allowed",
-    409: "Conflict",
+    "swifts": "https",
+    "cs3s": "https",
 }
 
 
@@ -121,35 +121,27 @@ def wire_scheme(scheme: str) -> str:
     return _WIRE.get(scheme.partition("+")[0], "")
 
 
-def _query_without_tokens(query: str) -> str:
-    if not query:
-        return ""
-    kept = [
-        item
-        for item in query.split("&")
-        if urllib.parse.unquote_plus(item.partition("=")[0]) not in TOKEN_KEYS
-    ]
-    return "&".join(kept)
-
-
-def url_token(url: URL) -> str | None:
-    """A token carried in the URL's query (``authz=`` or ``access_token=``)."""
-    for key, value in url.query_items():
-        if key in TOKEN_KEYS and value:
-            return value[len("Bearer ") :].strip() if value.startswith("Bearer ") else value
-    return None
-
-
 def wire_url(url: str) -> str:
-    """``url`` as another server must see it: ``http(s)://``, and no token.
+    """``url`` as another server must see it: ``http(s)://``, query and all.
 
     What goes in a ``Destination`` or ``Source`` header is read by a server,
     not by gfal2, and ``davs://`` means nothing to it.
     """
     parsed = parse(url)
-    query = _query_without_tokens(parsed.query)
     text = f"{wire_scheme(parsed.scheme)}://{parsed.netloc}{parsed.path or '/'}"
-    return f"{text}?{query}" if query else text
+    return f"{text}?{parsed.query}" if parsed.query else text
+
+
+def config_group(url: str) -> str:
+    """gfal2's per-endpoint group for ``url``: ``DAV:HOST`` for ``davs://host/...``.
+
+    The protocol (``+3rd`` dropped) loses one trailing ``s``, and the whole
+    name is upper-cased: ``https`` and ``http`` share ``[HTTP:HOST]``.
+    """
+    parsed = parse(url)
+    scheme = parsed.scheme.partition("+")[0]
+    scheme = scheme[:-1] if scheme.endswith("s") else scheme
+    return f"{scheme}:{parsed.host}".upper()
 
 
 _ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
@@ -190,7 +182,7 @@ class Target:
         # S3 signs the path exactly as its canonical form spells it, so the
         # wire must use that spelling too.
         quoted = urllib.parse.quote(urllib.parse.unquote(raw), safe="/") if s3 else _quote_path(raw)
-        query = _query_without_tokens(parsed.query)
+        query = parsed.query
         return cls(scheme, parsed.host, port, f"{quoted}?{query}" if query else quoted, parsed)
 
     @property
@@ -229,37 +221,55 @@ class TransportError(GError):
     """A GError that came from the network, not from the server's answer."""
 
 
-def http_errno(status: int) -> int:
-    """The errno gfal2 reports for ``status``.
+#: The scope in which davix reads 405 and 409 as a directory question.
+MKDIR = "mkdir"
 
-    The one difference from :data:`~xgfalclient.errors.HTTP_ERRNO` is 403:
-    davix calls it "permission refused" and gfal2 reports ``EPERM`` for it,
-    for every operation (checked against gfal2 2.23.5 and XrdHttp).
+_EHOSTDOWN = getattr(errno, "EHOSTDOWN", errno.EIO)
+
+#: davix's ``httpcodeToDavixError`` for everything that is not a success,
+#: with gfal2's ``davix2errno`` already applied: status -> (errno, phrase).
+_DAVIX: dict[int, tuple[int, str]] = {
+    **dict.fromkeys((401, 402, 407), (errno.EACCES, "Authentication Error")),
+    **dict.fromkeys((303, 404, 410), (errno.ENOENT, "File not found")),
+    **dict.fromkeys((408, 504), (errno.ETIMEDOUT, "Operation timeout")),
+    **dict.fromkeys((403, 423), (errno.EPERM, "Permission refused")),
+    **dict.fromkeys((400, 411, 412, 413, 414, 415, 424, 501), (_EHOSTDOWN, "Server Error")),
+    507: (errno.EIO, "Insufficient Storage"),
+    **dict.fromkeys(
+        (300, 301, 302),
+        (errno.ENOSYS, "Redirection requested, transparent redirection disabled"),
+    ),
+}
+
+
+def davix_status(status: int, scope: str = "") -> tuple[int, str]:
+    """``(errno, phrase)`` for a failed ``status``, as gfal2 reports it through davix.
+
+    Only ``mkdir`` reads 405 and 409 differently: there they mean the
+    directory exists and its parent does not, elsewhere a refusal and an
+    existing file. Anything davix has no words for is ``EIO``.
     """
-    if status == 403:
-        return errno.EPERM
-    return errno_for_http(status)
+    if status == 405:
+        if scope == MKDIR:
+            return errno.EEXIST, "Method Not Allowed, File Exist"
+        return errno.EPERM, "Method Not Allowed, Permission refused"
+    if status == 409:
+        if scope == MKDIR:
+            return errno.ENOENT, "Conflict, File not Found"
+        return errno.EEXIST, "Conflict, File Exist"
+    return _DAVIX.get(status, (errno.EIO, f"Unexpected server error: {status}"))
 
 
-def status_text(status: int, reason: str = "") -> str:
+def status_text(status: int, scope: str = "") -> str:
     """davix's wording: ``HTTP 404 : File not found `` (trailing space and all)."""
-    phrase = _PHRASES.get(status) or reason or "Unknown error"
-    return f"HTTP {status} : {phrase} "
+    return f"HTTP {status} : {davix_status(status, scope)[1]} "
 
 
 def status_error(
-    status: int,
-    reason: str = "",
-    *,
-    prefix: str = "",
-    suffix: str = "",
-    code: int | None = None,
-    phrase: str | None = None,
+    status: int, *, prefix: str = "", suffix: str = "", scope: str = ""
 ) -> HTTPStatusError:
-    text = f"HTTP {status} : {phrase} " if phrase is not None else status_text(status, reason)
-    return HTTPStatusError(
-        f"{prefix}{text}{suffix}", http_errno(status) if code is None else code, status
-    )
+    code, phrase = davix_status(status, scope)
+    return HTTPStatusError(f"{prefix}HTTP {status} : {phrase} {suffix}", code, status)
 
 
 def transport_error(exc: BaseException) -> TransportError:
@@ -659,8 +669,6 @@ class Auth:
     headers: dict[str, str] = field(default_factory=dict)
     tls: ssl.SSLContext | None = None
     signer: Signer | None = None
-    #: Whether the credential is a header (token, Basic) rather than the TLS handshake.
-    bearer: bool = False
 
 
 _STALE = (
@@ -738,45 +746,62 @@ class HTTPClient:
 
     # -- credentials ---------------------------------------------------------------
 
-    def _plain_tls(self) -> ssl.SSLContext:
-        """A TLS context that presents no client certificate."""
-        insecure = self.context.options.boolean(self.group, "INSECURE", False)
-        return self.context.tls.get(None, verify=not insecure, ca_path=self.context.ca_path())
-
     def auth(self, url: str) -> Auth:
-        """How to authorise requests for ``url``, in gfal2's order of preference."""
+        """How to authorise requests for ``url``, as gfal2's ``get_credentials`` does.
+
+        The TLS context always carries the X.509 credential, if there is one:
+        gfal2 presents it whatever else it sends.
+        """
         parsed = parse(url)
+        tls = self.context.ssl_context(url, group=self.group)
+        scheme = parsed.scheme.partition("+")[0]
+        if scheme in ("cs3", "cs3s"):
+            configured = self.context.options.string("BEARER", "TOKEN")
+            return Auth({"Authorization": f"Bearer {configured}"} if configured else {}, tls)
         query = parsed.query_dict()
-        if "X-Amz-Signature" in query or "X-Amz-Credential" in query:
-            return Auth(tls=self._plain_tls(), bearer=True)  # a pre-signed URL
-        token = url_token(parsed) or self.context.bearer_token(url)
+        if "X-Amz-Signature" in query or "AWSAccessKeyId" in query:
+            return Auth(tls=tls)  # a pre-signed URL carries its own credential
+        if scheme in OBJECT_STORES:
+            return Auth(tls=tls, signer=self.signer_for(parsed))
+        token = self.bearer(url, parsed)
         if token:
-            return Auth({"Authorization": f"Bearer {token}"}, self._plain_tls(), bearer=True)
-        signer = self.signer_for(parsed)
-        if signer is not None:
-            return Auth(tls=self._plain_tls(), signer=signer, bearer=True)
+            return Auth({"Authorization": f"Bearer {token}"}, tls)
         user, password = _basic(self.context, url, parsed)
         if user:
             secret = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
-            return Auth({"Authorization": f"Basic {secret}"}, self._plain_tls(), bearer=True)
-        return Auth(tls=self.context.ssl_context(url, group=self.group))
+            return Auth({"Authorization": f"Basic {secret}"}, tls)
+        return Auth(tls=tls)
+
+    def bearer(self, url: str, parsed: URL) -> str | None:
+        """The bearer token for ``url``: by URL prefix, then by bare host, then configured."""
+        value, _ = self.context.credentials.get(BEARER, url)
+        if not value:
+            value, _ = self.context.credentials.get(BEARER, parsed.host)
+        return value or self.context.bearer_token(url) or None
 
     # -- headers -------------------------------------------------------------------
 
-    def standing_headers(self, target: Target) -> dict[str, str]:
-        """What every request carries: identity, ClientInfo, configured extras."""
+    def standing_headers(self, target: Target, origin: URL) -> dict[str, str]:
+        """What every request carries: identity, ClientInfo, configured extras.
+
+        The extras are ``HEADERS`` from the endpoint's own group (``[DAV:HOST]``
+        for the URL the caller named, not a redirect's), and only when it has
+        none, from ``[HTTP PLUGIN]``.
+        """
         headers = {"Host": target.host_header, "User-Agent": self.context.user_agent_string()}
         info = self.context.client_info_string()
         if info:
             headers["ClientInfo"] = info
         if not self.keep_alive:
             headers["Connection"] = "close"
-        scheme = target.url.scheme.partition("+")[0].upper()
-        for group in (f"{scheme}:{target.host}", self.group):
-            for item in self.context.options.string_list(group, "HEADERS"):
-                name, sep, value = item.partition(":")
-                if sep and name.strip():
-                    headers[name.strip()] = value.strip()
+        options = self.context.options
+        group = config_group(str(origin))
+        if not options.has(group, "HEADERS"):
+            group = self.group
+        for item in options.string_list(group, "HEADERS"):
+            name, sep, value = item.partition(":")
+            if sep and name.strip():
+                headers[name.strip()] = value.strip()
         return headers
 
     # -- requests ------------------------------------------------------------------
@@ -799,7 +824,7 @@ class HTTPClient:
         first = Target.of(url, s3=auth.signer is not None)
         for _ in range(MAX_REDIRECTS + 1):
             target = Target.of(current, s3=auth.signer is not None)
-            sent = self.standing_headers(target)
+            sent = self.standing_headers(target, first.url)
             if auth.headers and _may_forward(first, target):
                 sent.update(auth.headers)
             sent.update(headers or {})
@@ -895,7 +920,7 @@ class HTTPClient:
         first = Target.of(url, s3=auth.signer is not None)
         for _ in range(MAX_REDIRECTS + 1):
             target = Target.of(current, s3=auth.signer is not None)
-            sent = self.standing_headers(target)
+            sent = self.standing_headers(target, first.url)
             if auth.headers and _may_forward(first, target):
                 sent.update(auth.headers)
             sent.update(headers or {})

@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
+import zlib
 from pathlib import Path
 
 import pytest
@@ -105,14 +106,81 @@ def test_opendir_omits_dot_entries(wired) -> None:  # type: ignore[no-untyped-de
     assert all(name not in (".", "..") for name in [e.d_name for e in entries])
 
 
-def test_access_falls_back_to_stat(wired) -> None:  # type: ignore[no-untyped-def]
+def test_access_is_not_supported_as_in_gfal2(wired) -> None:  # type: ignore[no-untyped-def]
     ctx, _root, _server = wired
-    # The plugin does not implement access, so the core uses stat: success on
-    # an existing file, ENOENT on a missing one (better than gfal2's ENOSYS).
-    assert ctx.access(B + "hello.txt", os.R_OK) == 0
+    # gfal2's sftp plugin has no access, and its core does not fall back to stat.
+    for url in (B + "hello.txt", B + "missing"):
+        with pytest.raises(GError) as caught:
+            ctx.access(url, os.R_OK)
+        assert caught.value.code == errno.EPROTONOSUPPORT
+        assert caught.value.message == f"Protocol not supported or path/url invalid: {url}"
+
+
+def test_rmdir_and_unlink_say_what_is_in_the_way(wired) -> None:  # type: ignore[no-untyped-def]
+    ctx, root, _server = wired
+    (root / "full").mkdir()
+    (root / "full" / "f").write_bytes(b"x")
+    cases = [
+        (ctx.rmdir, "full", errno.ENOTEMPTY, "Directory not empty"),
+        (ctx.rmdir, "hello.txt", errno.ENOTDIR, "Not a directory"),
+        (ctx.rmdir, "missing", errno.ENOENT, "No such file"),
+        (ctx.unlink, "full", errno.EISDIR, "Is a directory"),
+        (ctx.unlink, "missing", errno.ENOENT, "No such file"),
+    ]
+    for call, name, code, words in cases:
+        with pytest.raises(GError) as caught:
+            call(B + name)
+        assert caught.value.code == code, name
+        assert words in caught.value.message
+
+
+def test_rmdir_failures_nothing_explains(wired, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
+    ctx, root, _server = wired
+    (root / "d").mkdir()
+    real = os.rmdir
+
+    def refuse(path: object, *args: object, **kwargs: object) -> None:
+        if str(path).endswith("/d"):
+            raise OSError(errno.EBUSY, "busy")  # FAILURE, on an empty directory
+        if str(path).endswith("/ghost"):
+            raise FileNotFoundError(errno.ENOENT, "gone")
+        real(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "rmdir", refuse)
     with pytest.raises(GError) as caught:
-        ctx.access(B + "missing", os.F_OK)
+        ctx.rmdir(B + "d")
+    assert caught.value.code == errno.ENOTEMPTY  # what gfal2 makes of every FAILURE
+    (root / "ghost").mkdir()
+    with pytest.raises(GError) as caught:
+        ctx.rmdir(B + "ghost")  # NO_SUCH_FILE for a directory that is there
     assert caught.value.code == errno.ENOENT
+    with pytest.raises(GError) as caught:
+        ctx.rmdir(B + "hello.txt/x")  # no directory, no file: nothing to look at
+    assert caught.value.code == errno.ENOENT
+    (root / "locked").mkdir()
+    monkeypatch.setattr(os, "rmdir", lambda path: (_ for _ in ()).throw(PermissionError(13, "no")))
+    with pytest.raises(GError) as caught:
+        ctx.rmdir(B + "locked")  # a status that needs no second look
+    assert caught.value.code == errno.EACCES
+
+
+def test_unlink_failure_on_a_file_stays_a_failure(wired, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
+    ctx, _root, _server = wired
+
+    def busy(path: object, *args: object, **kwargs: object) -> None:
+        raise OSError(errno.EBUSY, "busy")  # FAILURE, and it is a file
+
+    monkeypatch.setattr(os, "unlink", busy)
+    with pytest.raises(GError) as caught:
+        ctx.unlink(B + "hello.txt")
+    assert caught.value.code == errno.EIO
+
+
+def test_upper_case_scheme_is_nobodys(wired) -> None:  # type: ignore[no-untyped-def]
+    ctx, _root, _server = wired
+    with pytest.raises(GError) as caught:
+        ctx.stat("SFTP://server.example/hello.txt")
+    assert caught.value.code == errno.EPROTONOSUPPORT
 
 
 def test_open_read_write_seek(wired) -> None:  # type: ignore[no-untyped-def]
@@ -207,7 +275,15 @@ def test_checksum_unknown_algorithm(wired) -> None:  # type: ignore[no-untyped-d
     ctx, _root, _server = wired
     with pytest.raises(GError) as caught:
         ctx.checksum(B + "hello.txt", "no-such-hash")
-    assert caught.value.code == errno.EINVAL
+    assert caught.value.code == errno.EPROTONOSUPPORT  # gfal2's answer for every algorithm
+
+
+def test_checksum_by_read_knows_gfal2s_algorithms(wired) -> None:  # type: ignore[no-untyped-def]
+    ctx, root, _server = wired
+    data = (root / "hello.txt").read_bytes()
+    assert ctx.checksum(B + "hello.txt", "ADLER32") == f"{zlib.adler32(data):08x}"
+    assert ctx.checksum(B + "hello.txt", "CRC32") == str(zlib.crc32(data))
+    assert ctx.checksum(B + "hello.txt", "crc32c") != ""
 
 
 # -- copies -------------------------------------------------------------------

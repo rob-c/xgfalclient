@@ -11,13 +11,12 @@ from __future__ import annotations
 import math
 import os
 import stat
-import sys
 from datetime import datetime
 from typing import Callable
 
 from ..types import Stat
 from ._base import Command, Spec, arg, out, stdout_isatty, surl
-from ._utils import file_mode_str
+from ._utils import file_mode_str, ls_colors
 
 __all__ = ["SPECS", "size_to_human", "TIME_FORMATS"]
 
@@ -66,20 +65,6 @@ def size_to_human(size: float) -> str:
     return f"{math.ceil(size):0.0f}{symbols[degree]}"
 
 
-def _ls_colors() -> dict[str, str]:
-    """``LS_COLORS`` as a dict, warning about entries gfal2-util cannot parse."""
-    colors: dict[str, str] = {}
-    for entry in os.environ.get("LS_COLORS", "").split(":"):
-        if "=" not in entry:
-            continue
-        parts = entry.split("=")
-        if len(parts) == 2:
-            colors[parts[0]] = parts[1]
-        else:
-            sys.stderr.write(f"unparsable value for LS_COLORS environment variable: {entry}\n")
-    return colors
-
-
 class _Lister:
     def __init__(self, cmd: Command) -> None:
         self.cmd = cmd
@@ -88,7 +73,7 @@ class _Lister:
             self.colorize = True
         else:
             self.colorize = self.params.color == "auto" and stdout_isatty()
-        self.colors = _ls_colors()
+        self.colors = ls_colors()
 
     def color(self, name: str, mode: int | None) -> str:
         if not self.colorize:
@@ -153,6 +138,7 @@ def ls(cmd: Command) -> int:
 
 SPECS = {
     "ls": Spec(
+        "ls",
         "List directory's contents",
         [
             arg("-a", "--all", action="store_true", help="display hidden files"),

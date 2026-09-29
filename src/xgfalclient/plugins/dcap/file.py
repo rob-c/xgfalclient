@@ -48,6 +48,7 @@ serves is the listing, one ``<pnfsid>:<d|f>:<size>:<name>`` line per entry.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import socket
@@ -204,18 +205,66 @@ class DataChannel:
 # ---------------------------------------------------------------------------
 
 
+def callback_ports(value: str) -> range:
+    """``$DCACHE_CBPORT`` as libdcap reads it: ``first`` or ``first:last``, ``last`` excluded.
+
+    Either number is ``atoi``'s: leading digits, else zero. No port, or port
+    zero, is any free port; a ``last`` at or below ``first`` wraps past
+    65535 in libdcap, which is every port from ``first`` up.
+    """
+    first_text, colon, last_text = value.partition(":")
+    first = _atoi(first_text)
+    if first > 65535:
+        return range(0, 1)  # no such port: any will do
+    last = _atoi(last_text) if colon else first + 1
+    if last <= first:
+        last += 65536
+    return range(first, min(last, 65536))
+
+
+def _bind(listener: socket.socket, address: str, ports: range) -> None:
+    """Bind to the first of ``ports`` that is free; libdcap's words when none is."""
+    for port in ports[:-1]:
+        with contextlib.suppress(OSError):
+            listener.bind((address, port))
+            return
+    try:
+        listener.bind((address, ports[-1]))
+    except OSError as exc:
+        if ports[0] == 0:
+            raise  # any port at all, and none to be had: the socket's own error
+        raise GError(
+            "Error reported by the external library dcap : Bind failed, number : 27",
+            exc.errno or errno.EADDRINUSE,
+        ) from exc
+
+
+def _atoi(text: str) -> int:
+    digits = ""
+    for character in text.strip():
+        if not character.isdigit():
+            break
+        digits += character
+    return int(digits) if digits else 0
+
+
 def callback_listener(conn: ControlConnection) -> tuple[socket.socket, str, int]:
     """A listening socket for the pool to call back, and the host and port to announce.
 
     It is bound to the address the control connection leaves from, which is
     the one the door can route back to; ``$DCACHE_REPLY`` overrides the
-    announced name, as it does for libdcap.
+    announced name and ``$DCACHE_CBPORT`` the ports it may listen on (for a
+    firewalled client), as they do for libdcap.
     """
     local = conn.sock.getsockname()
+    ports = callback_ports(os.environ.get("DCACHE_CBPORT", ""))
     listener = socket.socket(conn.sock.family, socket.SOCK_STREAM)
     try:
-        listener.bind((local[0], 0))
+        _bind(listener, local[0], ports)
         listener.listen(8)
+    except GError:
+        listener.close()
+        raise
     except OSError as exc:
         listener.close()
         raise socket_error(exc, "Cannot create the dcap callback socket") from exc

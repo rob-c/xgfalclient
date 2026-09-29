@@ -188,6 +188,10 @@ class GridFTPServer:
         self.block_size = block_size
         #: The host ``PASV`` advertises; ``None`` means the one it listens on.
         self.advertise = advertise
+        #: Whether ``SITE SETNETSTACK udt`` is accepted (globus whitelists it).
+        self.udt = False
+        #: A fixed reply to ``SITE USAGE``; ``None`` reports the root's disk.
+        self.usage: str | None = None
         self.faults: dict[str, str] = {}
         self.after: dict[str, str] = {}
         self.data_faults: dict[str, str] = {}
@@ -518,8 +522,16 @@ class _Session:
                 raise self.failure(exc, "chmod") from None
             raise _Reply("200 SITE CHMOD command successful.")
         if what == "USAGE":
+            if self.server.usage is not None:
+                raise _Reply(self.server.usage)
             usage = shutil.disk_usage(self.server.root)
             raise _Reply(f"250 USAGE {usage.used} FREE {usage.free} TOTAL {usage.total}")
+        if what in ("RETRBUFSIZE", "STORBUFSIZE"):
+            raise _Reply(f"200 {what} {rest} OK.")
+        if what == "SETNETSTACK":
+            if rest.lower() == "udt" and not self.server.udt:
+                raise _Reply("500 Command failed : udt driver not whitelisted")
+            raise _Reply("200 Site Command Successful.")
         raise _Reply("500 Invalid command.")
 
     def do_ALLO(self, arg: str) -> None:
@@ -716,6 +728,13 @@ class _Session:
         )
 
     def send_file(self, verb: str, path: str, start: int, end: int | None) -> None:
+        if os.path.isdir(self.local(path)):
+            raise _Reply(
+                "500-Command failed. : callback failed.\r\n"
+                "500-globus_xio: System error in read: Is a directory\r\n"
+                "500-globus_xio: A system call failed: Is a directory\r\n"
+                "500 End."
+            )
         try:
             fd = os.open(self.local(path), os.O_RDONLY)
         except OSError as exc:
@@ -764,13 +783,37 @@ class _Session:
             raise _Reply("501 Unsupported ERET module.")
         self.send_file("ERET", path, int(offset), int(offset) + int(length))
 
+    def do_ESTO(self, arg: str) -> None:
+        module, offset, path = arg.split(" ", 2)
+        if module != "A":
+            raise _Reply("501 Unsupported ESTO module.")
+        self.store(path, int(offset), truncate=False)
+
     def do_STOR(self, arg: str) -> None:
-        flags = os.O_WRONLY | os.O_CREAT | (0 if self.rest else os.O_TRUNC)
+        self.store(arg, self.rest, truncate=not self.rest)
+
+    def getput(self, arg: str) -> str:
+        """Set up a GridFTP v2 ``GET``/``PUT``'s data channel; the file it names."""
+        options = dict(item.partition("=")[::2] for item in arg.split(";") if item)
+        if "port" in options:
+            self.close_passive()
+            self.active = [parse_pasv(options["port"])]
+        elif "pasv" in options:
+            self.reply(f"127 PORT ({self.pasv()})")
+        return options.get("file", "")
+
+    def do_GET(self, arg: str) -> None:
+        self.send_file("RETR", self.getput(arg), 0, None)
+
+    def do_PUT(self, arg: str) -> None:
+        self.store(self.getput(arg), 0, truncate=True)
+
+    def store(self, arg: str, start: int, *, truncate: bool) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if truncate else 0)
         try:
             fd = os.open(self.local(arg), flags, 0o644)
         except OSError as exc:
             raise self.failure(exc, "open") from None
-        start = self.rest
 
         def write(view: memoryview, offset: int) -> None:
             os.pwrite(fd, view, offset)

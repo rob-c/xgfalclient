@@ -159,6 +159,12 @@ def parse_url(url: str) -> DcapURL:
     """
     parts = parse_url_parts(url)
     scheme = parts.scheme
+    if not url.startswith(scheme):
+        # gfal2 claims DCAP:// (its check ignores case) and libdcap refuses it.
+        raise GError(
+            "Error reported by the external library dcap : Not valid DCAP url, number : 32",
+            errno.EINVAL,
+        )
     # Everything after the authority is the name, '?' and '#' included, as in libdcap.
     path = url[len(scheme) + 3 + len(parts.netloc) :]
     host = parts.host

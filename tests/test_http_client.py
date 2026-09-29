@@ -24,14 +24,14 @@ from xgfalclient.plugins.http._client import (
     Target,
     TransportError,
     Upload,
+    config_group,
+    davix_status,
     status_text,
     transport_error,
-    url_token,
     wire_url,
 )
 from xgfalclient.testing.pki import PKI
 from xgfalclient.testing.webdav import WebDAVServer
-from xgfalclient.url import parse
 
 
 def plugin(context: xgfalclient.Gfal2Context):  # type: ignore[no-untyped-def]
@@ -215,14 +215,29 @@ def test_identity_headers(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> 
     hctx.set_user_agent("fts", "3.14")
     hctx.add_client_info("job-id", "42")
     hctx.set_opt_string_list("HTTP PLUGIN", "HEADERS", ["X-Site: here", "nocolon", ": noname"])
+    hctx.stat(dav.url("/data"))
+    request = dav.requests[-1]
+    assert request.header("User-Agent") == "fts/3.14 gfal2/2.23.5"
+    assert request.header("ClientInfo") == "job-id=42"
+    assert request.header("X-Site") == "here"
+    assert request.header("nocolon") is None
+    # The endpoint's own group replaces the plugin's list rather than adding to it.
     hctx.set_opt_string_list("DAV:127.0.0.1", "HEADERS", ["X-Host: yes"])
     hctx.stat(dav.url("/data"))
     request = dav.requests[-1]
-    assert request.header("User-Agent") == "fts/3.14"
-    assert request.header("ClientInfo") == "job-id=42"
-    assert request.header("X-Site") == "here"
-    assert request.header("X-Host") == "yes"
-    assert request.header("nocolon") is None
+    assert (request.header("X-Host"), request.header("X-Site")) == ("yes", None)
+
+
+def test_header_groups_are_named_as_gfal2_names_them(
+    hctx: xgfalclient.Gfal2Context, davs_open: WebDAVServer, grid_env: PKI
+) -> None:
+    hctx.set_opt_string_list("DAVS:127.0.0.1", "HEADERS", ["X-Wrong: davs"])
+    hctx.set_opt_string_list("HTTP:127.0.0.1", "HEADERS", ["X-Right: http"])
+    hctx.stat(davs_open.url("/data", scheme="https"))
+    request = davs_open.requests[-1]
+    assert (request.header("X-Right"), request.header("X-Wrong")) == ("http", None)
+    hctx.stat(davs_open.url("/data"))  # davs is [DAV:HOST], which has none: the plugin's
+    assert davs_open.requests[-1].header("X-Right") is None
 
 
 def test_basic_auth(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -243,18 +258,39 @@ def test_bearer_tokens(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> Non
     with pytest.raises(GError) as caught:
         hctx.stat(dav.url("/data"))
     assert caught.value.code == errno.EACCES
-    assert hctx.stat(dav.url("/data?authz=Bearer%20GOOD")).is_dir()
-    assert hctx.stat(dav.url("/data?access_token=GOOD")).is_dir()
     hctx.cred_set(dav.url("/"), hctx.cred_new("BEARER", "GOOD"))
     assert hctx.stat(dav.url("/data")).is_dir()
+
+
+def test_bearer_token_keyed_by_host(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
+    """FTS sets tokens for a bare host name; a URL-prefix one still comes first."""
+    dav.tokens = {"HOST", "PREFIX"}
+    hctx.cred_set("127.0.0.1", hctx.cred_new("BEARER", "HOST"))
+    assert hctx.stat(dav.url("/data")).is_dir()
+    assert dav.requests[-1].header("Authorization") == "Bearer HOST"
+    hctx.cred_set(dav.url("/data"), hctx.cred_new("BEARER", "PREFIX"))
+    assert hctx.stat(dav.url("/data")).is_dir()
+    assert dav.requests[-1].header("Authorization") == "Bearer PREFIX"
+
+
+def test_tokens_in_the_url_stay_in_the_url(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
+    """davix sends the query as it is, and adds no Authorization for it."""
+    write(dav, "/data/f", b"x")
+    hctx.stat(dav.url("/data/f?authz=Bearer%20T&x=1"))
+    request = dav.requests[-1]
+    assert request.path == "/data/f?authz=Bearer%20T&x=1"
+    assert request.header("Authorization") is None
 
 
 def test_presigned_urls_carry_their_own_credentials(hctx: xgfalclient.Gfal2Context) -> None:
     hctx.cred_set("dav://", hctx.cred_new("BEARER", "UNUSED"))
     client = HTTPClient(hctx)
-    for query in ("X-Amz-Signature=abc", "X-Amz-Credential=AKID%2F20240101"):
+    for query in ("X-Amz-Signature=abc", "AWSAccessKeyId=AKID&Signature=x"):
         auth = client.auth(f"dav://h/b/k?{query}")
-        assert auth.bearer and not auth.headers and auth.signer is None
+        assert not auth.headers and auth.signer is None
+    assert client.auth("dav://h/b/k?X-Amz-Credential=AKID").headers  # not signed after all
 
 
 def test_x509_only_requests_leave_tokens_out(
@@ -275,8 +311,11 @@ def test_x509_and_tokens_over_tls(
     assert hctx.stat(davs.url("/data")).is_dir()  # the proxy in the handshake
     hctx.cred_set(davs.url("/"), hctx.cred_new("BEARER", "BAD"))
     with pytest.raises(GError) as caught:
-        hctx.stat(davs.url("/data"))  # a token, and no certificate alongside it
+        hctx.stat(davs.url("/data"))  # the server goes by the token it was given
     assert caught.value.code == errno.EACCES
+    request = davs.requests[-1]
+    # As gfal2 does, the certificate is presented alongside the token.
+    assert request.header("Authorization") == "Bearer BAD" and request.subject
 
 
 def test_tls_verification(
@@ -375,7 +414,7 @@ def test_targets() -> None:
     target = Target.of("davs://[::1]:8443/a b?authz=T&x=1")
     assert (target.scheme, target.host, target.port) == ("https", "::1", 8443)
     assert target.host_header == "[::1]:8443"
-    assert target.path == "/a%20b?x=1"
+    assert target.path == "/a%20b?authz=T&x=1"
     assert Target.of("dav://h/p").host_header == "h"
     assert Target.of("davs+3rd://h").path == "/"
     assert Target.of("https://h:x/").port == 443
@@ -385,20 +424,29 @@ def test_targets() -> None:
 
 
 def test_url_helpers() -> None:
-    assert url_token(parse("davs://h/f?authz=Bearer%20abc")) == "abc"
-    assert url_token(parse("davs://h/f?other=1")) is None
-    assert url_token(parse("davs://h/f?authz=&access_token=T")) == "T"  # an empty one is none
-    assert wire_url("davs://h/f?authz=x") == "https://h/f"
-    assert wire_url("dav://h/f?a=1&access_token=x") == "http://h/f?a=1"
+    assert wire_url("davs://h/f?authz=x") == "https://h/f?authz=x"
+    assert wire_url("cs3s://h/f") == "https://h/f"
     assert wire_url("s3s://h") == "https://h/"
     assert _client._resolve("dav://h/a/b", "c") == "dav://h/a/c"
     assert _client._resolve("dav://h/a/b", "https://o/x") == "https://o/x"
+    assert config_group("davs://se.example:443/p") == "DAV:SE.EXAMPLE"
+    assert config_group("https+3rd://h/p") == "HTTP:H"
+    assert config_group("dav://h/p") == "DAV:H"
 
 
 def test_status_words() -> None:
+    """davix's reading of each status, and gfal2's errno for it."""
     assert status_text(404) == "HTTP 404 : File not found "
-    assert status_text(599) == "HTTP 599 : Unknown error "
-    assert status_text(500, "Oops") == "HTTP 500 : Oops "
+    assert status_text(599) == "HTTP 599 : Unexpected server error: 599 "
+    assert davix_status(409) == (errno.EEXIST, "Conflict, File Exist")
+    assert davix_status(409, "mkdir") == (errno.ENOENT, "Conflict, File not Found")
+    assert davix_status(405) == (errno.EPERM, "Method Not Allowed, Permission refused")
+    assert davix_status(405, "mkdir") == (errno.EEXIST, "Method Not Allowed, File Exist")
+    assert davix_status(423) == (errno.EPERM, "Permission refused")
+    assert davix_status(501)[1] == "Server Error"
+    assert davix_status(504) == (errno.ETIMEDOUT, "Operation timeout")
+    assert davix_status(507) == (errno.EIO, "Insufficient Storage")
+    assert davix_status(302)[0] == errno.ENOSYS
 
 
 def test_transport_errors() -> None:

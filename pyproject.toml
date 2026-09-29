@@ -51,6 +51,10 @@ gfal-cat = "xgfalclient.cli:cat"
 gfal-chmod = "xgfalclient.cli:chmod"
 gfal-copy = "xgfalclient.cli:copy"
 gfal-evict = "xgfalclient.cli:evict"
+gfal-legacy-bringonline = "xgfalclient.cli:legacy_bringonline"
+gfal-legacy-register = "xgfalclient.cli:legacy_register"
+gfal-legacy-replicas = "xgfalclient.cli:legacy_replicas"
+gfal-legacy-unregister = "xgfalclient.cli:legacy_unregister"
 gfal-ls = "xgfalclient.cli:ls"
 gfal-mkdir = "xgfalclient.cli:mkdir"
 gfal-rename = "xgfalclient.cli:rename"
@@ -60,9 +64,17 @@ gfal-stat = "xgfalclient.cli:stat"
 gfal-sum = "xgfalclient.cli:sum"
 gfal-token = "xgfalclient.cli:token"
 gfal-xattr = "xgfalclient.cli:xattr"
+gfal2_version = "xgfalclient.cli:gfal2_version"
+gfal_srm_ifce_version = "xgfalclient.cli:gfal_srm_ifce_version"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/xgfalclient"]
+# gfal2 and gfal2_util are the import names of the packages this replaces.
+packages = ["src/xgfalclient", "src/gfal2", "src/gfal2_util"]
+
+# gfal2-util's man pages, generated from the commands' own parsers by
+# tests/test_cli_man.py; pip installs them under <prefix>/share/man/man1.
+[tool.hatch.build.targets.wheel.shared-data]
+"share/man/man1" = "share/man/man1"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -74,7 +86,7 @@ markers = [
 
 [tool.coverage.run]
 branch = true
-source = ["xgfalclient"]
+source = ["xgfalclient", "gfal2", "gfal2_util"]
 parallel = true
 concurrency = ["thread"]
 
@@ -100,5 +112,5 @@ ignore = ["RUF012", "SIM105", "UP007", "UP045", "RUF022"]
 [tool.mypy]
 python_version = "3.10"
 strict = true
-files = ["src/xgfalclient"]
+files = ["src/xgfalclient", "src/gfal2", "src/gfal2_util"]
 warn_unused_ignores = false

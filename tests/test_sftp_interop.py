@@ -10,8 +10,7 @@ a driver that performs the same operations through ``gfal2`` and through
 
 Each answer is compared; the deliberate differences are in :data:`KNOWN`
 (proper errno instead of the raw SFTP status gfal2 leaks, ``.``/``..`` left
-out of listings, a real ``lstat``, a working checksum, ``access`` via
-``stat``). The three xgfalclient tiers - ``openssh`` (key/agent only),
+out of listings, a real ``lstat``, a working checksum). The three xgfalclient tiers - ``openssh`` (key/agent only),
 ``python`` and (if importable) ``paramiko`` - are all exercised: openssh with
 key auth, python/paramiko with password and key.
 
@@ -48,18 +47,11 @@ ROOT = Path(__file__).resolve().parent.parent
 #: Deliberate differences from gfal2's sftp plugin, and why.
 KNOWN = {
     "listdir": "gfal2 includes '.' and '..'; this plugin omits them",
-    "stat missing": "gfal2 leaks the raw SFTP status as errno; this plugin maps ENOENT",
-    "mkdir exists": "gfal2 leaks the raw status; this plugin maps EEXIST",
-    "rmdir missing": "errno mapping differs (raw status vs ENOENT)",
-    "rmdir not empty": "errno mapping differs (raw status vs ENOTEMPTY)",
     "rename missing": "errno mapping differs (raw status vs ENOENT)",
-    "chmod missing": "errno mapping differs (raw status vs ENOENT)",
-    "unlink missing": "errno mapping differs (raw status vs ENOENT)",
-    "open missing": "errno mapping differs (raw status vs ENOENT)",
     "checksum md5": "gfal2 answers EPROTONOSUPPORT; this plugin reads the file",
+    "checksum adler32": "gfal2 answers EPROTONOSUPPORT; this plugin reads the file",
+    "unlink dir": "gfal2 leaks the raw SFTP status (4); this plugin says EISDIR",
     "checksum missing": "gfal2 answers EPROTONOSUPPORT; this plugin reads (then ENOENT)",
-    "access": "gfal2 answers EPROTONOSUPPORT; this plugin falls back to stat",
-    "access missing": "gfal2 answers EPROTONOSUPPORT; this plugin falls back to stat (ENOENT)",
     "readlink notlink": "errno mapping differs (raw status vs EINVAL)",
     "symlink": "errno/behaviour differs; this plugin performs a real symlink",
     "lstat link": "gfal2 aliases lstat to stat; this plugin does a real lstat",
@@ -116,6 +108,11 @@ def ops(mod, ctx, base, home):
         ("rmdir missing", lambda: ctx.rmdir(base + "/newdir")),
         ("mkdir_rec", lambda: ctx.mkdir_rec(base + "/a/b/c", 0o755)),
         ("rmdir not empty", lambda: ctx.rmdir(base + "/a")),
+        ("rmdir file", lambda: ctx.rmdir(base + "/hello.txt")),
+        ("unlink dir", lambda: ctx.unlink(base + "/a")),
+        ("checksum adler32", lambda: ctx.checksum(base + "/hello.txt", "ADLER32")),
+        ("checksum bogus", lambda: ctx.checksum(base + "/hello.txt", "bogus")),
+        ("stat upper", lambda: ctx.stat(base.replace("sftp://", "SFTP://") + "/hello.txt")),
         ("unlink missing", lambda: ctx.unlink(base + "/missing")),
         ("chmod missing", lambda: ctx.chmod(base + "/missing", 0o600)),
         ("read", lambda: [ctx.open(base + "/hello.txt", "r").read(5)]),
@@ -202,7 +199,9 @@ def _drive(tmp_path: Path) -> dict:
             "-e",
             f"IHOST={HOST}",
             "-v",
-            f"{ROOT}:/src:ro",
+            # The package alone: src/ also holds the gfal2 shim, which
+            # would shadow the real gfal2 and compare this package with itself.
+            f"{ROOT / 'src' / 'xgfalclient'}:/src/src/xgfalclient:ro",
             "-v",
             f"{keydir}:/keys:ro",
             IMAGE,

@@ -23,6 +23,13 @@ def _fast_polls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(srm_client, "POLL_INITIAL", 0.001)
 
 
+@pytest.fixture(autouse=True)
+def _no_bdii() -> None:
+    """A short SURL would have the BDII (lcg-bdii.cern.ch by default) asked for its
+    service: switch it off, as a site without one does. test_bdii.py covers it."""
+    Path(os.environ["GFAL_CONFIG_DIR"], "bdii.conf").write_text("[BDII]\nENABLED=false\n")
+
+
 @pytest.fixture
 def root(tmp_path: Path) -> Path:
     base = tmp_path / "root"
@@ -309,6 +316,11 @@ def test_space_xattrs(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
     assert error.message == "Unknown space token attribute bogus"
     error = fails(errno.ENODATA, sctx.getxattr, url, "spacetoken.bogus?tok1")
     assert error.message == "Unknown space token attribute bogus?tok1"
+    # gfal2 sends every "spacetoken..." name to its space code, and words it so.
+    for name in ("spacetoken?x", "spacetokenX"):
+        error = fails(errno.ENODATA, sctx.getxattr, url, name)
+        assert error.message == f"Unknown space token attribute {name}"
+    assert sctx.getxattr(url, "spacetoken.") == '["tok1","tok2","tok3"]'
 
 
 def test_space_without_sizes(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
@@ -335,6 +347,49 @@ def test_xattr_fail_nearline(sctx: xgfalclient.Gfal2Context, srm: SRMServer, roo
     assert error.message == "The source file is not ONLINE"
     srm.set_locality("/data/f", "ONLINE_AND_NEARLINE")
     assert sctx.getxattr(srm.url("/data/f"), "user.replicas").startswith("file://")
+    # Only NEARLINE is refused: gfal2 compares with it exactly.
+    srm.set_locality("/data/f", "NONE")
+    assert sctx.getxattr(srm.url("/data/f"), "user.replicas").startswith("file://")
+    srm.set_locality("/data/f", "LOST")
+    error = fails(errno.EIDRM, sctx.getxattr, srm.url("/data/f"), "user.replicas")
+    assert "[PrepareToGet][SRM_FILE_LOST]" in error.message
+    fails(errno.ENOENT, sctx.getxattr, srm.url("/nope"), "user.replicas")
+
+
+def test_percent_encoded_surls(sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Path) -> None:
+    (root / "data" / "sp ace").write_bytes(b"12")
+    assert sctx.stat(srm.url("/data/sp%20ace")).st_size == 2
+    assert "<urlArray>srm://localhost/data/sp ace</urlArray>" in srm.log[-1][1].decode()
+    assert sctx.stat(srm.full_url("/data/sp%20ace")).st_size == 2
+
+
+def test_spacetokendesc_for_every_request(
+    sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Path
+) -> None:
+    """gfal2 asks for ``SPACETOKENDESC``'s space on opens, replicas and checksum TURLs."""
+    sctx.set_opt_string(GROUP, "SPACETOKENDESC", "ATLASDATADISK")
+    with sctx.open(srm.url("/data/w"), "w") as handle:
+        handle.write("x")
+    with sctx.open(srm.url("/data/f"), "r") as handle:
+        handle.read(1)
+    sctx.getxattr(srm.url("/data/f"), "user.replicas")
+    srm.checksum_type = None  # the checksum comes from a TURL
+    sctx.checksum(srm.url("/data/f"), "ADLER32")
+    bodies = [body.decode() for op, body in srm.log if op.startswith("srmPrepareTo")]
+    assert len(bodies) == 4
+    assert all("<targetSpaceToken>tok1</targetSpaceToken>" in body for body in bodies)
+
+
+def test_identity_headers(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:
+    sctx.stat(srm.url("/data/f"))
+    assert srm.headers[-1]["User-Agent"].endswith(" srm-ifce/1.24.8 gSOAP/2.8")
+    assert "ClientInfo" not in srm.headers[-1]
+    sctx.set_user_agent("myagent", "9.9")
+    sctx.add_client_info("job", "42")
+    sctx.stat(srm.url("/data/f"))
+    agent = srm.headers[-1]["User-Agent"]
+    assert agent.startswith("myagent/9.9 ") and agent.endswith(" srm-ifce/1.24.8 gSOAP/2.8")
+    assert srm.headers[-1]["ClientInfo"] == "job=42"
 
 
 # -- I/O -----------------------------------------------------------------------------
@@ -411,8 +466,7 @@ def test_write_failures(sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Pa
     handle = sctx.open(srm.url("/data/new"), "w")
     inner = handle._file.inner  # type: ignore[attr-defined]
     inner.close()  # the TURL goes away under us
-    with pytest.raises(ValueError):
-        handle.write("x")
+    fails(errno.EINVAL, handle.write, "x")  # the file plugin's ValueError, as the context maps it
     handle.close()
     assert srm.operations()[-1] == "srmAbortRequest"
     # putdone refused

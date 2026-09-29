@@ -156,3 +156,23 @@ def test_check_path() -> None:
     assert caught.value.code == errno.EINVAL
     with pytest.raises(GError):
         p.check_path("/a\nDELE /b")  # a bare line feed ends the line too
+
+
+def test_passive_address() -> None:
+    """What gfal2's PASV plugin reads from a passive reply."""
+    from xgfalclient.plugins.gridftp.protocol import passive_address
+
+    def of(code: int, *lines: str) -> object:
+        return passive_address(p.Reply(code, list(lines)))
+
+    assert of(227, "227 Entering Passive Mode (10,0,0,1,1,2)") == ("10.0.0.1", 258, False)
+    assert of(127, "127 PORT 10,0,0,1,1,2") == ("10.0.0.1", 258, False)
+    assert of(227, "227 no address") is None
+    assert of(229, "229 Entering Extended Passive Mode (|||5000|)") == ("", 5000, False)
+    assert of(229, "229 EPSV (|2|::1|5000|)") == ("[::1]", 5000, True)
+    assert of(229, "229 EPSV (|2||5000|)") == ("", 5000, True)
+    assert of(229, "229 EPSV (|1|10.0.0.1|5000|)") == ("10.0.0.1", 5000, False)
+    assert of(229, "229-Striped", " 10,0,0,1,1,2", "229 End") == ("10.0.0.1", 258, False)
+    assert of(229, "229 nothing") is None
+    assert of(200, "200 Passive delayed.") is None
+    assert of(500, "527 x") is None

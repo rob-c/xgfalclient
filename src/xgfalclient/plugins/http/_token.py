@@ -3,46 +3,62 @@
 A storage element can mint a token for its own files, authenticated by the
 X.509 proxy the client already has; that token then goes wherever the
 proxy cannot - into a third-party copy's ``TransferHeaderAuthorization``.
-gfal2 asks in two ways, and so does this:
+This is gfal2's chain of retrievers, request for request:
 
-* **OAuth2 client credentials**, when the SE advertises a token endpoint -
-  in ``/.well-known/oauth-authorization-server`` on its own host, or, when
-  an issuer is named, in the issuer's ``.well-known/openid-configuration``;
-* **a macaroon request**: a ``POST`` of ``application/macaroon-request`` to
-  the file itself, with caveats naming the activities and an ISO 8601
-  validity - what dCache and XRootD's macaroon plugin answer.
+* **no issuer**: a macaroon request - a ``POST`` of
+  ``application/macaroon-request`` to the file itself, with a caveat naming
+  the activities and an ISO 8601 validity - what dCache and XRootD answer;
+* **an issuer**: first *SciTokens*, which discovers the issuer's token
+  endpoint in ``<issuer host>/.well-known/oauth-authorization-server<issuer
+  path>`` and asks it for ``grant_type=client_credentials`` and nothing
+  more; then a *macaroon retriever* for that issuer, which does the same
+  discovery and, if an endpoint is found, sends it an OAuth request with
+  ``scopes=<ACTIVITY>:<path> ...``, and otherwise falls back to the
+  macaroon request to the file.
 
-Activities default to gfal2's sets: ``LIST,DOWNLOAD`` to read and
-``LIST,MANAGE,UPLOAD,DELETE`` to write. Tokens are only ever requested over
-HTTPS - a token minted over plain HTTP would have been visible to anyone
-on the path - and every failure is reported as gfal2 reports it,
-``ENODATA`` naming the last attempt.
+The TPC far side uses a macaroon request to the file, then a macaroon
+retriever with the storage element itself as issuer.
+
+Activities are the caller's, as given, or gfal2's sets: ``LIST,DOWNLOAD``
+to read and ``LIST,DOWNLOAD,MANAGE,UPLOAD,DELETE`` to write. Tokens are only
+requested over HTTPS (``davs`` counts). Every failure is reported as gfal2
+reports it, ``ENODATA`` naming the last attempt.
+
+gfal2's retrievers also look in ``.well-known/openid-configuration`` when
+the first discovery document yields nothing; since a document that yields
+nothing is an error there, that second look never happens, and it is not
+made here either.
 """
 
 from __future__ import annotations
 
 import errno
 import json
+import logging
 import urllib.parse
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ...errors import GError
-from ...url import parse
-from ._client import Target, status_text, wire_scheme
+from ...url import URL, parse
 
 if TYPE_CHECKING:
     from .plugin import HTTPPlugin
 
-__all__ = ["activities", "retrieve"]
+__all__ = ["activities", "retrieve", "se_token"]
+
+_log = logging.getLogger("gfal2")
 
 READ_ACTIVITIES = ("LIST", "DOWNLOAD")
-WRITE_ACTIVITIES = ("LIST", "MANAGE", "UPLOAD", "DELETE")
+WRITE_ACTIVITIES = ("LIST", "DOWNLOAD", "MANAGE", "UPLOAD", "DELETE")
+#: The most of a macaroon response gfal2 reads (StoRM answers the POST with the file).
+RESPONSE_MAX_SIZE = 1024 * 1024
 
 
 def activities(write_access: bool, requested: Sequence[str] = ()) -> list[str]:
     if requested:
-        return [item.strip().upper() for item in requested if item.strip()]
+        return list(requested)
     return list(WRITE_ACTIVITIES if write_access else READ_ACTIVITIES)
 
 
@@ -51,7 +67,7 @@ class _Failed(Exception):
 
 
 def _json(payload: bytes, key: str) -> str:
-    if not payload.strip():
+    if not payload:
         raise _Failed("Response with no data")
     try:
         document: Any = json.loads(payload.decode("utf-8", "replace"))
@@ -60,63 +76,124 @@ def _json(payload: bytes, key: str) -> str:
     if not isinstance(document, dict) or key not in document:
         raise _Failed(f"Response did not include '{key}' key")
     value = document[key]
-    if not isinstance(value, str):
+    if value is None:
         raise _Failed(f"Key '{key}' was not a string")
-    if not value:
+    text = value if isinstance(value, str) else json.dumps(value)
+    if not text:
         raise _Failed(f"Extracted value for key '{key}' is empty")
-    return value
+    return text
 
 
-def _post(plugin: HTTPPlugin, url: str, body: bytes, content_type: str, cred_url: str) -> bytes:
-    try:
-        response = plugin._request(
-            "POST",
-            url,
-            body=body,
-            headers={"Content-Type": content_type, "Accept": "application/json"},
-            cred_url=cred_url,
-            x509_only=True,
-        )
-    except GError as exc:
-        raise _Failed(exc.message) from exc
-    payload = response.body()
-    if response.status != 200 and response.status != 201:
-        raise _Failed(f"Token request failed: {status_text(response.status, response.reason)}")
-    return payload
-
-
-def _endpoint(plugin: HTTPPlugin, discovery: str, cred_url: str) -> str | None:
-    """The ``token_endpoint`` a discovery document names, if there is one."""
-    try:
-        response = plugin._request("GET", discovery, cred_url=cred_url, x509_only=True)
-    except GError:
-        return None
-    payload = response.body()
-    if response.status != 200:
-        return None
-    try:
-        endpoint = _json(payload, "token_endpoint")
-    except _Failed:
-        return None
-    if not endpoint.lower().startswith("https://"):
+def _https(url: str) -> URL:
+    """``url`` as HTTPS (``davs`` becomes ``https``); anything else is refused."""
+    parsed = parse(url)
+    scheme = "https" if parsed.scheme == "davs" else parsed.scheme
+    if scheme != "https":
         raise _Failed("Token request must be done over HTTPs")
-    return endpoint
+    return parsed.with_scheme(scheme)
 
 
-def _oauth(plugin: HTTPPlugin, endpoint: str, url: str, validity: int, acts: list[str]) -> str:
-    path = parse(url).path
-    scopes = " ".join(f"{act.lower()}:{path}" for act in acts)
-    form = urllib.parse.urlencode(
-        {"grant_type": "client_credentials", "expire_in": str(validity * 60), "scopes": scopes}
-    )
-    payload = _post(plugin, endpoint, form.encode(), "application/x-www-form-urlencoded", url)
-    return _json(payload, "access_token")
+@dataclass
+class _Retriever:
+    """One of gfal2's ``TokenRetriever``: SciTokens or macaroon, with or without an issuer."""
+
+    plugin: HTTPPlugin
+    issuer: str = ""
+    scitokens: bool = False
+
+    def _endpoint(self, cred_url: str) -> str:
+        """The issuer's ``token_endpoint``, or ``""`` if there is none to be had."""
+        if not self.issuer:
+            return ""
+        try:
+            issuer = _https(self.issuer)
+            path = issuer.path if issuer.path not in ("", "/") else ""
+            discovery = f"{issuer.base}/.well-known/oauth-authorization-server{path}"
+            payload = self._send("GET", discovery, cred_url, "Token endpoint discovery")
+            return _json(payload, "token_endpoint")
+        except _Failed as exc:
+            _log.debug("(SEToken) Error during issuer endpoint discovery: %s", exc)
+            return ""
+
+    def _send(
+        self,
+        method: str,
+        url: str,
+        cred_url: str,
+        what: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        colon: str = ":",
+    ) -> bytes:
+        try:
+            response = self.plugin._request(
+                method, url, body=body, headers=headers, cred_url=cred_url, x509_only=True
+            )
+        except GError as exc:
+            raise _Failed(f"{what} request failed: {exc.message}") from exc
+        payload = response.body(RESPONSE_MAX_SIZE)
+        if response.status != 200:
+            raise _Failed(f"{what} request failed with status code{colon} {response.status}")
+        if len(payload) >= RESPONSE_MAX_SIZE:
+            raise _Failed(
+                f"{what} response exceeds maximum size: {len(payload)} bytes "
+                f"(max size = {RESPONSE_MAX_SIZE})"
+            )
+        return payload
+
+    def retrieve(
+        self, url: str, write_access: bool, validity: int, requested: Sequence[str]
+    ) -> str:
+        target = _https(url)
+        endpoint = self._endpoint(url)
+        acts = activities(write_access, requested)
+        form = "application/x-www-form-urlencoded"
+        if self.scitokens:
+            if not endpoint:
+                raise _Failed("Invalid or empty token issuer endpoint")
+            headers = {"Accept": "application/json", "Content-Type": form}
+            payload = self._send(
+                "POST", endpoint, url, "SciTokens", b"grant_type=client_credentials", headers
+            )
+            return _json(payload, "access_token")
+        if endpoint:
+            scopes = " ".join(f"{act}:{target.path}" for act in acts)
+            body = (
+                f"grant_type=client_credentials&expire_in={validity * 60}"
+                f"&scopes={urllib.parse.quote(scopes, safe='')}"
+            )
+            headers = {"Content-Type": form, "Accept": "application/json"}
+            payload = self._send("POST", endpoint, url, "Token", body.encode(), headers, "")
+            return _json(payload, "access_token")
+        request = {"caveats": [f"activity:{','.join(acts)}"], "validity": f"PT{validity}M"}
+        payload = self._send(
+            "POST",
+            str(target),
+            url,
+            "Macaroon",
+            json.dumps(request).encode(),
+            {"Content-Type": "application/macaroon-request"},
+            "",
+        )
+        return _json(payload, "macaroon")
 
 
-def _macaroon(plugin: HTTPPlugin, url: str, validity: int, acts: list[str]) -> str:
-    request = {"caveats": [f"activity:{','.join(acts)}"], "validity": f"PT{validity}M"}
-    payload = _post(plugin, url, json.dumps(request).encode(), "application/macaroon-request", url)
-    return _json(payload, "macaroon")
+def _chain(
+    chain: Sequence[_Retriever],
+    url: str,
+    write_access: bool,
+    validity: int,
+    requested: Sequence[str],
+) -> tuple[str, str]:
+    """``(token, "")`` from the first retriever that works, else ``("", last error)``."""
+    last = ""
+    for retriever in chain:
+        try:
+            return retriever.retrieve(url, write_access, validity, requested), ""
+        except _Failed as exc:
+            _log.info("(SEToken) Error during token retrieval: %s", exc)
+            last = str(exc)
+    return "", last
 
 
 def retrieve(
@@ -127,25 +204,30 @@ def retrieve(
     write_access: bool,
     requested: Sequence[str] = (),
 ) -> str:
-    """A token for ``url`` from its storage element (or ``issuer``)."""
-    acts = activities(write_access, requested)
-    minutes = max(int(validity), 1)
-    try:
-        if wire_scheme(parse(url).scheme) != "https":
-            raise _Failed("Token request must be done over HTTPs")
-        if issuer:
-            discovery = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
-        else:
-            discovery = f"{Target.of(url).base}/.well-known/oauth-authorization-server"
-        endpoint = _endpoint(plugin, discovery, url)
-        if endpoint is not None:
-            try:
-                return _oauth(plugin, endpoint, url, minutes, acts)
-            except _Failed:
-                pass  # the SE may still answer a macaroon request
-        elif issuer:
-            raise _Failed("Invalid or empty token issuer endpoint")
-        return _macaroon(plugin, url, minutes, acts)
-    except _Failed as exc:
-        last = str(exc)
-    raise GError(f"Could not retrieve token for {url} [last failed attempt: {last}]", errno.ENODATA)
+    """``token_retrieve``: a token for ``url`` from its storage element (or ``issuer``)."""
+    if issuer:
+        chain = [_Retriever(plugin, issuer, scitokens=True), _Retriever(plugin, issuer)]
+    else:
+        chain = [_Retriever(plugin)]
+    token, last = _chain(chain, url, write_access, int(validity), requested)
+    if not token:
+        raise GError(
+            f"Could not retrieve token for {url} [last failed attempt: {last}]", errno.ENODATA
+        )
+    return token
+
+
+def se_token(plugin: HTTPPlugin, url: str, write_access: bool, validity: int) -> str | None:
+    """A token the storage element behind ``url`` mints for it, or ``None``.
+
+    gfal2's ``retrieve_and_store_se_token``: a macaroon request to the file,
+    then the same with the storage element itself as the issuer.
+    """
+    parsed = parse(url)
+    storage = f"{parsed.scheme}://{parsed.netloc.rpartition('@')[2]}"
+    chain = [_Retriever(plugin), _Retriever(plugin, storage)]
+    token, _ = _chain(chain, url, write_access, validity, ())
+    if not token:
+        _log.warning("(SEToken) Could not retrieve any token for %s", url)
+        return None
+    return token

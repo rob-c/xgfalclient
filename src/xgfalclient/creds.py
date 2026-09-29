@@ -8,12 +8,23 @@ the longest prefix that matches, so a token for one directory beats a token
 for its host. The types are gfal2's: ``BEARER``, ``X509_CERT``, ``X509_KEY``,
 ``USER`` and ``PASSWD``.
 
-**Discovery.** With nothing set explicitly, credentials are found where the
-grid expects them, in gfal2's order: the ``[X509]`` options, then
-``$X509_USER_PROXY``, then ``/tmp/x509up_u<uid>``, then
-``$X509_USER_CERT``/``$X509_USER_KEY``, then ``~/.globus``. Bearer tokens
-follow the WLCG discovery specification: ``$BEARER_TOKEN``, the file named
-by ``$BEARER_TOKEN_FILE``, ``$XDG_RUNTIME_DIR/bt_u<uid>``, ``/tmp/bt_u<uid>``.
+**Discovery.** As gfal2 does when a context is created, :func:`seed_options`
+copies the environment's credential into the options, over anything a
+configuration file said: ``$BEARER_TOKEN`` into ``[BEARER] TOKEN`` (and then
+nothing else), else ``$X509_USER_PROXY`` (not checked for existence),
+``/tmp/x509up_u<uid>`` if it exists, ``$X509_USER_CERT``/``$X509_USER_KEY``,
+or a readable ``~/.globus`` pair into ``[X509] CERT``/``KEY``. That is what
+``cred_get`` falls back to, and what ``get_opt_string("X509", "CERT")``
+shows.
+
+When a plugin asks for a credential, the ``[X509]`` options come first, then
+the same search again, lazily, so a variable set after the context was made
+still counts. Two things deliberately go beyond gfal2 here. A seeded file
+that does not exist is passed over rather than presented, so a stale
+``$X509_USER_PROXY`` cannot break token-only access (davix behaves the same).
+And bearer tokens follow the whole WLCG discovery specification:
+``$BEARER_TOKEN``, the file named by ``$BEARER_TOKEN_FILE``,
+``$XDG_RUNTIME_DIR/bt_u<uid>``, ``/tmp/bt_u<uid>``.
 """
 
 from __future__ import annotations
@@ -44,6 +55,7 @@ __all__ = [
     "find_x509",
     "find_bearer_token",
     "find_ca_path",
+    "seed_options",
     "TLSContexts",
 ]
 
@@ -107,9 +119,10 @@ class CredentialStore:
                     best = (value, prefix)
             return best
 
-    def delete(self, type: str, prefix: str) -> None:
+    def delete(self, type: str, prefix: str) -> bool:
+        """Remove one exact entry; ``False`` if there was none."""
         with self._lock:
-            self._entries.pop((type, prefix), None)
+            return self._entries.pop((type, prefix), None) is not None
 
     def clean(self) -> None:
         with self._lock:
@@ -141,6 +154,49 @@ def _existing(path: str | None) -> str | None:
     return path if path and os.path.isfile(path) else None
 
 
+def _trimmed(env: Mapping[str, str], name: str) -> str | None:
+    """``gfal2_trim_string(getenv(name))``: surrounding blanks dropped, ``""`` as unset."""
+    return env.get(name, "").strip() or None
+
+
+def seed_options(options: Options, environ: Mapping[str, str] | None = None) -> None:
+    """Write the environment's credential into ``options``, as ``gfal2_context_new`` does."""
+    env = os.environ if environ is None else environ
+    token = _trimmed(env, "BEARER_TOKEN")
+    if token:
+        options.set_string("BEARER", "TOKEN", token)
+        return
+    found = _environment_x509(env)
+    if found is not None:
+        options.set_string("X509", "CERT", found.cert)
+        options.set_string("X509", "KEY", found.key)
+
+
+def _environment_x509(env: Mapping[str, str]) -> X509Credential | None:
+    """gfal2's search, which trusts the variables without looking at the files."""
+    proxy = _trimmed(env, "X509_USER_PROXY") or _existing(f"/tmp/x509up_u{_uid()}")
+    if proxy:
+        return X509Credential(proxy, proxy)
+    cert, key = _trimmed(env, "X509_USER_CERT"), _trimmed(env, "X509_USER_KEY")
+    if cert and key:
+        return X509Credential(cert, key)
+    home = _trimmed(env, "HOME")
+    if home:
+        pair = X509Credential(
+            os.path.join(home, ".globus", "usercert.pem"),
+            os.path.join(home, ".globus", "userkey.pem"),
+        )
+        if os.access(pair.cert, os.R_OK) and os.access(pair.key, os.R_OK):
+            return pair
+    return None
+
+
+def _stale(cert: str, env: Mapping[str, str]) -> bool:
+    """A configured certificate that is missing and came from the environment."""
+    seeded = (_trimmed(env, "X509_USER_PROXY"), _trimmed(env, "X509_USER_CERT"))
+    return cert in seeded and not os.path.isfile(cert)
+
+
 def find_x509(
     options: Options,
     store: CredentialStore | None = None,
@@ -155,7 +211,7 @@ def find_x509(
             key, _ = store.get(X509_KEY, url)
             return X509Credential(cert, key or cert)
     cert = options.string("X509", "CERT")
-    if cert:
+    if cert and not _stale(cert, env):
         return X509Credential(cert, options.string("X509", "KEY") or cert)
     # Discovered (as opposed to configured) files count only if they exist,
     # as in davix: a stale X509_USER_PROXY must not break token-only access.

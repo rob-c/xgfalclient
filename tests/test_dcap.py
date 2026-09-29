@@ -323,7 +323,7 @@ def test_write(dctx: xgfalclient.Gfal2Context, door: DcapServer, root: Path) -> 
     assert (root / "data" / "new").read_bytes() == b"abc" + big
     assert door.checksums[-1] == zlib.adler32(b"abc" + big)
     line = door.log[-1].split()
-    assert line[5:8] == ["w", "-mode=0644", "-truncate"]
+    assert line[5:8] == ["w", "-mode=0744", "-truncate"]  # gfal2_open's mode
 
 
 def test_write_random_access(dctx: xgfalclient.Gfal2Context, door: DcapServer, root: Path) -> None:
@@ -338,7 +338,7 @@ def test_write_random_access(dctx: xgfalclient.Gfal2Context, door: DcapServer, r
         handle.write(b"!")
     assert (root / "data" / "rw").read_bytes() == b"01ABxy6789\x00\x00cd!"
     assert door.checksums[-1] is None  # no checksum once writes stopped being sequential
-    assert door.log[-1].split()[5:7] == ["rw", "-mode=0644"]
+    assert door.log[-1].split()[5:7] == ["rw", "-mode=0744"]
 
 
 def test_write_existing(dctx: xgfalclient.Gfal2Context, door: DcapServer, root: Path) -> None:
@@ -869,3 +869,66 @@ def test_open_flags_reach_the_door(dctx: xgfalclient.Gfal2Context, door: DcapSer
     loaded = with_dcap(dctx)
     loaded.open(door.url("/data/hello.txt"), O_RDONLY).close()
     assert door.log[-1].split()[5] == "r"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", range(0, 1)),
+        ("abc", range(0, 1)),
+        ("40000", range(40000, 40001)),
+        ("40000:40003", range(40000, 40003)),
+        ("40000:3", range(40000, 65536)),  # libdcap wraps a last below the first
+        (" 40000x:40002y", range(40000, 40002)),
+        ("70000", range(0, 1)),
+    ],
+)
+def test_callback_ports(value: str, expected: range) -> None:
+    assert file.callback_ports(value) == expected
+
+
+def test_listdir_callback_port_range(
+    dctx: xgfalclient.Gfal2Context, door: DcapServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dctx.stat(door.url("/data/hello.txt"))  # connect first, with the real socket class
+    tried: list[int] = []
+
+    class Picky(socket.socket):
+        """Ports 1 and 3 are taken; any other stands in for an ephemeral one."""
+
+        def bind(self, address: tuple[str, int]) -> None:  # type: ignore[override]
+            tried.append(address[1])
+            if address[1] == 1:
+                raise OSError(errno.EADDRINUSE, "in use")
+            if address[1] == 3:
+                raise OSError("in use, says nobody")
+            super().bind((address[0], 0))
+
+    monkeypatch.setattr(file.socket, "socket", Picky)
+    monkeypatch.setenv("DCACHE_CBPORT", "1:3")
+    assert "sub" in dctx.listdir(door.url("/data"))
+    assert tried == [1, 2]
+    monkeypatch.setenv("DCACHE_CBPORT", "2:9")
+    assert "sub" in dctx.listdir(door.url("/data"))
+    assert tried[2:] == [2]  # the first free one, and no further
+    for value, code in (("1", errno.EADDRINUSE), ("3", errno.EADDRINUSE)):
+        monkeypatch.setenv("DCACHE_CBPORT", value)
+        with pytest.raises(GError) as caught:
+            dctx.listdir(door.url("/data"))
+        assert caught.value.code == code
+        assert caught.value.message == (
+            "Error reported by the external library dcap : Bind failed, number : 27"
+        )
+
+
+def test_an_unresolvable_door_is_unreachable(
+    dctx: xgfalclient.Gfal2Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unknown(*args: object, **kwargs: object) -> None:
+        raise socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(control.socket, "create_connection", unknown)
+    with pytest.raises(GError) as caught:
+        dctx.stat("dcap://nosuch.invalid:22125/x")
+    # Not getaddrinfo's EAI code (-2, or 8 on macOS), which is no errno at all.
+    assert caught.value.code == errno.EHOSTUNREACH

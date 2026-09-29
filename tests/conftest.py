@@ -41,6 +41,8 @@ _AMBIENT = (
     "KRB5_CONFIG",
     "XGFAL_KRB5_BACKEND",
     "XGFAL_GSSAPI_LIBRARY",
+    "LS_COLORS",
+    "LCG_GFAL_INFOSYS",
 )
 
 #: Rebuilding a delegated proxy's chain from the TLS handshake needs the
@@ -62,6 +64,9 @@ def _hermetic(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPath
     for name in _AMBIENT:
         monkeypatch.delenv(name, raising=False)
     config = tmp_path_factory.mktemp("gfal2.d")
+    # The BDII is on by default and names lcg-bdii.cern.ch: point it at a
+    # closed local port, so a stray srm:// lookup is refused at once.
+    (config / "bdii.conf").write_text("[BDII]\nLCG_GFAL_INFOSYS=127.0.0.1:1\nCACHE_FILE=\n")
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("GFAL_CONFIG_DIR", str(config))
     monkeypatch.setenv("HOME", str(home))

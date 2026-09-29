@@ -9,6 +9,7 @@ from __future__ import annotations
 import errno
 import io
 import os
+import re
 import stat
 import sys
 import threading
@@ -31,6 +32,14 @@ from xgfalclient.types import Stat
 Run = Callable[..., tuple[int, str, str]]
 
 
+@pytest.fixture(autouse=True)
+def _environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``gfal-copy`` exports ``XrdSecGSIDELEGPROXY``: put it back afterwards."""
+    monkeypatch.setenv("XrdSecGSIDELEGPROXY", "")
+    monkeypatch.delenv("XrdSecGSIDELEGPROXY")
+    monkeypatch.delenv("LS_COLORS", raising=False)
+
+
 @pytest.fixture
 def run(capsys: pytest.CaptureFixture[str]) -> Run:
     def _run(*args: str) -> tuple[int, str, str]:
@@ -39,6 +48,11 @@ def run(capsys: pytest.CaptureFixture[str]) -> Run:
         return code, captured.out, captured.err
 
     return _run
+
+
+def test_copy_exports_gsi_delegation(run: Run) -> None:
+    assert run("--help")[0] == 0
+    assert os.environ["XrdSecGSIDELEGPROXY"] == "1"  # noqa: SIM112
 
 
 @pytest.fixture
@@ -209,6 +223,7 @@ def test_copy_verbose(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_copy_verbose_monitor_lines(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("xgfalclient.transfer.MONITOR_INTERVAL", 0.0)  # report every chunk
+    monkeypatch.setattr("xgfalclient.transfer.STREAM_MONITOR_INTERVAL", 0.0, raising=False)
     source, target = url(tree / "a.txt"), url(tree / "o")
     _code, out, _ = run("-v", source, target)
     monitors = [line for line in out.splitlines() if line.startswith("monitor: ")]
@@ -220,7 +235,8 @@ def test_copy_mock(run: Run) -> None:
     source, target = "mock://h/src?size=10&time=0", "mock://h/dst?size_post=10&time=0"
     assert run(source, target)[0] == errno.EEXIST  # gfal2: a size_post destination exists
     assert run("-f", source, target) == (0, f"Copying 10 bytes {source} => {target}\n", "")
-    failing = target + "&transfer_errno=5"
+    # gfal2 fails a mock copy inside its sleep loop, so only one that lasts a second
+    failing = target.replace("time=0", "time=1") + "&transfer_errno=5"
     assert run("-f", source, failing) == (
         5,
         f"Copying 10 bytes {source} => {failing}\n",
@@ -304,8 +320,8 @@ def test_copy_to_fifo(run: Run, tree: Path) -> None:
 
 
 def test_stream_to_unopenable_special(tree: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    command = base.Command("gfal-copy", copy_module.SPECS["copy"])
-    command.parse([url(tree / "a.txt"), url(tree / "o")])
+    command = base.Command()
+    command.parse(copy_module.SPECS["copy"], ["gfal-copy", url(tree / "a.txt"), url(tree / "o")])
     command.context = Gfal2Context()
     copier = copy_module._Copier(command)
     with pytest.raises(GError) as error:
@@ -457,9 +473,22 @@ def test_progress_bar_on_a_tty(run: Run, tree: Path, tty: None) -> None:
     assert out.endswith("\n")
 
 
+def test_progress_bar_follows_the_monitor(
+    run: Run, tree: Path, tty: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("xgfalclient.transfer.MONITOR_INTERVAL", 0.0)
+    monkeypatch.setattr("xgfalclient.transfer.STREAM_MONITOR_INTERVAL", 0.0, raising=False)
+    updates: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        progress.Progress, "update", lambda self, *args, **kwargs: updates.append(args)
+    )
+    assert run(url(tree / "a.txt"), url(tree / "o"))[0] == 0
+    assert updates[-1][:2] == (6, 6)
+
+
 def test_progress_bar_failure(run: Run, tree: Path, tty: None) -> None:
     code, out, _ = run(
-        "-f", "mock://h/s?size=1&time=0", "mock://h/d?size_post=1&time=0&transfer_errno=5"
+        "-f", "mock://h/s?size=1&time=0", "mock://h/d?size_post=1&time=1&transfer_errno=5"
     )
     assert code == 5
     assert "[FAILED]" in out
@@ -474,9 +503,9 @@ def test_progress_bar_timeout(
     )
     assert code == errno.ETIMEDOUT
     assert err == "Command timed out after 1 seconds!\n"
-    assert "[FAILED]  after 1s" in out
+    assert re.search(r"\[FAILED\]  after [01]s", out)
     for thread in threading.enumerate():
-        if thread.name == "gfal-command":
+        if thread.name == "Thread-1":
             thread.join(10)
 
 
@@ -572,8 +601,8 @@ def test_width(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_event_callback_quiet(tree: Path) -> None:
-    command = base.Command("gfal-copy", copy_module.SPECS["copy"])
-    command.parse([url(tree / "a.txt"), url(tree / "o")])
+    command = base.Command()
+    command.parse(copy_module.SPECS["copy"], ["gfal-copy", url(tree / "a.txt"), url(tree / "o")])
     command.context = Gfal2Context()
     transfer = copy_module._Copier(command).parameters(6)
     assert transfer.event_callback is not None

@@ -10,15 +10,34 @@ code written for the C-backed bindings runs unchanged::
 Each call is dispatched to the first plugin, in priority order, that both
 claims the URL and implements the operation. Where gfal2's core fills a gap
 itself - ``listdir`` from ``opendir``, ``mkdir_rec`` from ``mkdir``,
-``lstat`` from ``stat``, bulk ``unlink`` from single ones - so does this.
+``lstat`` from ``stat``, bulk ``unlink`` from single ones, ``getxattr`` of
+``user.checksum.<alg>`` from ``checksum`` - so does this.
+
+Every failure is a ``GError``: a plugin that lets a ``ValueError`` or a
+stray ``OSError`` escape is reported as ``EINVAL``/``EIO`` or the errno, as
+gfal2 reports everything. A freed context refuses every call with
+``EFAULT``, as the bindings do. The list forms of the tape calls answer one
+result per URL and raise only for an empty list or mismatched metadata.
+
+Knowingly different from gfal2: ``access`` falls back to ``stat`` for a
+plugin without ``access``; a bulk ``unlink`` routes each URL to its own
+plugin (gfal2 sends them all to the first URL's); ``rename`` across two
+plugins is refused with ``EPROTONOSUPPORT`` where gfal2 silently does
+nothing; client info is percent-encoded byte for byte, where gfal2 mangles
+non-ASCII bytes to ``%FF``; ``read(0)`` and ``write("")`` succeed; and
+``cancel()`` never waits for operations running on the calling thread (a
+callback that cancels its own copy would deadlock gfal2); and a second
+``free()`` does nothing rather than raise.
 """
 
 from __future__ import annotations
 
 import errno
+import functools
 import logging
 import os
 import threading
+import urllib.parse
 from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
@@ -31,11 +50,23 @@ from .creds import (
     find_bearer_token,
     find_ca_path,
     find_x509,
+    seed_options,
 )
-from .errors import GError, not_supported_url
+from .enums import event_side
+from .errors import GError, from_oserror, not_supported_url
 from .events import GfaltEvent
 from .options import Options
-from .plugin import O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, Plugin, PluginFile, StagingResult
+from .plugin import (
+    O_CREAT,
+    O_RDONLY,
+    O_RDWR,
+    O_TRUNC,
+    O_WRONLY,
+    DirEntry,
+    Plugin,
+    PluginFile,
+    StagingResult,
+)
 from .transfer import TransferParameters, run_bulk, run_copy
 from .types import Dirent, Stat, dtype_for_mode
 from .url import parent, scheme_of
@@ -46,6 +77,13 @@ if TYPE_CHECKING:
 __all__ = ["Gfal2Context", "FileType", "DirectoryType", "creat_context"]
 
 _log = logging.getLogger("gfal2")
+
+#: ``gfal2_cred_get``'s fallback when no prefix matches: the configured value.
+_CONFIGURED_CREDENTIAL = {
+    "X509_CERT": ("X509", "CERT"),
+    "X509_KEY": ("X509", "KEY"),
+    "BEARER": ("BEARER", "TOKEN"),
+}
 
 _OPEN_FLAGS = {
     "r": O_RDONLY,
@@ -129,22 +167,25 @@ class DirectoryType:
     def __init__(self, context: Gfal2Context, path: str) -> None:
         self._context = context
         self.path = path
-        self._entries: Iterator[tuple[str, Stat | None]] = context._opendir(path)
+        self._entries: Iterator[DirEntry] = context._opendir(path)
         self._offset = 0
 
-    def _next(self) -> tuple[str, Stat | None] | None:
+    def _next(self) -> tuple[str, Stat | None, int | None] | None:
+        """``(name, stat, d_type)``; ``d_type`` is ``None`` unless the plugin gave one."""
         try:
-            return self._context._guard(next, self._entries)  # type: ignore[no-any-return]
+            entry: DirEntry = self._context._guard(next, self._entries)
         except StopIteration:
             return None
+        return (entry[0], entry[1], entry[2] if len(entry) == 3 else None)
 
     def read(self) -> Dirent:
         entry = self._next()
         if entry is None:
             return Dirent()
-        name, info = entry
+        name, info, dtype = entry
         self._offset += 1
-        dtype = dtype_for_mode(info.st_mode) if info is not None else 0
+        if dtype is None:
+            dtype = dtype_for_mode(info.st_mode) if info is not None else 0
         ino = info.st_ino if info is not None else 0
         return Dirent(name, dtype, ino, self._offset)
 
@@ -152,11 +193,13 @@ class DirectoryType:
         entry = self._next()
         if entry is None:
             return None, None
-        name, info = entry
+        name, info, dtype = entry
         if info is None:
             info = self._context.stat(_child(self.path, name))
         self._offset += 1
-        return Dirent(name, dtype_for_mode(info.st_mode), info.st_ino, self._offset), info
+        if dtype is None:
+            dtype = dtype_for_mode(info.st_mode)
+        return Dirent(name, dtype, info.st_ino, self._offset), info
 
     def __iter__(self) -> Iterator[Dirent]:
         while True:
@@ -180,13 +223,19 @@ class Gfal2Context:
 
     def __init__(self, *, options: Options | None = None, load_plugins: bool = True) -> None:
         self.options = options if options is not None else Options()
+        seed_options(self.options)
         self.credentials = CredentialStore()
         self.tls = TLSContexts()
-        self._client_info: dict[str, str] = {}
+        #: Ordered pairs, re-ordered as gfal2's ``GPtrArray`` is (see ``add_client_info``).
+        self._client_info: list[tuple[str, str]] = []
         self._user_agent: tuple[str | None, str | None] = (None, None)
         self._cancel_generation = 0
         self._running = 0
+        #: Running operations per thread, so ``cancel()`` never waits for its own.
+        self._running_by_thread: dict[int, int] = {}
+        self._cancelling = 0
         self._lock = threading.Lock()
+        self._idle = threading.Condition(self._lock)
         self._freed = False
         self._load_lock = threading.Lock()
         self.plugins: list[Plugin] = []
@@ -245,7 +294,7 @@ class Gfal2Context:
         return found
 
     def _find(self, url: str, operation: str) -> Plugin | None:
-        self._load_for(scheme_of(url))
+        self._load_for(_load_key(url))
         for candidate in self.plugins:
             if candidate.implements(operation) and candidate.handles(url, operation):
                 return candidate
@@ -260,7 +309,7 @@ class Gfal2Context:
         return error
 
     def _copy_plugin(self, source: str, destination: str) -> Plugin | None:
-        self._load_for(scheme_of(source), scheme_of(destination))
+        self._load_for(_load_key(source), _load_key(destination))
         for candidate in self.plugins:
             if candidate.implements("copy") and candidate.copy_check(source, destination):
                 return candidate
@@ -268,34 +317,57 @@ class Gfal2Context:
 
     # -- plumbing ---------------------------------------------------------------
 
-    def _guard(self, method: Any, *args: Any) -> Any:
-        """Run a plugin call, counting it as running and normalising failures."""
+    def _enter(self) -> None:
+        """Count one more running operation (refused while a ``cancel()`` drains)."""
         if self._freed:
-            raise GError("The context has been freed", errno.EBADF)
+            raise _freed()
         with self._lock:
+            if self._cancelling:
+                raise GError("[gfal2_cancel] operation canceled by user", errno.ECANCELED)
             self._running += 1
+            me = threading.get_ident()
+            self._running_by_thread[me] = self._running_by_thread.get(me, 0) + 1
+
+    def _leave(self) -> None:
+        with self._lock:
+            self._running -= 1
+            me = threading.get_ident()
+            left = self._running_by_thread.pop(me) - 1
+            if left:
+                self._running_by_thread[me] = left
+            self._idle.notify_all()
+
+    def _guard(self, method: Any, *args: Any) -> Any:
+        """Run a plugin call, counting it as running and making every failure a ``GError``."""
+        self._enter()
         try:
             return method(*args)
         except (GError, StopIteration):
             raise
         except OSError as exc:
-            code = exc.errno if exc.errno is not None else errno.EIO
-            raise GError(str(exc), code) from exc
+            # gfal2's file plugin words a local failure; so does any errno here.
+            if exc.errno is not None:
+                raise from_oserror(exc) from exc
+            raise GError(str(exc), errno.EIO) from exc
+        except Exception as exc:
+            code = errno.EINVAL if isinstance(exc, ValueError) else errno.EIO
+            raise GError(str(exc) or type(exc).__name__, code) from exc
         finally:
-            with self._lock:
-                self._running -= 1
+            self._leave()
 
     def _dispatch(self, operation: str, url: str, *args: Any) -> Any:
         plugin = self.plugin(url, operation)
         return self._guard(getattr(plugin, operation), url, *args)
 
-    def _open(self, url: str, flags: int, size: int | None = None) -> PluginFile:
+    def _open(self, url: str, flags: int, size: int | None = None, mode: int = 0o744) -> PluginFile:
+        """Open through the URL's plugin; ``mode`` for a file this creates is
+        gfal2's (``gfal2_open`` passes 0744)."""
         plugin = self.plugin(url, "open")
         if size is None:
-            return self._guard(plugin.open, url, flags)  # type: ignore[no-any-return]
-        return self._guard(plugin.open, url, flags, 0o644, size)  # type: ignore[no-any-return]
+            return self._guard(plugin.open, url, flags, mode)  # type: ignore[no-any-return]
+        return self._guard(plugin.open, url, flags, mode, size)  # type: ignore[no-any-return]
 
-    def _opendir(self, url: str) -> Iterator[tuple[str, Stat | None]]:
+    def _opendir(self, url: str) -> Iterator[DirEntry]:
         plugin = self._find(url, "opendir")
         if plugin is not None:
             return self._guard(plugin.opendir, url)  # type: ignore[no-any-return]
@@ -333,34 +405,42 @@ class Gfal2Context:
         )
 
     def user_agent_string(self) -> str:
-        """What goes in a ``User-Agent`` header."""
-        from ._version import __version__
+        """What goes in a ``User-Agent`` header: ``<agent>/<version> gfal2/<v>``, as gfal2 sends."""
+        from ._version import GFAL2_VERSION
 
         name, version = self._user_agent
-        if name:
-            return f"{name}/{version}" if version else name
-        return f"xgfalclient/{__version__}"
+        own = f"gfal2/{GFAL2_VERSION}"
+        return f"{name}/{version} {own}" if name else own
 
     def client_info_string(self) -> str:
-        """``key=value;key=value`` - the ``ClientInfo`` header gfal2 sends."""
-        return ";".join(f"{key}={value}" for key, value in self._client_info.items())
+        """``key=value;key=value``, each side percent-encoded - gfal2's ``ClientInfo`` header.
+
+        Empty when there is none, in which case gfal2 sends no header.
+        """
+        return ";".join(
+            f"{_urlencode(key)}={_urlencode(value)}" for key, value in self._client_info
+        )
 
     # -- namespace -----------------------------------------------------------------
 
     def access(self, path: str, mode: int) -> int:
+        """``0``, or what the plugin answers (gfal2's mock answers 1)."""
         plugin = self._find(path, "access")
-        if plugin is not None:
-            self._guard(plugin.access, path, mode)
-        else:
+        if plugin is None:
             self._dispatch("stat", path)
-        return 0
+            return 0
+        answer = self._guard(plugin.access, path, mode)
+        return answer if isinstance(answer, int) else 0
 
     def chmod(self, path: str, mode: int) -> int:
         self._dispatch("chmod", path, mode)
         return 0
 
     def rename(self, old: str, new: str) -> int:
-        self._dispatch("rename", old, new)
+        plugin = self.plugin(old, "rename")
+        if self._find(new, "rename") is not plugin:
+            raise not_supported_url(new)
+        self._guard(plugin.rename, old, new)
         return 0
 
     def stat(self, path: str) -> Stat:
@@ -377,27 +457,43 @@ class Gfal2Context:
 
     def mkdir_rec(self, path: str, mode: int = 0o755) -> int:
         if self._find(path, "mkdir_rec") is not None:
-            self._dispatch("mkdir_rec", path, mode)
+            try:
+                self._dispatch("mkdir_rec", path, mode)
+            except GError as exc:
+                if exc.code != errno.EEXIST:
+                    raise
             return 0
         self._mkdir_parents(path, mode)
         return 0
 
     def _mkdir_parents(self, path: str, mode: int) -> None:
-        try:
-            if self.stat(path).is_dir():
-                return
-            raise GError(f"{path} exists and is not a directory", errno.ENOTDIR)
-        except GError as exc:
-            if exc.code != errno.ENOENT:
-                raise
-        up = parent(path)
-        if up != path:
-            self._mkdir_parents(up, mode)
-        try:
-            self.mkdir(path, mode)
-        except GError as exc:
-            if exc.code != errno.EEXIST:
-                raise
+        """``gfal2_mkdir_rec``: try the leaf; on ``ENOENT`` climb until a mkdir works.
+
+        Anything already at ``path`` - a file included - counts as done
+        (``EEXIST``), exactly as in gfal2.
+        """
+        missing: list[str] = []  # deepest first
+        current = path
+        while True:
+            try:
+                self.mkdir(current, mode)
+                break
+            except GError as exc:
+                if exc.code == errno.EEXIST:
+                    break
+                if exc.code != errno.ENOENT:
+                    raise
+            missing.append(current)
+            up = parent(current)
+            if up == current:
+                break  # even the root is missing; creating it below reports why
+            current = up
+        for url in reversed(missing):
+            try:
+                self.mkdir(url, mode)
+            except GError as exc:
+                if exc.code != errno.EEXIST:  # made by someone else meanwhile
+                    raise
 
     def rmdir(self, path: str) -> int:
         self._dispatch("rmdir", path)
@@ -407,7 +503,7 @@ class Gfal2Context:
         plugin = self._find(path, "listdir")
         if plugin is not None:
             return self._guard(plugin.listdir, path)  # type: ignore[no-any-return]
-        return [name for name, _ in self._opendir(path)]
+        return [entry[0] for entry in self._opendir(path)]
 
     def opendir(self, path: str) -> DirectoryType:
         return DirectoryType(self, path)
@@ -431,9 +527,7 @@ class Gfal2Context:
         if isinstance(path, str):
             self._dispatch("unlink", path)
             return 0
-        paths = list(path)
-        if not paths:
-            return []
+        paths = _non_empty(path)
         bulk = self._find(paths[0], "unlink_bulk")
         if bulk is not None:
             return self._guard(bulk.unlink_bulk, paths)  # type: ignore[no-any-return]
@@ -449,7 +543,14 @@ class Gfal2Context:
     # -- metadata -------------------------------------------------------------------
 
     def getxattr(self, path: str, name: str) -> str:
-        return self._dispatch("getxattr", path, name)  # type: ignore[no-any-return]
+        """The attribute; for ``user.checksum.<alg>`` a failed lookup falls back to
+        :meth:`checksum`, as gfal2's core does."""
+        try:
+            return self._dispatch("getxattr", path, name)  # type: ignore[no-any-return]
+        except GError:
+            if not name.startswith(_CHECKSUM_XATTR):
+                raise
+        return self.checksum(path, name[len(_CHECKSUM_XATTR) :])
 
     def setxattr(self, path: str, name: str, value: str, flags: int = 0) -> int:
         self._dispatch("setxattr", path, name, value, flags)
@@ -472,53 +573,75 @@ class Gfal2Context:
 
     def bring_online(self, path: str | Sequence[str], *args: Any) -> tuple[Any, str]:
         """``(path(s), [metadata(s)], pintime, timeout, async)``, as gfal2 overloads it."""
-        single = isinstance(path, str)
-        paths = [path] if isinstance(path, str) else list(path)
         if len(args) == 4:
             metadata_arg, pintime, timeout, is_async = args
-            metadata = [metadata_arg] if single else list(metadata_arg)
         elif len(args) == 3:
+            metadata_arg = None
             pintime, timeout, is_async = args
-            metadata = [""] * len(paths)
         else:
             raise TypeError("bring_online(path(s), [metadata], pintime, timeout, async)")
-        if len(metadata) != len(paths):
-            raise GError("Number of metadata entries does not match the paths", errno.EINVAL)
-        plugin = self.plugin(paths[0], "bring_online")
-        results, token = self._guard(
-            plugin.bring_online, paths, metadata, int(pintime), int(timeout), bool(is_async)
-        )
-        if single:
+        call = (int(pintime), int(timeout), bool(is_async))
+        if isinstance(path, str):
+            metadata = [metadata_arg if metadata_arg is not None else ""]
+            plugin = self.plugin(path, "bring_online")
+            results, token = self._guard(plugin.bring_online, [path], metadata, *call)
             return _single_status(results[0]), token
+        paths = _non_empty(path)
+        metadata = list(metadata_arg) if metadata_arg is not None else [""] * len(paths)
+        if len(metadata) != len(paths):
+            raise GError("List of urls and list of metadata with different sizes", errno.EINVAL)
+        found = self._bulk("bring_online", paths, metadata, *call)
+        if isinstance(found, GError):
+            return [found] * len(paths), ""
+        results, token = found
         return [_list_error(r, u, None) for r, u in zip(results, paths)], token
 
     def bring_online_poll(self, path: str | Sequence[str], token: str) -> Any:
-        paths = [path] if isinstance(path, str) else list(path)
-        plugin = self.plugin(paths[0], "bring_online_poll")
-        results = self._guard(plugin.bring_online_poll, paths, token)
         if isinstance(path, str):
-            return _single_status(results[0])
-        return [_list_error(r, u, "online") for r, u in zip(results, paths)]
+            return _single_status(self._one("bring_online_poll", path, token), pending=True)
+        return self._bulk_list("bring_online_poll", path, "online", token)
 
     def release(self, path: str | Sequence[str], token: str = "") -> Any:
-        paths = [path] if isinstance(path, str) else list(path)
-        plugin = self.plugin(paths[0], "release")
-        results = self._guard(plugin.release, paths, token)
-        return _single_or_list(path, results)
+        if isinstance(path, str):
+            return _single_done(self._one("release", path, token))
+        return self._bulk_list("release", path, None, token)
 
     def abort_bring_online(self, path: str | Sequence[str], token: str) -> Any:
-        paths = [path] if isinstance(path, str) else list(path)
-        plugin = self.plugin(paths[0], "abort_bring_online")
-        results = self._guard(plugin.abort_bring_online, paths, token)
-        return _single_or_list(path, results)
+        if isinstance(path, str):
+            return _single_done(self._one("abort_bring_online", path, token))
+        return self._bulk_list("abort_bring_online", path, None, token)
 
     def archive_poll(self, path: str | Sequence[str]) -> Any:
-        paths = [path] if isinstance(path, str) else list(path)
-        plugin = self.plugin(paths[0], "archive_poll")
-        results = self._guard(plugin.archive_poll, paths)
         if isinstance(path, str):
-            return _single_status(results[0])
-        return [_list_error(r, u, "archived") for r, u in zip(results, paths)]
+            return _single_status(self._one("archive_poll", path), pending=True)
+        return self._bulk_list("archive_poll", path, "archived")
+
+    def _one(self, operation: str, path: str, *args: Any) -> Any:
+        """A list-shaped plugin call made for one URL: its only result."""
+        plugin = self.plugin(path, operation)
+        return self._guard(getattr(plugin, operation), [path], *args)[0]
+
+    def _bulk(self, operation: str, paths: list[str], *args: Any) -> Any:
+        """Run a list-form call on the first URL's plugin, or the ``GError`` every file gets.
+
+        gfal2 sends the whole list to the plugin of the first URL, and turns a
+        failure to find one (or of the call as a whole) into the same error
+        for each file rather than raising.
+        """
+        try:
+            plugin = self.plugin(paths[0], operation)
+            return self._guard(getattr(plugin, operation), paths, *args)
+        except GError as exc:
+            return exc
+
+    def _bulk_list(
+        self, operation: str, path: Sequence[str], pending: str | None, *args: Any
+    ) -> list[GError | None]:
+        paths = _non_empty(path)
+        found = self._bulk(operation, paths, *args)
+        if isinstance(found, GError):
+            return [found] * len(paths)
+        return [_list_error(r, u, pending) for r, u in zip(found, paths)]
 
     # -- QoS ----------------------------------------------------------------------
 
@@ -540,25 +663,32 @@ class Gfal2Context:
 
     # -- tokens ---------------------------------------------------------------------
 
-    def token_retrieve(
-        self, path: str, issuer: str, validity: int, access: bool | Sequence[str]
-    ) -> str:
-        if isinstance(access, bool):
-            write_access, activities = access, []
+    def token_retrieve(self, path: str, issuer: str, validity: int, *access: Any) -> str:
+        """``(url, issuer, validity, write_access | activities)`` or
+        ``(url, issuer, validity, write_access, activities)``, as gfal2 overloads it.
+
+        Given activities, the plugin asks for those; ``write_access`` only
+        picks a default set, and is ``False`` for the activities-only form.
+        """
+        if len(access) == 2:
+            write_access, activities = bool(access[0]), list(access[1])
+        elif len(access) == 1 and isinstance(access[0], (list, tuple)):
+            write_access, activities = False, list(access[0])
+            if not activities:
+                raise GError("Empty list of activities", errno.EINVAL)
+        elif len(access) == 1:
+            write_access, activities = bool(access[0]), []
         else:
-            activities = list(access)
-            write_access = any(
-                activity.upper() in ("UPLOAD", "MANAGE", "UPDATE", "DELETE")
-                for activity in activities
-            )
+            raise TypeError("token_retrieve(url, issuer, validity, write_access[, activities])")
         return self._dispatch(  # type: ignore[no-any-return]
             "token_retrieve", path, issuer, int(validity), write_access, activities
         )
 
     # -- copies -----------------------------------------------------------------------
 
-    def transfer_parameters(self) -> TransferParameters:
-        return TransferParameters()
+    #: gfal2 binds the class itself here, so ``ctx.transfer_parameters()`` makes one
+    #: and ``isinstance(p, ctx.transfer_parameters)`` holds.
+    transfer_parameters = TransferParameters
 
     def filecopy(self, *args: Any) -> Any:
         """``filecopy([params,] src, dst)`` or ``filecopy([params,] srcs, dsts[, checksums])``."""
@@ -618,8 +748,8 @@ class Gfal2Context:
 
     # -- credentials -------------------------------------------------------------------
 
-    def cred_new(self, type: str, value: str) -> Credential:
-        return Credential(type, value)
+    #: As in gfal2, the ``Credential`` class itself.
+    cred_new = Credential
 
     def cred_set(self, prefix: str, credential: Credential) -> int:
         self.credentials.set(prefix, credential)
@@ -627,12 +757,18 @@ class Gfal2Context:
         return 0
 
     def cred_get(self, type: str, url: str) -> tuple[str, str]:
-        return self.credentials.get(type, url)
+        """``(value, prefix)``; with no prefix matching, the configured
+        ``[X509] CERT``/``KEY`` or ``[BEARER] TOKEN`` and an empty prefix."""
+        found = self.credentials.get(type, url)
+        if found[1] or type not in _CONFIGURED_CREDENTIAL:
+            return found
+        return self.options.string(*_CONFIGURED_CREDENTIAL[type]), ""
 
     def cred_del(self, type: str, prefix: str) -> int:
-        self.credentials.delete(type, prefix)
+        """``0``, or ``-1`` if there was no credential of ``type`` at exactly ``prefix``."""
+        removed = self.credentials.delete(type, prefix)
         self.tls.clear()
-        return 0
+        return 0 if removed else -1
 
     def cred_clean(self) -> int:
         self.credentials.clean()
@@ -649,15 +785,31 @@ class Gfal2Context:
         return self._user_agent
 
     def add_client_info(self, key: str, value: str) -> int:
-        self._client_info[key] = value
+        """Set ``key``; a key set again moves to the end, as in gfal2."""
+        with self._lock:
+            self._remove_client_info(key)
+            self._client_info.append((key, value))
         return 0
 
     def remove_client_info(self, key: str) -> int:
-        self._client_info.pop(key, None)
+        with self._lock:
+            if not self._remove_client_info(key):
+                raise GError(f"Key {key} not found", errno.EINVAL)
         return 0
 
+    def _remove_client_info(self, key: str) -> bool:
+        """``g_ptr_array_remove_index_fast``: the last entry takes the removed one's place."""
+        for index, (name, _) in enumerate(self._client_info):
+            if name == key:
+                last = self._client_info.pop()
+                if index < len(self._client_info):
+                    self._client_info[index] = last
+                return True
+        return False
+
     def clear_client_info(self) -> int:
-        self._client_info.clear()
+        with self._lock:
+            self._client_info = []
         return 0
 
     def get_client_info(self) -> dict[str, str]:
@@ -666,12 +818,32 @@ class Gfal2Context:
     # -- lifecycle ----------------------------------------------------------------------
 
     def cancel(self) -> int:
-        """Cancel the copies in flight; answers how many operations were running."""
+        """Cancel what is in flight and wait for it to stop, as ``gfal2_cancel`` does.
+
+        Answers how many operations were running. Copies notice between
+        chunks; an operation starting meanwhile fails with ``ECANCELED``.
+        Operations running on the calling thread (a callback cancelling its
+        own copy) are not waited for.
+        """
         with self._lock:
             self._cancel_generation += 1
-            return self._running
+            running = self._running
+            self._cancelling += 1
+            try:
+                me = threading.get_ident()
+                self._idle.wait_for(lambda: self._running == self._running_by_thread.get(me, 0))
+            finally:
+                self._cancelling -= 1
+            return running
 
     def free(self) -> None:
+        """Release the plugins; every later call raises ``EFAULT``.
+
+        A second ``free()`` does nothing, where gfal2's raises: fixtures and
+        ``with`` blocks free contexts that a test may already have freed.
+        """
+        if self._freed:
+            return
         for plugin in self.plugins:
             try:
                 plugin.close()
@@ -691,9 +863,47 @@ class Gfal2Context:
         return f"<xgfalclient.Gfal2Context plugins={loaded} pending={len(self._pending)}>"
 
 
-# gfal2 exposes its record types as attributes of the context class too.
+# gfal2 exposes its record types as attributes of the context class too, and
+# (being defined inside the class's scope) its event enum and NullHandler.
 for _alias in (Credential, DirectoryType, Dirent, FileType, GfaltEvent, Stat, TransferParameters):
     setattr(Gfal2Context, _alias.__name__, _alias)
+Gfal2Context.event_side = event_side  # type: ignore[attr-defined]
+Gfal2Context.gfalt_event = GfaltEvent  # type: ignore[attr-defined]
+Gfal2Context.NullHandler = logging.NullHandler  # type: ignore[attr-defined]
+
+
+def _freed() -> GError:
+    return GError("gfal2 context has been freed", errno.EFAULT)
+
+
+def _live(method: Any) -> Any:
+    """Refuse the call once the context is freed, as every bindings method does."""
+
+    @functools.wraps(method)
+    def call(self: Gfal2Context, *args: Any, **kwargs: Any) -> Any:
+        if self._freed:
+            raise _freed()
+        return method(self, *args, **kwargs)
+
+    return call
+
+
+#: The bindings' methods; each raises ``EFAULT`` on a freed context.
+_API = (
+    "cancel", "open", "file", "opendir", "directory", "access", "lstat", "stat",
+    "chmod", "unlink", "mkdir", "mkdir_rec", "rmdir", "listdir", "rename", "readlink",
+    "symlink", "checksum", "getxattr", "setxattr", "listxattr", "remove_opt",
+    "get_opt_integer", "get_opt_boolean", "get_opt_string", "get_opt_string_list",
+    "set_opt_string_list", "set_opt_string", "set_opt_boolean", "set_opt_integer",
+    "load_opts_from_file", "set_user_agent", "get_user_agent", "add_client_info",
+    "remove_client_info", "clear_client_info", "get_client_info", "filecopy",
+    "bring_online", "bring_online_poll", "archive_poll", "release", "abort_bring_online",
+    "get_plugin_names", "qos_check_classes", "check_file_qos",
+    "check_available_qos_transitions", "check_target_qos", "change_object_qos",
+    "token_retrieve", "cred_set", "cred_get", "cred_del", "cred_clean",
+)  # fmt: skip
+for _name in _API:
+    setattr(Gfal2Context, _name, _live(getattr(Gfal2Context, _name)))
 
 
 class _Running:
@@ -703,16 +913,17 @@ class _Running:
         self.context = context
 
     def __enter__(self) -> None:
-        with self.context._lock:
-            self.context._running += 1
+        self.context._enter()
 
     def __exit__(self, *exc: object) -> None:
-        with self.context._lock:
-            self.context._running -= 1
+        self.context._leave()
 
 
-def _single_status(result: StagingResult) -> int:
+def _single_status(result: StagingResult, pending: bool = False) -> int:
+    """``1`` done, ``0`` not yet; a poll's ``EAGAIN`` is "not yet" too, as in the bindings."""
     if isinstance(result, GError):
+        if pending and result.code == errno.EAGAIN:
+            return 0
         raise result
     return 1 if result else 0
 
@@ -726,12 +937,38 @@ def _list_error(result: StagingResult, url: str, pending: str | None) -> GError 
     return None
 
 
-def _single_or_list(path: str | Sequence[str], results: list[GError | None]) -> Any:
-    if isinstance(path, str):
-        if results[0] is not None:
-            raise results[0]
-        return 0
-    return results
+def _single_done(result: GError | None) -> int:
+    if result is not None:
+        raise result
+    return 0
+
+
+def _load_key(url: str) -> str:
+    """The scheme a lazily loaded plugin is filed under.
+
+    ``scheme_of`` wants ``scheme://``; gfal2's mock plugin also takes
+    ``mock:anything``, so a bare ``scheme:`` prefix names a plugin to load too.
+    """
+    return scheme_of(url) or url.partition(":")[0].lower()
+
+
+def _non_empty(paths: Sequence[str]) -> list[str]:
+    """A list-form argument as a list; gfal2 refuses an empty one."""
+    found = list(paths)
+    if not found:
+        raise GError("Empty list of files", errno.EINVAL)
+    return found
+
+
+#: The attribute prefix gfal2's core answers with a checksum when a plugin cannot.
+_CHECKSUM_XATTR = "user.checksum."
+
+
+def _urlencode(text: str) -> str:
+    """``gfal2_urlencode``: every byte but ``[A-Za-z0-9._-]`` as ``%XX``."""
+    return urllib.parse.quote(text, safe="", encoding="utf-8", errors="surrogateescape").replace(
+        "~", "%7E"
+    )
 
 
 def creat_context() -> Gfal2Context:

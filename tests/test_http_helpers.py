@@ -61,7 +61,8 @@ def davs_open(tmp_path: Path, grid_env: PKI) -> Iterator[WebDAVServer]:
 def hctx() -> Iterator[xgfalclient.Gfal2Context]:
     context = xgfalclient.creat_context()
     yield context
-    context.free()
+    if not context._freed:  # a test may free it; a second free() is EFAULT
+        context.free()
 
 
 def write(server: WebDAVServer, path: str, data: bytes) -> Path:
