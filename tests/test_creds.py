@@ -216,3 +216,18 @@ def test_real_uid_and_empty_token_file_variable() -> None:
     assert (
         find_bearer_token(Options(load_system=False), None, "", {"BEARER_TOKEN_FILE": ""}) is None
     )
+
+
+def test_store_prefix_must_end_on_a_directory() -> None:
+    """A token for one directory never reaches a sibling that merely shares its spelling."""
+    store = CredentialStore()
+    store.set("https://se/store/alice", Credential(BEARER, "alice"))
+    assert store.get(BEARER, "https://se/store/alicebob/f") == ("", "")
+    assert store.get(BEARER, "https://se/store/alice") == ("alice", "https://se/store/alice")
+    assert store.get(BEARER, "https://se/store/alice/f") == ("alice", "https://se/store/alice")
+    store.set("https://se/store/", Credential(BEARER, "store"))
+    assert store.get(BEARER, "https://se/store/alicebob/f") == ("store", "https://se/store/")
+    store.set("davs://h", Credential(BEARER, "h"))
+    assert store.get(BEARER, "davs://hx/y") == ("", "")
+    assert store.get(BEARER, "davs://h:443/x") == ("", "")
+    assert store.get(BEARER, "davs://h/x") == ("h", "davs://h")

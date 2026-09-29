@@ -76,6 +76,17 @@ class Credential:
         return hash((self.type, self.value))
 
 
+def _covers(prefix: str, url: str) -> bool:
+    """Whether ``prefix`` names ``url`` or a directory above it, as gfal2 matches.
+
+    A bare string prefix is not enough: a token for ``https://h/store/alice``
+    must not go to ``https://h/store/alicebob/f``.
+    """
+    if not url.startswith(prefix):
+        return False
+    return len(prefix) == len(url) or prefix.endswith("/") or url[len(prefix)] == "/"
+
+
 class CredentialStore:
     """Credentials keyed by ``(type, URL prefix)``; the longest prefix wins."""
 
@@ -92,7 +103,7 @@ class CredentialStore:
         with self._lock:
             best = ("", "")
             for (kind, prefix), value in self._entries.items():
-                if kind == type and url.startswith(prefix) and len(prefix) >= len(best[1]):
+                if kind == type and _covers(prefix, url) and len(prefix) >= len(best[1]):
                     best = (value, prefix)
             return best
 
