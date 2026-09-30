@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,xrootd]"
+      - name: ruff
+        run: ruff check src tests benchmarks
+      - name: mypy --strict
+        run: mypy
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The xrootd extra brings xrdclient, which the root:// tests need;
+      # the interop tests want real grid servers in docker and skip themselves.
+      - run: pip install -e ".[dev,xrootd]"
+      # Coverage is reported, not gated: pyproject's 100% holds for the full
+      # run with XGFAL_INTEROP=1, and each OS alone leaves the other's
+      # platform branches (and the interop-only lines) unvisited.
+      - name: pytest
+        run: >-
+          pytest -q -p no:cacheprovider -n auto --timeout=300
+          --cov --cov-report=term-missing --cov-fail-under=0
