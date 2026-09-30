@@ -77,7 +77,7 @@ import random
 import socket
 import threading
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 
 from ... import events as ev
 from ... import transfer as core
@@ -90,13 +90,14 @@ from ._client import (
     BLOCK,
     FileBody,
     Response,
+    TransportError,
     config_group,
     status_error,
     wire_scheme,
     wire_url,
 )
 from ._delegation import delegate
-from ._io import HTTPReadFile, HTTPWriteFile
+from ._io import HTTPReadFile, HTTPWriteFile, _skip
 from ._token import se_token
 
 if TYPE_CHECKING:
@@ -549,22 +550,46 @@ def upload(plugin: HTTPPlugin, transfer: Transfer) -> None:
     with handle:
         size = os.fstat(handle.fileno()).st_size
         transfer.source_size = size
+        _put_with_retry(plugin, transfer, handle, size)
+    transfer.progress(size, force=True)
 
-        def progress(count: int) -> None:
-            transfer.add(count)
-            transfer.check()
 
+def _put_with_retry(plugin: HTTPPlugin, transfer: Transfer, handle: BinaryIO, size: int) -> None:
+    """``PUT`` the whole file, restarting it if a flaky link drops the body.
+
+    A ``PUT`` replaces the whole resource, so a dropped one leaves nothing to
+    resume from - but nothing committed either, so it is safe to send again
+    from the start, up to ``CONN_RETRY`` times. A refusal (a bad status) is
+    the server's answer, not a broken link, and is not retried.
+    """
+    destination = resolved(plugin, transfer.destination)
+    headers = _upload_headers(transfer)
+    attempts = 0
+    sent = transfer.transferred
+
+    def progress(count: int) -> None:
+        transfer.add(count)
+        transfer.check()
+
+    while True:
+        handle.seek(0)
         try:
             plugin._put_file(
-                resolved(plugin, transfer.destination),
+                destination,
                 FileBody(handle, 0, size, progress),
                 size,
                 timeout=_deadline_timeout(transfer, plugin.io_timeout()),
-                headers=_upload_headers(transfer),
+                headers=headers,
             )
+            return
+        except TransportError as exc:
+            attempts += 1
+            if attempts > plugin.conn_retry():
+                raise _destination(exc) from None
+            transfer.transferred = sent  # undo the abandoned attempt's progress
+            plugin.retry_pause(attempts)
         except GError as exc:
             raise _destination(exc) from None
-    transfer.progress(size, force=True)
 
 
 # ---------------------------------------------------------------------------
@@ -623,18 +648,38 @@ def _pwrite_all(fd: int, view: memoryview, offset: int) -> None:
 
 def _single(plugin: HTTPPlugin, transfer: Transfer, fd: int, size: int) -> None:
     timeout = plugin.io_timeout()
-    with plugin._get(transfer.source, {}, timeout=timeout) as response:
-        buffer = bytearray(BLOCK)
-        view = memoryview(buffer)
-        total = 0
-        while True:
-            count = response.readinto(view)
-            if count <= 0:
-                break
-            _pwrite_all(fd, view[:count], total)
-            total += count
-            transfer.add(count)
-            transfer.check()
+    view = memoryview(bytearray(BLOCK))
+    total = 0
+    attempts = 0
+    # A GET whose connection *drops* is resumed with a ranged GET from where it
+    # got to, up to CONN_RETRY times. A response that ends cleanly but short of
+    # the file is the server's answer, not a broken link: it is not resumed, and
+    # the size check below turns it into the short-copy error it has always been.
+    while True:
+        headers = {"Range": f"bytes={total}-"} if total else {}
+        try:
+            with plugin._get(transfer.source, headers, timeout=timeout) as response:
+                if total and response.status == 200:
+                    _skip(response, total)  # a server that ignores Range
+                while total < size:
+                    count = response.readinto(view)
+                    if count <= 0:
+                        break
+                    _pwrite_all(fd, view[:count], total)
+                    total += count
+                    attempts = 0  # progress resets the budget
+                    transfer.add(count)
+                    transfer.check()
+        except TransportError:
+            attempts += 1
+            if attempts > plugin.conn_retry():
+                raise GError(
+                    f"connection closed at {total} of {size} bytes downloading {transfer.source}",
+                    errno.EIO,
+                ) from None
+            plugin.retry_pause(attempts)
+            continue
+        break  # the response ended without a drop
     if total != size:
         raise GError(f"Short copy: {total} bytes transferred, the source has {size}", errno.EIO)
 
@@ -649,21 +694,42 @@ def _parallel(plugin: HTTPPlugin, transfer: Transfer, fd: int, size: int, stream
     timeout = plugin.io_timeout()
 
     def fetch(offset: int, count: int, view: memoryview) -> None:
-        headers = {"Range": f"bytes={offset}-{offset + count - 1}"}
-        with plugin._get(transfer.source, headers, timeout=timeout) as response:
-            if response.status != 206:
-                raise _NoRanges
-            done = 0
-            while done < count and not stop.is_set():
-                got = response.readinto(view[: min(len(view), count - done)])
-                if got <= 0:
+        done = 0
+        attempts = 0
+        # A segment whose connection *drops* is re-requested from where it got
+        # to, so one flaky stream costs a reconnect rather than the download. A
+        # clean 206 that is shorter than the range asked for is not a drop - it
+        # is the short read it has always been.
+        while True:
+            headers = {"Range": f"bytes={offset + done}-{offset + count - 1}"}
+            try:
+                with plugin._get(transfer.source, headers, timeout=timeout) as response:
+                    if response.status != 206:
+                        raise _NoRanges
+                    while done < count and not stop.is_set():
+                        got = response.readinto(view[: min(len(view), count - done)])
+                        if got <= 0:
+                            break
+                        _pwrite_all(fd, view[:got], offset + done)
+                        done += got
+                        attempts = 0
+                        transfer.add(got)
+                        transfer.check()
+            except TransportError:
+                attempts += 1
+                if attempts > plugin.conn_retry():
                     raise GError(
-                        f"Short read of {transfer.source} at offset {offset + done}", errno.EIO
-                    )
-                _pwrite_all(fd, view[:got], offset + done)
-                done += got
-                transfer.add(got)
-                transfer.check()
+                        f"connection closed at {offset + done} of {offset + count} "
+                        f"reading {transfer.source}",
+                        errno.EIO,
+                    ) from None
+                plugin.retry_pause(attempts)
+                continue
+            if done >= count or stop.is_set():
+                return
+            raise GError(
+                f"Short read of {transfer.source} at offset {offset + done}", errno.EIO
+            )
 
     def worker() -> None:
         view = memoryview(bytearray(BLOCK))
@@ -752,6 +818,7 @@ def third_party(plugin: HTTPPlugin, transfer: Transfer, mode: str) -> None:
         else (transfer.source, transfer.destination)
     )
     params = transfer.params
+    transfer.third_party = True
     headers = _passive_credential(plugin, far, mode == PUSH, transfer)
     signer = plugin.presigner_for(far)
     if signer is not None:

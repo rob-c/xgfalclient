@@ -1309,6 +1309,7 @@ class XRootDPlugin(Plugin):
         once more.
         """
         params = transfer.params
+        transfer.third_party = True
         job = _Rendezvous(
             self._copy_url(transfer.source, params.src_spacetoken),
             self._copy_url(transfer.destination, params.dst_spacetoken),

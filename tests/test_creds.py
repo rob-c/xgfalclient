@@ -92,7 +92,11 @@ def test_x509_discovery_order(tmp_path: Path) -> None:
         path.write_text("x")
     env = {"X509_USER_PROXY": str(proxy), "X509_USER_CERT": str(cert), "X509_USER_KEY": str(key)}
     assert find_x509(options, None, "", {**env, "HOME": str(home)}).cert == str(proxy)  # type: ignore[union-attr]
+    # A stale X509_USER_PROXY stands for nothing: not the user certificate,
+    # not ~/.globus - the variable named the identity, and it is not there.
     env["X509_USER_PROXY"] = str(tmp_path / "stale")
+    assert find_x509(options, None, "", {**env, "HOME": str(home)}) is None
+    env.pop("X509_USER_PROXY")
     found = find_x509(options, None, "", {**env, "HOME": str(home)})
     assert found == X509Credential(str(cert), str(key))
     found = find_x509(options, None, "", {"HOME": str(home)})
@@ -126,6 +130,25 @@ def test_x509_default_proxy_location(monkeypatch: pytest.MonkeyPatch, tmp_path: 
         assert found == X509Credential(str(proxy), str(proxy))
     finally:
         proxy.unlink()
+
+
+def test_a_missing_named_proxy_is_not_replaced_by_the_default_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """In a pilot, /tmp/x509up_u<uid> is the pilot's proxy, not the payload's."""
+    proxy = Path(f"/tmp/x509up_u{UNUSED_UID}")
+    missing = str(tmp_path / "payload-proxy")
+    try:
+        proxy.write_text("x")
+        env = {"X509_USER_PROXY": missing, "HOME": str(tmp_path)}
+        with caplog.at_level("WARNING"):
+            assert find_x509(Options(load_system=False), None, "", env) is None
+            assert find_x509(Options(load_system=False), None, "", env) is None
+    finally:
+        proxy.unlink()
+    warnings = [r for r in caplog.records if missing in r.getMessage()]
+    assert len(warnings) == 1  # said once, not once per request
+    assert "no X.509 credential will be presented" in warnings[0].getMessage()
 
 
 def test_x509_uses_real_environment_by_default(

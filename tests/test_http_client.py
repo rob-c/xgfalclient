@@ -125,9 +125,11 @@ def test_truncated_bodies(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> 
         plugin(hctx)._request("GET", dav.url("/data/f")).read()
     assert caught.value.code == _client.ECOMM
     dav.fault("GET", status=200, body=b"0123456789", truncate=4)
+    hctx.set_opt_integer("CORE", "CONN_RETRY", 0)  # with resume off, the drop surfaces
     handle = hctx.open(dav.url("/data/f"), "r")
     with pytest.raises(GError):
         handle.read(10)
+    hctx.set_opt_integer("CORE", "CONN_RETRY", 3)
     # http.client reads a body cut short as a quiet end of file, and lets go of
     # its stream: a large readinto afterwards must not go looking for it.
     dav.fault("GET", body=b"0123456789", truncate=4)  # the status defaults to 200

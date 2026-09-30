@@ -1169,3 +1169,93 @@ def test_delegation(
     davs.delegation_version = 1
     hctx.filecopy(params(overwrite=True), davs_open.url("/data/src"), davs.url("/data/dst"))
     assert len(davs.delegated) == 2
+
+
+# -- transfers that survive a flaky link --------------------------------------------------
+#
+# A dropped GET is resumed from where it got to; a dropped PUT is restarted (a
+# PUT replaces the whole resource, so nothing partial survives to resume). Both
+# are bounded by CONN_RETRY. The WebDAV server's ``truncate`` fault declares a
+# full length then cuts the body, which is exactly a dropped connection.
+
+
+def test_a_single_stream_download_resumes_after_a_drop(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_path: Path
+) -> None:
+    data = os.urandom(200_000)
+    write(dav, "/data/big", data)
+    dav.fault("GET", body=data, truncate=50_000, times=1)  # first GET drops early
+    hctx.filecopy(params(nbstreams=1), dav.url("/data/big"), file_url(tmp_path / "out"))
+    assert (tmp_path / "out").read_bytes() == data
+
+
+def test_a_parallel_download_resumes_a_dropped_segment(
+    hctx: xgfalclient.Gfal2Context,
+    dav: WebDAVServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
+    data = os.urandom(3 * MB + 17)
+    write(dav, "/data/big", data)
+    # One segment's ranged GET drops part way; its worker re-requests the rest.
+    dav.fault("GET", body=data, truncate=40_000, times=1)
+    hctx.filecopy(params(nbstreams=3), dav.url("/data/big"), file_url(tmp_path / "big"))
+    assert (tmp_path / "big").read_bytes() == data
+
+
+def test_a_download_gives_up_after_conn_retry(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_path: Path
+) -> None:
+    data = os.urandom(100_000)
+    write(dav, "/data/big", data)
+    hctx.set_opt_integer("CORE", "CONN_RETRY", 2)
+    dav.fault("GET", body=data, truncate=1000, times=50)  # every GET drops
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(params(nbstreams=1), dav.url("/data/big"), file_url(tmp_path / "out"))
+    assert caught.value.code in (errno.EIO, errno.ECOMM if hasattr(errno, "ECOMM") else errno.EIO)
+
+
+def test_an_upload_restarts_after_a_dropped_put(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_path: Path
+) -> None:
+    data = os.urandom(200_000)
+    source = tmp_path / "src"
+    source.write_bytes(data)
+    dav.fault("PUT", drop=True, times=1)  # the first PUT's connection drops
+    hctx.filecopy(params(overwrite=True), file_url(source), dav.url("/data/up"))
+    assert dav.local("/data/up").read_bytes() == data
+
+
+def test_an_upload_gives_up_after_conn_retry(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_path: Path
+) -> None:
+    source = tmp_path / "src"
+    source.write_bytes(os.urandom(50_000))
+    hctx.set_opt_integer("CORE", "CONN_RETRY", 2)
+    dav.fault("PUT", drop=True, times=50)  # every PUT drops
+    with pytest.raises(GError):
+        hctx.filecopy(params(overwrite=True), file_url(source), dav.url("/data/up"))
+
+
+def test_a_parallel_segment_gives_up_after_conn_retry(
+    hctx: xgfalclient.Gfal2Context,
+    dav: WebDAVServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A segment whose stream keeps dropping is bounded by CONN_RETRY, then errors."""
+    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
+    data = os.urandom(3 * MB + 17)
+    write(dav, "/data/big", data)
+    hctx.set_opt_integer("CORE", "CONN_RETRY", 2)
+    hctx.set_opt_integer("CORE", "CONN_RETRY_INTERVAL", 1)  # exercise the pause path
+    import xgfalclient.plugins.http.plugin as plugin_module
+
+    monkeypatch.setattr(plugin_module.time, "sleep", lambda _s: None)
+    # Every GET's connection is reset before a byte arrives, so no segment ever
+    # makes progress and each one exhausts its retries.
+    dav.fault("GET", drop=True, times=1000)
+    with pytest.raises(GError) as caught:
+        hctx.filecopy(params(nbstreams=2), dav.url("/data/big"), file_url(tmp_path / "a"))
+    assert caught.value.code == errno.EIO

@@ -175,6 +175,10 @@ class Transfer:
         self.owns_destination = False
         #: The first exception a callback raised; :meth:`check` re-raises it.
         self.callback_error: Exception | None = None
+        #: Set by a plugin that had one server copy to the other: no byte
+        #: passed through here, so only the servers' checksums can say the
+        #: destination holds what the source does (see :func:`_verify_third_party`).
+        self.third_party = False
         self._generation = context._cancel_generation
         self._lock = threading.Lock()
         self._last_report = self.started
@@ -334,6 +338,41 @@ def _verify_destination(transfer: Transfer, algorithm: str) -> None:
         )
 
 
+def _verify_third_party(transfer: Transfer, algorithm: str) -> None:
+    """After a third-party copy nobody asked to verify: compare the two ends anyway.
+
+    A destination can report a finished pull that never happened: RAL's
+    Echo, asked to pull from EOS with a delegated proxy it could not use,
+    answered the final ``kXR_sync`` and ``kXR_close`` with success and left a
+    file of the full size - pre-sized from ``oss.asize`` - holding no data
+    (adler32 ``00000001``). Without a checksum requested, gfal2 calls that a
+    successful copy. Here the two servers' checksums are compared, which
+    costs two metadata queries; a mismatch fails the copy (and the failed
+    destination is removed as any other would be), and an end that cannot
+    say its checksum leaves the copy as it was. ``[CORE]
+    VERIFY_THIRD_PARTY=false`` turns it off.
+    """
+    if not transfer.third_party or transfer.checksum_mode != checksum_mode.none:
+        return
+    if not transfer.context.options.boolean("CORE", "VERIFY_THIRD_PARTY", True):
+        return
+    try:
+        source = _checksum_value(transfer.context, transfer.source, algorithm)
+        destination = _checksum_value(transfer.context, transfer.destination, algorithm)
+    except GError as exc:
+        LOGGER.debug("third-party copy not verified: %s", exc.message)
+        return
+    if not checksums_match(source, destination):
+        # This copy wrote it, and what it wrote is wrong: the plugin's own
+        # clean-up ran only for failures it saw, so this one is ours.
+        transfer.owns_destination = True
+        raise GError(
+            "DESTINATION CHECKSUM MISMATCH after a third-party copy the destination "
+            f"reported as finished: source {algorithm} {source} != destination {destination}",
+            errno.EIO,
+        )
+
+
 def _prepare_destination(transfer: Transfer) -> None:
     """Refuse or remove an existing destination; create its parent if asked."""
     context = transfer.context
@@ -439,6 +478,7 @@ def run_copy(
             transfer.event(ev.TRANSFER_EXIT, transfer.pair)
         if verify:
             _verify_destination(transfer, algorithm)
+        _verify_third_party(transfer, algorithm)
     except Exception as exc:
         _cleanup(transfer, plugin_copy=plugin is not None)
         error = transfer.callback_error

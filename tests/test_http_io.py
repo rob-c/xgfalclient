@@ -317,3 +317,56 @@ def test_date_parsing() -> None:
     assert _dav.epoch("yesterday") == 0
     assert _dav.href_path("https://h/a%20b/") == "/a b/"
     assert _dav.href_path("") == "/"
+
+
+# -- resuming a dropped read ---------------------------------------------------------------
+#
+# A GET whose connection drops mid-body is resumed with a ranged GET from where
+# it got to, so a flaky link costs a reconnect rather than the read - CONN_RETRY
+# bounds how many times. A response that ends cleanly at its own length is not a
+# drop (test_short_and_refused_reads, above) and is passed on unchanged.
+
+
+def test_a_dropped_read_resumes_from_where_it_got_to(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
+    body = bytes(range(256)) * 40  # 10240 bytes
+    write(dav, "/data/f", body)
+    # The first GET declares the full length but sends only 3000 bytes, then
+    # drops; the resumed ranged GET serves the rest.
+    dav.fault("GET", body=body, truncate=3000, times=1)
+    handle = hctx.open(dav.url("/data/f"), "r")
+    assert handle.read_bytes(len(body) + 10) == body
+    handle.close()
+    assert any(r.header("Range") for r in dav.requests if r.method == "GET")
+
+
+def test_a_read_gives_up_after_conn_retry_drops(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
+    body = b"0123456789" * 100
+    write(dav, "/data/f", body)
+    hctx.set_opt_integer("CORE", "CONN_RETRY", 2)
+    dav.fault("GET", body=body, truncate=10, times=50)  # every GET drops early
+    handle = hctx.open(dav.url("/data/f"), "r")
+    with pytest.raises(GError) as caught:
+        handle.read_bytes(len(body))
+    assert caught.value.code == errno.EIO
+    handle.close()
+
+
+def test_retry_pause_waits_only_when_an_interval_is_set(
+    hctx: xgfalclient.Gfal2Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xgfalclient.plugins.http import plugin as plugin_module
+
+    slept: list[float] = []
+    monkeypatch.setattr(plugin_module.time, "sleep", slept.append)
+    http = plugin(hctx)
+    http.retry_pause(2)  # no interval configured: no wait
+    assert slept == []
+    hctx.set_opt_integer("CORE", "CONN_RETRY_INTERVAL", 1)
+    http.retry_pause(1)
+    http.retry_pause(5)  # capped at the interval * attempts, but never below it
+    assert slept == [1, 1]
+    assert http.conn_retry() == 3  # the default when nothing is set

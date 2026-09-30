@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 from ...errors import GError
 from ...plugin import PluginFile
-from ._client import PUT, FileBody, Response, Upload, status_error
+from ._client import PUT, FileBody, Response, TransportError, Upload, status_error
 
 if TYPE_CHECKING:
     from .plugin import HTTPPlugin
@@ -78,17 +78,40 @@ class HTTPReadFile(PluginFile):
         view = memoryview(buffer).cast("B")
         if not view.nbytes or self.position >= self._size:
             return 0
-        try:
-            stream = self._open_stream()
-        except _EOFError:
-            return 0
-        count = stream.readinto(view)
-        if count <= 0:
+        # A GET whose connection *drops* before the file's end is resumed with
+        # a fresh ranged GET from where it got to, so a flaky link costs a
+        # reconnect rather than a lost read. A response that ends cleanly at
+        # its own declared length is not a drop - it is what the server chose
+        # to send - and is passed on as the end, as it was before.
+        attempts = 0
+        while True:
+            try:
+                stream = self._open_stream()
+                count = stream.readinto(view)
+            except _EOFError:
+                return 0
+            except TransportError:
+                # The body was cut short mid-flight: the stream is spent, but
+                # the file is not (this call added nothing, and the guard above
+                # means ``position`` is still short of the end) - reconnect and
+                # resume from ``position``, up to CONN_RETRY times.
+                self._drop()
+                attempts += 1
+                if attempts <= self._plugin.conn_retry():
+                    self._plugin.retry_pause(attempts)
+                    continue
+                raise GError(
+                    f"connection closed at {self.position} of {self._size} bytes "
+                    f"reading {self.url}",
+                    errno.EIO,
+                ) from None
+            if count > 0:
+                self._stream_at += count
+                self.position += count
+                return count
+            # A clean end of this response - honoured, not resumed.
             self._drop()
             return 0
-        self._stream_at += count
-        self.position += count
-        return count
 
     def read(self, size: int) -> bytes:
         buffer = bytearray(max(size, 0))

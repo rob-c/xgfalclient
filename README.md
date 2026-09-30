@@ -122,12 +122,21 @@ Deliberately, and only where gfal2's behaviour is a bug:
   deletes the source;
 * a failed copy cleans up its destination whenever `transfer_cleanup` is set,
   including after a destination checksum mismatch;
+* a third-party copy is checked even when no checksum was asked for: the two
+  servers' checksums are compared afterwards (`[CORE] VERIFY_THIRD_PARTY`,
+  on by default), because a destination can report a pull finished that
+  never happened - RAL's Echo did, leaving a full-size file of no data -
+  and gfal2 then reports success;
 * `TransferParameters.timeout = 0` means no limit; gfal2's local copy
   expires at once;
 * error codes are the intended ones where gfal2 reports a stale `errno` or
   a raw protocol status (details in each plugin's module docstring);
 * `sftp://` checks host keys (accept-new by default; gfal2 checks none) and
   never passes a password to an `ssh` subprocess.
+* a `$X509_USER_PROXY` naming a file that is not there is passed over, so
+  token-only access still works, and nothing else is presented in its place:
+  not `/tmp/x509up_u<uid>`, which in a pilot job is the pilot's identity
+  rather than the payload's. gfal2 presents the missing file and fails.
 
 ## Performance
 

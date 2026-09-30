@@ -22,6 +22,11 @@ the same search again, lazily, so a variable set after the context was made
 still counts. Two things deliberately go beyond gfal2 here. A seeded file
 that does not exist is passed over rather than presented, so a stale
 ``$X509_USER_PROXY`` cannot break token-only access (davix behaves the same).
+It is not replaced by anything, either: the variable says which proxy is
+meant, and presenting ``/tmp/x509up_u<uid>`` or ``~/.globus`` instead - in a
+pilot job, the pilot's own identity rather than the payload's - would act as
+somebody the environment did not name. X.509 access then fails with the
+server's refusal, and a warning says why.
 And bearer tokens follow the whole WLCG discovery specification:
 ``$BEARER_TOKEN``, the file named by ``$BEARER_TOKEN_FILE``,
 ``$XDG_RUNTIME_DIR/bt_u<uid>``, ``/tmp/bt_u<uid>``.
@@ -155,6 +160,23 @@ def _existing(path: str | None) -> str | None:
     return path if path and os.path.isfile(path) else None
 
 
+_WARNED: set[str] = set()
+_WARNED_LOCK = threading.Lock()
+
+
+def _warn_missing_proxy(path: str) -> None:
+    """Say once per path that the named proxy is missing and nothing stands in."""
+    with _WARNED_LOCK:
+        if path in _WARNED:
+            return
+        _WARNED.add(path)
+    _log.LOGGER.warning(
+        "X509_USER_PROXY names %s, which does not exist; no X.509 credential "
+        "will be presented (a proxy from anywhere else would be a different identity)",
+        path,
+    )
+
+
 def _trimmed(env: Mapping[str, str], name: str) -> str | None:
     """``gfal2_trim_string(getenv(name))``: surrounding blanks dropped, ``""`` as unset."""
     return env.get(name, "").strip() or None
@@ -230,7 +252,15 @@ def find_x509(
         return X509Credential(cert, options.string("X509", "KEY") or cert)
     # Discovered (as opposed to configured) files count only if they exist,
     # as in davix: a stale X509_USER_PROXY must not break token-only access.
-    proxy = _existing(env.get("X509_USER_PROXY")) or _existing(f"/tmp/x509up_u{_uid()}")
+    # Nor is it replaced by a proxy found elsewhere, which would be a
+    # different identity from the one the environment named.
+    named = _trimmed(env, "X509_USER_PROXY")
+    if named:
+        if _existing(named):
+            return X509Credential(named, named)
+        _warn_missing_proxy(named)
+        return None
+    proxy = _existing(f"/tmp/x509up_u{_uid()}")
     if proxy:
         return X509Credential(proxy, proxy)
     user_cert = _existing(env.get("X509_USER_CERT"))

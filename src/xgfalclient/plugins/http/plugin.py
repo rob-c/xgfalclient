@@ -62,6 +62,7 @@ import posixpath
 import re
 import stat as _stat
 import string
+import time
 import urllib.parse
 from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING
@@ -209,6 +210,20 @@ class HTTPPlugin(Plugin):
 
     def io_timeout(self) -> float:
         return float(self.option_timeout())
+
+    def conn_retry(self) -> int:
+        """How many times a dropped transfer is reconnected, as gfal2's ``CONN_RETRY``.
+
+        A read cut short by a flaky link is resumed with a ranged GET up to
+        this many times before it gives up; gfal2's default is 3.
+        """
+        return max(0, int(self.options.integer("CORE", "CONN_RETRY", 3)))
+
+    def retry_pause(self, attempts: int) -> None:
+        """Wait before the next reconnect, as gfal2's ``CONN_RETRY_INTERVAL`` does."""
+        interval = self.options.integer("CORE", "CONN_RETRY_INTERVAL", 0)
+        if interval > 0:
+            time.sleep(min(interval, interval * attempts))
 
     def checksum_timeout(self) -> float:
         return float(self.options.integer("CORE", "CHECKSUM_TIMEOUT", 1800))

@@ -967,3 +967,68 @@ def test_stream_reads_to_eof(ctx: Gfal2Context, tmp_path: Path) -> None:
     ctx.filecopy(file_url(fifo), file_url(tmp_path / "fromfifo"))
     writer.join(10)
     assert (tmp_path / "fromfifo").read_bytes() == b"x" * 1000
+
+
+class ThirdParty(Plugin):
+    """Two servers copying between themselves; checksums as each end reports them."""
+
+    name = "thirdparty"
+    schemes = ("tpc",)
+    option_group = "THIRDPARTY PLUGIN"
+    priority = 5
+    sums: dict[str, str] = {}
+    removed: list[str] = []
+
+    def stat(self, url: str) -> Stat:
+        raise GError("No such file", errno.ENOENT)
+
+    def unlink(self, url: str) -> None:
+        self.removed.append(url)
+
+    def checksum(self, url: str, algorithm: str, offset: int, length: int) -> str:
+        if url not in self.sums:
+            raise GError("no checksum here", errno.ENOTSUP)
+        return self.sums[url]
+
+    def copy_check(self, source: str, destination: str) -> bool:
+        return source.startswith("tpc://")
+
+    def copy(self, transfer: Transfer) -> None:
+        transfer.third_party = True  # the destination says it is done
+
+
+@pytest.fixture
+def tctx(ctx: Gfal2Context) -> Gfal2Context:
+    ThirdParty.sums, ThirdParty.removed = {}, []
+    ctx.add_plugin(ThirdParty)
+    return ctx
+
+
+def test_a_third_party_copy_is_checked_even_when_no_checksum_was_asked_for(
+    tctx: Gfal2Context,
+) -> None:
+    """RAL's Echo called a pull from EOS finished and held a full-size file of no data."""
+    ThirdParty.sums = {"tpc://src/f": "262a6f28", "tpc://dst/f": "00000001"}
+    params = tctx.transfer_parameters()
+    with pytest.raises(GError) as caught:
+        tctx.filecopy(params, "tpc://src/f", "tpc://dst/f")
+    assert caught.value.code == errno.EIO
+    assert "DESTINATION CHECKSUM MISMATCH after a third-party copy" in caught.value.message
+    assert "262a6f28 != destination 00000001" in caught.value.message
+    assert ThirdParty.removed == ["tpc://dst/f"]  # what it wrote is wrong, so it goes
+
+
+def test_a_third_party_copy_whose_ends_agree_or_cannot_say_stands(tctx: Gfal2Context) -> None:
+    params = tctx.transfer_parameters()
+    ThirdParty.sums = {"tpc://src/f": "262a6f28", "tpc://dst/f": "262A6F28"}
+    tctx.filecopy(params, "tpc://src/f", "tpc://dst/f")
+    ThirdParty.sums = {"tpc://src/f": "262a6f28"}  # the destination has no checksum to give
+    tctx.filecopy(params, "tpc://src/f", "tpc://dst/f")
+    assert ThirdParty.removed == []
+
+
+def test_the_third_party_check_can_be_turned_off(tctx: Gfal2Context) -> None:
+    ThirdParty.sums = {"tpc://src/f": "262a6f28", "tpc://dst/f": "00000001"}
+    tctx.set_opt_boolean("CORE", "VERIFY_THIRD_PARTY", False)
+    tctx.filecopy(tctx.transfer_parameters(), "tpc://src/f", "tpc://dst/f")
+    assert ThirdParty.removed == []
