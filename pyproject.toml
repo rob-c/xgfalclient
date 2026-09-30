@@ -29,6 +29,11 @@ classifiers = [
 # The core, and every protocol but root://, is the standard library alone.
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/rob-c/xgfalclient"
+Repository = "https://github.com/rob-c/xgfalclient"
+Issues = "https://github.com/rob-c/xgfalclient/issues"
+
 [project.optional-dependencies]
 # root:// and roots:// are spoken by xrdclient, which is itself pure Python.
 xrootd = ["xrdclient>=0.1.0"]
