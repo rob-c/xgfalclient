@@ -649,7 +649,9 @@ def test_libcrypto_without_gcm_symbols() -> None:
         lib.aes_gcm(bytes(16), True)
 
 
-def test_libcrypto_gcm_failures() -> None:
+def test_libcrypto_gcm_failures(monkeypatch) -> None:
+    # The fakes fail on purpose; keep the known-answer gate from hiding them.
+    monkeypatch.setattr(libcrypto.LibCrypto, "_gcm_known_answer", lambda self: None)
     buffer = bytearray(48)
     # The context cannot be made.
     with pytest.raises(RuntimeError, match="EVP_CipherInit_ex failed"):

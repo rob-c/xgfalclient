@@ -34,7 +34,7 @@ import ctypes
 import ctypes.util
 import sys
 import threading
-from typing import Any
+from typing import Any, Callable
 
 __all__ = ["LibCrypto", "load", "candidates"]
 
@@ -238,6 +238,42 @@ class LibCrypto:
             ]
             self._mac = c.EVP_MAC_fetch(None, b"POLY1305", None) or None
         self._local = threading.local()
+        # Apple's LibreSSL (what the Xcode Python's ``_ssl`` links) exports the
+        # symbols but fails AES-GCM outright and derives a different ChaCha20
+        # keystream from the same IV, so every primitive is proven against a
+        # known answer before it is offered, and the pure-Python code takes
+        # over for whichever fails.
+        self.has_chacha = _passes(self._chacha_known_answer)
+        self.has_gcm = self.has_gcm and _passes(self._gcm_known_answer)
+
+    def _ctr_known_answer(self) -> None:
+        # NIST SP 800-38A F.5.1, first block.
+        key = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
+        iv = bytes.fromhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
+        out = self.aes_ctr(key, iv).update(bytes.fromhex("6bc1bee22e409f96e93d7e117393172a"))
+        if bytes(out) != bytes.fromhex("874d6191b620e3261bef6864990db6ce"):
+            raise RuntimeError("AES-CTR known answer failed")
+
+    def _chacha_known_answer(self) -> None:
+        # RFC 8439 2.4.2, first 16 bytes of the keystream at counter 1.
+        cipher = self.chacha20(bytes(range(32)))
+        cipher.reset(b"\x01\x00\x00\x00" + bytes.fromhex("000000000000004a00000000"))
+        out = cipher.update(b"Ladies and Gentl")
+        if bytes(out) != bytes.fromhex("6e2e359a2568f98041ba0728dd0d6981"):
+            raise RuntimeError("ChaCha20 known answer failed")
+
+    def _gcm_known_answer(self) -> None:
+        # NIST GCM test case 2: zero key, zero IV, one zero block, no AAD.
+        buffer = bytearray(32)
+        sealed = bytes.fromhex("0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")
+        if not self.aes_gcm(bytes(16), True).apply(bytes(12), b"", buffer, 0, 16):
+            raise RuntimeError("AES-GCM seal failed")
+        if bytes(buffer) != sealed:
+            raise RuntimeError("AES-GCM known answer failed")
+        if not self.aes_gcm(bytes(16), False).apply(bytes(12), b"", buffer, 0, 16):
+            raise RuntimeError("AES-GCM open failed")
+        if bytes(buffer[:16]) != bytes(16):
+            raise RuntimeError("AES-GCM round trip failed")
 
     def _version(self) -> str:
         function = getattr(self.c, "OpenSSL_version", None)
@@ -292,6 +328,14 @@ class LibCrypto:
         return out.raw
 
 
+def _passes(check: Callable[[], None]) -> bool:
+    try:
+        check()
+    except (RuntimeError, ValueError, OSError):
+        return False
+    return True
+
+
 _lock = threading.Lock()
 _loaded: list[LibCrypto | None] = []
 
@@ -300,7 +344,9 @@ def _find() -> LibCrypto | None:
     for path in candidates():
         handle = _open(path)
         if handle is not None and all(hasattr(handle, name) for name in _REQUIRED):
-            return LibCrypto(handle, path)
+            lib = LibCrypto(handle, path)
+            if _passes(lib._ctr_known_answer):
+                return lib
     return None
 
 

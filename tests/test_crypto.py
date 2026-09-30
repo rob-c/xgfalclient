@@ -580,11 +580,20 @@ class _Handle:
             setattr(self, name, _Function(*results.get(name, ())))
 
 
+@pytest.fixture
+def no_known_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fakes here script each call, so keep the load-time known-answer gate off them."""
+    for name in ("_ctr_known_answer", "_chacha_known_answer", "_gcm_known_answer"):
+        monkeypatch.setattr(libcrypto.LibCrypto, name, lambda self: None)
+
+
+@pytest.mark.usefixtures("no_known_answers")
 def test_libcrypto_poly1305_unavailable_when_fetch_fails() -> None:
     lib = libcrypto.LibCrypto(_Handle(EVP_MAC_fetch=(None,)), None)
     assert not lib.has_poly1305 and lib.has_gcm and lib.version == "libcrypto"
 
 
+@pytest.mark.usefixtures("no_known_answers")
 @pytest.mark.parametrize("failing", ["EVP_MAC_init", "EVP_MAC_update", "EVP_MAC_final"])
 def test_libcrypto_poly1305_failures(failing: str) -> None:
     lib = libcrypto.LibCrypto(_Handle(**{failing: (0,)}), None)
@@ -592,6 +601,7 @@ def test_libcrypto_poly1305_failures(failing: str) -> None:
         lib.poly1305(bytes(32), b"data")
 
 
+@pytest.mark.usefixtures("no_known_answers")
 def test_libcrypto_gcm_failures() -> None:
     key, nonce = bytes(16), bytes(12)
     with pytest.raises(RuntimeError, match="EVP_CipherInit_ex"):
@@ -606,6 +616,7 @@ def test_libcrypto_gcm_failures() -> None:
         opener.apply(nonce, b"", bytearray(32), 0, 16)
 
 
+@pytest.mark.usefixtures("no_known_answers")
 def test_libcrypto_find_skips_libraries_missing_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
     full = _Handle()
     handles = {"partial": object(), "full": full}

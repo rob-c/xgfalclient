@@ -102,7 +102,7 @@ class _LibBackend(Backend):
 
     @property
     def fast_chacha(self) -> bool:
-        return self.lib.has_poly1305
+        return self.lib.has_poly1305 and self.lib.has_chacha
 
     @property
     def has_gcm(self) -> bool:
@@ -115,6 +115,8 @@ class _LibBackend(Backend):
         return self.lib.aes_gcm(key, encrypt)
 
     def chacha20(self, key: bytes) -> ChaCha20:
+        if not self.lib.has_chacha:
+            return _PureChaCha(key)
         return _LibChaCha(self.lib, key)
 
     def poly1305(self, key: bytes, data: Buffer) -> bytes:

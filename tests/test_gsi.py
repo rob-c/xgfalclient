@@ -232,6 +232,8 @@ def _fields(cert: x509.Certificate) -> dict[str, object]:
 
 
 def test_dcache_style_peers_take_no_turn(pki: PKI) -> None:
+    if not ssl.HAS_TLSv1_3:
+        pytest.skip("this Python's ssl module has no TLS 1.3 (macOS's LibreSSL 2.8)")
     """dCache's GSI engine neither sends nor waits for the TLS 1.3 turn."""
     client = SecurityContext(client_tls(pki), delegate=pki.credential(), turn=False)
     server = SecurityContext(

@@ -222,6 +222,12 @@ class GridFTPServer:
 
     def stop(self) -> None:
         self._stop.set()
+        # Linux does not wake a thread blocked in accept() when the listener is
+        # merely closed (macOS does); a shutdown does.
+        try:
+            self._listener.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self._listener.close()
         with self._lock:
             sockets, threads = list(self._sockets), list(self._threads)

@@ -393,6 +393,12 @@ class DcapServer:
         return self
 
     def stop(self) -> None:
+        # Linux does not wake a thread blocked in accept() when the listener is
+        # merely closed (macOS does); a shutdown does, so stop() takes no 5 s join.
+        try:
+            self._listener.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self._listener.close()
         with self._lock:
             sockets = list(self._sockets)
