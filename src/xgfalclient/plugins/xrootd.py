@@ -633,7 +633,7 @@ class XRootDFile(PluginFile):
         view = memoryview(data).cast("B")
         return self._io(
             "Failed while writing to file",
-            lambda: int(self._handle.write(view, offset)),  # type: ignore[arg-type]
+            lambda: int(self._handle.write(view, offset)),
         )
 
     def size(self) -> int:
@@ -1434,7 +1434,13 @@ class XRootDPlugin(Plugin):
         handle.open(_READ, 0)
         reader = XRootDFile(str(source), handle, writable=False)
         os.ftruncate(fd, 0)
-        writer = LocalFile(transfer.destination, local_path(transfer.destination), os.O_WRONLY, 0)
+        writer = LocalFile(
+            transfer.destination,
+            local_path(transfer.destination),
+            os.O_WRONLY,
+            0,
+            self.options,
+        )
         try:
             pump(transfer, reader, writer, final_report=False)  # the caller reports
         finally:
@@ -1470,7 +1476,7 @@ class XRootDPlugin(Plugin):
         from .file import LocalFile
 
         try:
-            reader = LocalFile(transfer.source, source, os.O_RDONLY, 0)
+            reader = LocalFile(transfer.source, source, os.O_RDONLY, 0, self.options)
         except OSError as exc:
             raise _CopyError(_local_failure(exc), "source") from exc
         try:

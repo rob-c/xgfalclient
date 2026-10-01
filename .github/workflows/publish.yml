@@ -15,9 +15,40 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install build twine
+      - run: pip install 'build>=1,<2' 'twine>=6,<7'
       - run: python -m build
-      - run: twine check dist/*
+      - run: twine check --strict dist/*
+      - name: verify tag, changelog and installed wheel
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python -m venv /tmp/xgfalclient-release
+          /tmp/xgfalclient-release/bin/python -m pip install --no-deps dist/*.whl
+          /tmp/xgfalclient-release/bin/python - <<'PY'
+          import importlib.metadata
+          import os
+          from pathlib import Path
+
+          import gfal2
+          import gfal2_util
+          import xgfalclient
+
+          version = importlib.metadata.version("xgfalclient")
+          if version != xgfalclient.VERSION:
+              raise SystemExit("wheel metadata and runtime version disagree")
+          if os.environ["RELEASE_TAG"] != f"v{version}":
+              raise SystemExit(f"tag must be v{version}")
+          headings = [
+              line for line in Path("CHANGELOG.md").read_text().splitlines()
+              if line.startswith(f"## [{version}]")
+          ]
+          if not headings:
+              raise SystemExit(f"CHANGELOG.md has no {version} entry")
+          if headings[0].endswith("Unreleased"):
+              raise SystemExit("date the changelog before tagging")
+          if gfal2.get_version() != "2.23.5" or gfal2_util.__name__ != "gfal2_util":
+              raise SystemExit("compatibility packages did not survive wheel installation")
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: dist

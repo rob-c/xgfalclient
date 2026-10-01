@@ -193,6 +193,8 @@ class _TransferError(GError):
 def _pwrite(fd: int, view: memoryview, offset: int) -> None:
     while view:
         written = os.pwrite(fd, view, offset)
+        if written <= 0:
+            raise OSError(errno.EIO, "local pwrite made no progress")
         view = view[written:]
         offset += written
 

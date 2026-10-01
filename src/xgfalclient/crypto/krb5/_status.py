@@ -127,7 +127,7 @@ class KerberosError(GError):
         self.minor = minor
         self.token = token
 
-    def __reduce__(self) -> tuple[type[GError], tuple[str, int]]:  # type: ignore[override]
+    def __reduce__(self) -> tuple[type[GError], tuple[str, int]]:
         return (KerberosError, (self.message, self.code))
 
 

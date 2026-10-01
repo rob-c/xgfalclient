@@ -102,7 +102,7 @@ def connect(endpoint: Endpoint, key_files: Any = ()) -> ParamikoStream:
     """Open a paramiko transport to ``endpoint`` and start the ``sftp`` subsystem."""
     import socket
 
-    import paramiko  # type: ignore[import-untyped,import-not-found]
+    import paramiko  # type: ignore[import-untyped]
 
     del key_files  # paramiko loads keys from the file itself
     timeout = float(endpoint.timeout) if endpoint.timeout > 0 else None

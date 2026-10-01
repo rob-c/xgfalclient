@@ -97,7 +97,7 @@ from ._client import (
     wire_url,
 )
 from ._delegation import delegate
-from ._io import HTTPReadFile, HTTPWriteFile, _skip
+from ._io import HTTPReadFile, HTTPWriteFile
 from ._token import se_token
 
 if TYPE_CHECKING:
@@ -515,7 +515,9 @@ def streamed(plugin: HTTPPlugin, transfer: Transfer) -> None:
         raise GError(f"{transfer.source} is a directory", errno.EISDIR)
     size = info.st_size
     transfer.source_size = size
-    reader = HTTPReadFile(plugin, transfer.source, size)
+    reader = HTTPReadFile(
+        plugin, transfer.source, size, active=plugin._metalink_start(transfer.source)
+    )
     try:
         destination = resolved(plugin, transfer.destination)
         writer = (
@@ -603,6 +605,20 @@ class _NoRanges(Exception):
 
 def download(plugin: HTTPPlugin, transfer: Transfer) -> None:
     transfer.event(ev.TRANSFER_TYPE, STREAMED)
+    size = _download_size(plugin, transfer)
+    transfer.source_size = size
+    fd = _open_download_destination(transfer.destination)
+    try:
+        streams = _download_streams(transfer)
+        if not _try_parallel_download(plugin, transfer, fd, size, streams):
+            _single(plugin, transfer, fd, size)
+    finally:
+        os.close(fd)
+    transfer.progress(size, force=True)
+
+
+def _download_size(plugin: HTTPPlugin, transfer: Transfer) -> int:
+    """Validate the source and return the advertised byte count."""
     try:
         info = plugin.stat(transfer.source)
     except GError as exc:
@@ -610,30 +626,48 @@ def download(plugin: HTTPPlugin, transfer: Transfer) -> None:
         raise GError(f"Could not open source: {exc.message}", exc.code) from None
     if info.is_dir():
         raise GError(f"{transfer.source} is a directory", errno.EISDIR)
-    size = info.st_size
-    transfer.source_size = size
-    path = local_path(transfer.destination)
+    return info.st_size
+
+
+def _open_download_destination(url: str) -> int:
+    """Open a local download target and translate filesystem failures."""
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        return os.open(local_path(url), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     except OSError as exc:
         raise GError(f"Could not open destination: {exc.strerror}", exc.errno or errno.EIO) from exc
+
+
+def _download_streams(transfer: Transfer) -> int:
+    configured = transfer.params.nbstreams
+    return configured if configured > 0 else _default_streams(transfer.source)
+
+
+def _try_parallel_download(
+    plugin: HTTPPlugin, transfer: Transfer, fd: int, size: int, streams: int
+) -> bool:
+    """Use ranged streams when worthwhile, returning false for a clean fallback."""
+    if size < PARALLEL_THRESHOLD or streams <= 1:
+        return False
     try:
-        params = transfer.params
-        streams = params.nbstreams if params.nbstreams > 0 else _default_streams(transfer.source)
-        done = False
-        if size >= PARALLEL_THRESHOLD and streams > 1:
-            try:
-                _parallel(plugin, transfer, fd, size, streams)
-                done = True
-            except _NoRanges:
-                _log.debug("%s ignores Range; downloading in one stream", transfer.source)
-                os.ftruncate(fd, 0)
-                transfer.progress(0)
-        if not done:
-            _single(plugin, transfer, fd, size)
-    finally:
-        os.close(fd)
-    transfer.progress(size, force=True)
+        _parallel(plugin, transfer, fd, size, streams)
+        return True
+    except _NoRanges:
+        _log.debug("%s ignores Range; downloading in one stream", transfer.source)
+    except GError as exc:
+        # Davix applies Metalink below its ranged-read layer. Keep the
+        # zero-overhead parallel happy path; only after it fails do we
+        # discover replicas and restart through the failover-aware stream.
+        if exc.code in (errno.ECANCELED, errno.ETIMEDOUT):
+            raise
+        try:
+            replicas = plugin._metalink_replicas(transfer.source)
+        except GError:
+            replicas = ()
+        if not replicas:
+            raise
+    os.ftruncate(fd, 0)
+    transfer.progress(0)
+    return False
 
 
 def _default_streams(url: str) -> int:
@@ -643,43 +677,34 @@ def _default_streams(url: str) -> int:
 def _pwrite_all(fd: int, view: memoryview, offset: int) -> None:
     done = 0
     while done < len(view):
-        done += os.pwrite(fd, view[done:], offset + done)
+        try:
+            written = os.pwrite(fd, view[done:], offset + done)
+        except OSError as exc:
+            raise GError(
+                f"Could not write destination: {exc.strerror or exc}", exc.errno or errno.EIO
+            ) from exc
+        if written <= 0:
+            raise GError("Could not write destination: write made no progress", errno.EIO)
+        done += written
 
 
 def _single(plugin: HTTPPlugin, transfer: Transfer, fd: int, size: int) -> None:
-    timeout = plugin.io_timeout()
     view = memoryview(bytearray(BLOCK))
     total = 0
-    attempts = 0
-    # A GET whose connection *drops* is resumed with a ranged GET from where it
-    # got to, up to CONN_RETRY times. A response that ends cleanly but short of
-    # the file is the server's answer, not a broken link: it is not resumed, and
-    # the size check below turns it into the short-copy error it has always been.
-    while True:
-        headers = {"Range": f"bytes={total}-"} if total else {}
-        try:
-            with plugin._get(transfer.source, headers, timeout=timeout) as response:
-                if total and response.status == 200:
-                    _skip(response, total)  # a server that ignores Range
-                while total < size:
-                    count = response.readinto(view)
-                    if count <= 0:
-                        break
-                    _pwrite_all(fd, view[:count], total)
-                    total += count
-                    attempts = 0  # progress resets the budget
-                    transfer.add(count)
-                    transfer.check()
-        except TransportError:
-            attempts += 1
-            if attempts > plugin.conn_retry():
-                raise GError(
-                    f"connection closed at {total} of {size} bytes downloading {transfer.source}",
-                    errno.EIO,
-                ) from None
-            plugin.retry_pause(attempts)
-            continue
-        break  # the response ended without a drop
+    reader = HTTPReadFile(
+        plugin, transfer.source, size, active=plugin._metalink_start(transfer.source)
+    )
+    try:
+        while total < size:
+            count = reader.readinto(view[: min(len(view), size - total)])
+            if count <= 0:
+                break
+            _pwrite_all(fd, view[:count], total)
+            total += count
+            transfer.add(count)
+            transfer.check()
+    finally:
+        reader.close()
     if total != size:
         raise GError(f"Short copy: {total} bytes transferred, the source has {size}", errno.EIO)
 
@@ -727,9 +752,7 @@ def _parallel(plugin: HTTPPlugin, transfer: Transfer, fd: int, size: int, stream
                 continue
             if done >= count or stop.is_set():
                 return
-            raise GError(
-                f"Short read of {transfer.source} at offset {offset + done}", errno.EIO
-            )
+            raise GError(f"Short read of {transfer.source} at offset {offset + done}", errno.EIO)
 
     def worker() -> None:
         view = memoryview(bytearray(BLOCK))

@@ -468,7 +468,19 @@ class Response:
     def body(self, limit: int = 1 << 26) -> bytes:
         """The whole body (up to ``limit``), and the response closed."""
         try:
-            return self.read(limit)
+            body = self.read(limit)
+            if len(body) < limit and self._raw.length:
+                # ``HTTPResponse.read(amount)`` quietly returns a short buffer
+                # when the peer closes despite an outstanding Content-Length.
+                # Whole-body callers need the same contract as ``readinto`` so
+                # their operation-level retry can distinguish a cut from EOF.
+                owed = self._raw.length
+                self._fail()
+                raise TransportError(
+                    f"Connection terminated abruptly: {owed} bytes of the body never arrived",
+                    ECOMM,
+                )
+            return body
         finally:
             self.close()
 

@@ -42,8 +42,7 @@ Where this differs from gfal2, deliberately:
   operation the way gfal2 does with ``RETRIEVE_BEARER_TOKEN`` (a macaroon
   ``POST`` ahead of each ``PROPFIND``): the X.509 proxy that would ask for
   it authenticates the operation just as well;
-* ``[HTTP PLUGIN] METALINK`` is not read (there is no Metalink support), nor
-  are davix's ``LOG_LEVEL``, ``LOG_SENSITIVE`` and ``LOG_CONTENT``: the plugin's
+* davix's ``LOG_LEVEL``, ``LOG_SENSITIVE`` and ``LOG_CONTENT`` are not read: the plugin's
   diagnostics go to the ``gfal2`` logger instead;
 * ``User-Agent`` is the context's (``<agent>/<version> gfal2/2.23.5``),
   without the `` neon/0.0.29`` that davix's HTTP library appends.
@@ -62,6 +61,7 @@ import posixpath
 import re
 import stat as _stat
 import string
+import threading
 import time
 import urllib.parse
 from collections.abc import Iterator, Sequence
@@ -71,7 +71,7 @@ from ...errors import GError
 from ...plugin import O_ACCMODE_MASK, O_RDONLY, O_WRONLY, Plugin, PluginFile, StagingResult
 from ...types import Stat
 from ...url import URL, parent, parse, scheme_of
-from . import _copy, _gcloud, _qos, _s3, _swift, _token
+from . import _copy, _gcloud, _metalink, _qos, _s3, _swift, _token
 from ._client import (
     MKDIR,
     Auth,
@@ -80,6 +80,7 @@ from ._client import (
     HTTPStatusError,
     Response,
     Signer,
+    TransportError,
     status_error,
     valid_authority,
     wire_url,
@@ -116,6 +117,11 @@ TAPE_OPERATIONS = frozenset(
         "archive_poll",
     }
 )
+
+# Reissuing these after a connection failed before an answer is safe. Mutating
+# methods are retried by their operation-specific code only when it can prove
+# what reached the server (for example, a whole-file PUT restart).
+_RETRYABLE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PROPFIND"})
 #: What davix splits an ``ETag`` on, looking for an MD5 in it.
 _ETAG_SPLIT = re.compile(r"[&;\\/\"']")
 #: What davix makes of a file it only knows from a ``HEAD``.
@@ -197,6 +203,8 @@ class HTTPPlugin(Plugin):
         self.client.signer_for = self._signer
         self.tape = TapeREST(self)
         self._gcloud = _gcloud.KeyCache()
+        self._metalink_cache: dict[str, tuple[str, ...]] = {}
+        self._metalink_lock = threading.Lock()
 
     def close(self) -> None:
         self.client.close()
@@ -222,8 +230,15 @@ class HTTPPlugin(Plugin):
     def retry_pause(self, attempts: int) -> None:
         """Wait before the next reconnect, as gfal2's ``CONN_RETRY_INTERVAL`` does."""
         interval = self.options.integer("CORE", "CONN_RETRY_INTERVAL", 0)
-        if interval > 0:
-            time.sleep(min(interval, interval * attempts))
+        if self.options.has("CORE", "CONN_RETRY_INTERVAL"):
+            if interval > 0:
+                time.sleep(float(interval))
+            return
+        # A missing setting gets a small exponential floor. Immediate retries
+        # all land inside the same short outage and spend CONN_RETRY in a few
+        # microseconds; 50 ms is invisible on a healthy path and gives a
+        # restarting proxy/server a meaningful chance to return.
+        time.sleep(min(0.05 * 2 ** max(attempts - 1, 0), 1.0))
 
     def checksum_timeout(self) -> float:
         return float(self.options.integer("CORE", "CHECKSUM_TIMEOUT", 1800))
@@ -264,15 +279,52 @@ class HTTPPlugin(Plugin):
         auth = None
         if x509_only:
             auth = Auth(tls=self.client.tls(cred_url or url))
-        return self.client.request(
-            method,
-            url,
-            headers=headers,
-            body=body,
-            timeout=self.io_timeout() if timeout is None else timeout,
-            cred_url=cred_url,
-            auth=auth,
-        )
+        attempts = 0
+        while True:
+            try:
+                return self.client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    body=body,
+                    timeout=self.io_timeout() if timeout is None else timeout,
+                    cred_url=cred_url,
+                    auth=auth,
+                )
+            except TransportError as exc:
+                attempts += 1
+                if (
+                    method not in _RETRYABLE_METHODS
+                    or exc.code == errno.ETIMEDOUT
+                    or attempts > self.conn_retry()
+                ):
+                    raise
+                self.retry_pause(attempts)
+
+    def _propfind(self, url: str, depth: str, *, body: bytes | None = None) -> tuple[int, bytes]:
+        """A PROPFIND whose response body survives a transient disconnect."""
+        headers = {"Depth": depth}
+        if body is not None:
+            headers["Content-Type"] = 'text/xml; charset="utf-8"'
+        attempts = 0
+        while True:
+            response: Response | None = None
+            try:
+                response = self.client.request(
+                    "PROPFIND",
+                    url,
+                    headers=headers,
+                    body=body,
+                    timeout=self.io_timeout(),
+                )
+                return response.status, response.body()
+            except TransportError as exc:
+                if response is not None:
+                    response.close()
+                attempts += 1
+                if exc.code == errno.ETIMEDOUT or attempts > self.conn_retry():
+                    raise
+                self.retry_pause(attempts)
 
     def _get(self, url: str, headers: dict[str, str], timeout: float | None = None) -> Response:
         """A ``GET`` that answered with a body (or ``416`` past the end); else raises."""
@@ -301,6 +353,11 @@ class HTTPPlugin(Plugin):
         try:
             return self._stat(url)
         except GError as exc:
+            if self._metalink_enabled(url) and exc.code != errno.ETIMEDOUT:
+                try:
+                    return self._metalink_stat(url, exc)
+                except GError as recovered:
+                    exc = recovered
             raise _result(exc) from None
 
     def _stat(self, url: str) -> Stat:
@@ -320,10 +377,9 @@ class HTTPPlugin(Plugin):
         return self._propfind_stat(url)
 
     def _propfind_stat(self, url: str) -> Stat:
-        response = self._request("PROPFIND", url, headers={"Depth": "0"})
-        payload = response.body()
-        if response.status not in (200, 207):
-            raise status_error(response.status)
+        status, payload = self._propfind(url, "0")
+        if status not in (200, 207):
+            raise status_error(status)
         entries = parse_multistatus(payload)
         if not entries:
             raise GError("Parsing Error: properties number < 1", errno.EIO)
@@ -336,6 +392,71 @@ class HTTPPlugin(Plugin):
         if response.status >= 300:
             raise status_error(response.status)
         return Stat(st_mode=HEAD_MODE, st_size=response.length or 0)
+
+    def _metalink_enabled(self, url: str) -> bool:
+        """Whether gfal2's HTTP Metalink option applies to this endpoint."""
+        return self.options.boolean(self.option_group, "METALINK", False) and _kind(url) not in (
+            "s3",
+            "swift",
+        )
+
+    def _metalink_start(self, url: str) -> str:
+        """A previously discovered preferred replica, else ``url`` itself."""
+        with self._metalink_lock:
+            replicas = self._metalink_cache.get(url, ())
+        return replicas[0] if replicas else url
+
+    def _prefer_metalink(self, url: str, replica: str) -> None:
+        with self._metalink_lock:
+            replicas = self._metalink_cache.get(url, ())
+            if replica in replicas:
+                self._metalink_cache[url] = (
+                    replica,
+                    *(item for item in replicas if item != replica),
+                )
+
+    def _metalink_replicas(self, url: str) -> tuple[str, ...]:
+        """Discover and cache the HTTP replicas advertised for ``url``."""
+        if not self._metalink_enabled(url):
+            return ()
+        with self._metalink_lock:
+            cached = self._metalink_cache.get(url)
+        if cached is not None:
+            return cached
+        response = self.client.request(
+            "HEAD",
+            url,
+            headers={"Accept": _metalink.ACCEPT},
+            timeout=self.io_timeout(),
+            follow=False,
+        )
+        with response:
+            descriptor = _metalink.descriptor_url(response, url)
+        if descriptor is None:
+            return ()
+        response = self._request("GET", descriptor, headers={"Accept": _metalink.ACCEPT})
+        if response.status < 200 or response.status >= 300:
+            response.close()
+            return ()
+        document = response.body(_metalink.MAX_DESCRIPTOR_SIZE + 1)
+        replicas = _metalink.parse_metalink(document, base_url=descriptor).replicas
+        with self._metalink_lock:
+            return self._metalink_cache.setdefault(url, replicas)
+
+    def _metalink_stat(self, url: str, original: GError) -> Stat:
+        """Try advertised replicas, preserving the original error if none works."""
+        try:
+            replicas = self._metalink_replicas(url)
+        except GError:
+            raise original from None
+        for replica in replicas:
+            try:
+                info = self._stat(replica)
+            except GError:
+                continue
+            self._prefer_metalink(url, replica)
+            return info
+        raise original from None
 
     # -- namespace -----------------------------------------------------------------
 
@@ -430,15 +551,9 @@ class HTTPPlugin(Plugin):
             return self._s3_list(url)
         if kind == "swift":
             return _swift.list_objects(self, url)
-        response = self._request(
-            "PROPFIND",
-            url,
-            headers={"Depth": "1", "Content-Type": 'text/xml; charset="utf-8"'},
-            body=PROPFIND_BODY,
-        )
-        payload = response.body()
-        if response.status not in (200, 207):
-            raise status_error(response.status)
+        status, payload = self._propfind(url, "1", body=PROPFIND_BODY)
+        if status not in (200, 207):
+            raise status_error(status)
         entries = parse_multistatus(payload)
         own = urllib.parse.unquote(parse(url).path)
         mine = next((i for i, (path, _) in enumerate(entries) if same_path(path, own)), 0)
@@ -469,7 +584,7 @@ class HTTPPlugin(Plugin):
             info = self.stat(url)
             if info.is_dir():
                 raise GError(f"{url} is a directory", errno.EISDIR)
-            return HTTPReadFile(self, url, info.st_size)
+            return HTTPReadFile(self, url, info.st_size, active=self._metalink_start(url))
         if access == O_WRONLY:
             if size is not None and size > _s3.MULTIPART_THRESHOLD and self._multipart(url):
                 return _s3.S3PartWriter(self, url)

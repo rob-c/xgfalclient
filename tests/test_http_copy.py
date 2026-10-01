@@ -243,6 +243,24 @@ def test_parallel_download_failure_stops_the_other_streams(
     assert len(writes) == 2
 
 
+def test_download_refuses_zero_progress_from_the_destination(monkeypatch) -> None:
+    monkeypatch.setattr(_copy.os, "pwrite", lambda *_: 0)
+    with pytest.raises(GError) as caught:
+        _copy._pwrite_all(123, memoryview(b"payload"), 0)
+    assert caught.value.code == errno.EIO
+
+
+def test_download_preserves_a_destination_enospc(monkeypatch) -> None:
+    def full(*_args: object) -> int:
+        raise OSError(errno.ENOSPC, "filesystem nearly full")
+
+    monkeypatch.setattr(_copy.os, "pwrite", full)
+    with pytest.raises(GError) as caught:
+        _copy._pwrite_all(123, memoryview(b"payload"), 0)
+    assert caught.value.code == errno.ENOSPC
+    assert "Could not write destination" in caught.value.message
+
+
 def test_download_errors(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_path: Path) -> None:
     write(dav, "/data/f", b"0123456789")
     dav.fault("GET", status=200, body=b"01234")

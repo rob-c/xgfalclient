@@ -30,6 +30,7 @@ import errno
 import hashlib
 import io
 import os
+import time
 import zlib
 from collections.abc import Callable, Iterator
 from typing import Any, TypeVar
@@ -45,6 +46,25 @@ __all__ = ["FilePlugin", "LocalFile", "local_path"]
 T = TypeVar("T")
 
 _CHUNK = 4 << 20
+_TRANSIENT_READ_ERRORS = frozenset(
+    getattr(errno, name)
+    for name in ("EAGAIN", "EBUSY", "EINTR", "ESTALE", "ETIMEDOUT")
+    if hasattr(errno, name)
+)
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    """Fields that distinguish a file generation even on inode-virtualising FUSE."""
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _retry_pause(options: Any, attempts: int) -> None:
+    interval = options.integer("CORE", "CONN_RETRY_INTERVAL", 0)
+    if options.has("CORE", "CONN_RETRY_INTERVAL"):
+        if interval > 0:
+            time.sleep(float(interval))
+        return
+    time.sleep(min(0.05 * 2 ** max(attempts - 1, 0), 1.0))
 
 
 def local_path(url: str) -> str:
@@ -58,13 +78,24 @@ class LocalFile(PluginFile):
     Errors are worded as gfal2's file plugin words them.
     """
 
-    def __init__(self, url: str, path: str, flags: int, mode: int) -> None:
+    def __init__(self, url: str, path: str, flags: int, mode: int, options: Any = None) -> None:
         super().__init__(url)
+        self._path = path
+        self._flags = flags
+        self._mode_bits = mode
+        self._options = options
         self._raw = io.FileIO(
             os.open(path, flags, mode), "r+" if flags & os.O_RDWR else _mode(flags)
         )
         #: False for a FIFO, socket or terminal: writes go in order, offsets ignored.
         self._seekable = self._raw.seekable()
+        try:
+            info = os.fstat(self._raw.fileno())
+        except BaseException:
+            self._raw.close()
+            raise
+        self._identity = _file_identity(info)
+        self._recovery_chunk: int | None = None
 
     def fileno(self) -> int:
         return self._raw.fileno()
@@ -76,23 +107,80 @@ class LocalFile(PluginFile):
         return bytes(buffer)
 
     def readinto(self, buffer: memoryview | bytearray) -> int:
-        if self._seekable:  # by position; a pipe has none and is read in order
-            _os(self._raw.seek, self.position)
-        count: int = _os(self._raw.readinto, buffer) or 0
+        def read() -> int:
+            if self._seekable:  # by position; a pipe has none and is read in order
+                _os(self._raw.seek, self.position)
+            view = memoryview(buffer)
+            if self._recovery_chunk is not None:
+                view = view[: self._recovery_chunk]
+            return _os(self._raw.readinto, view) or 0
+
+        count = self._recovering_read(read)
         self.position += count
         return count
 
     def pread(self, offset: int, size: int) -> bytes:
-        return _os(os.pread, self.fileno(), size, offset)  # type: ignore[no-any-return]
+        def read() -> bytes:
+            wanted = min(size, self._recovery_chunk) if self._recovery_chunk is not None else size
+            return _os(os.pread, self.fileno(), wanted, offset)
+
+        return self._recovering_read(read)
+
+    def _recovering_read(self, operation: Callable[[], T]) -> T:
+        """Retry a safe read after reopening the same local file generation."""
+        attempts = 0
+        while True:
+            try:
+                return operation()
+            except GError as exc:
+                attempts += 1
+                if not self._can_recover_read(exc, attempts):
+                    raise
+                self._reopen_read(attempts, exc)
+
+    def _can_recover_read(self, exc: GError, attempts: int) -> bool:
+        retries = (
+            max(0, int(self._options.integer("CORE", "CONN_RETRY", 3)))
+            if self._options is not None
+            else 0
+        )
+        return bool(
+            self._seekable
+            and not self._flags & (os.O_WRONLY | os.O_RDWR)
+            and exc.code in _TRANSIENT_READ_ERRORS
+            and attempts <= retries
+        )
+
+    def _reopen_read(self, attempts: int, cause: GError) -> None:
+        """Replace a stale descriptor, refusing a different file generation."""
+        self._recovery_chunk = 4096
+        self._raw.close()
+        _retry_pause(self._options, attempts)
+        try:
+            replacement = io.FileIO(os.open(self._path, self._flags, self._mode_bits), "r")
+        except OSError as exc:
+            raise from_oserror(exc) from exc
+        try:
+            info = os.fstat(replacement.fileno())
+        except OSError as exc:
+            replacement.close()
+            raise from_oserror(exc) from exc
+        if _file_identity(info) != self._identity:
+            replacement.close()
+            raise GError("local source changed while recovering", errno.ESTALE) from cause
+        self._raw = replacement
 
     def pwrite(self, data: bytes | bytearray | memoryview, offset: int) -> int:
         view = memoryview(data)
         done = 0
         while done < len(view):
             if self._seekable:
-                done += _os(os.pwrite, self.fileno(), view[done:], offset + done)
+                written = _os(os.pwrite, self.fileno(), view[done:], offset + done)
             else:
-                done += _os(os.write, self.fileno(), view[done:])
+                written = _os(os.write, self.fileno(), view[done:])
+            if written <= 0:
+                raise from_oserror(OSError(errno.EIO, "write made no progress"))
+            done += written
         return done
 
     def lseek(self, offset: int, whence: int = os.SEEK_SET) -> int:
@@ -198,10 +286,20 @@ class FilePlugin(Plugin):
     # -- I/O ---------------------------------------------------------------------
 
     def open(self, url: str, flags: int, mode: int = 0o744, size: int | None = None) -> PluginFile:
-        try:
-            return LocalFile(url, local_path(url), flags, mode)
-        except OSError as exc:
-            raise from_oserror(exc) from exc
+        attempts = 0
+        while True:
+            try:
+                return LocalFile(url, local_path(url), flags, mode, self.options)
+            except OSError as exc:
+                attempts += 1
+                retries = max(0, int(self.options.integer("CORE", "CONN_RETRY", 3)))
+                if (
+                    flags & (os.O_WRONLY | os.O_RDWR)
+                    or exc.errno not in _TRANSIENT_READ_ERRORS
+                    or attempts > retries
+                ):
+                    raise from_oserror(exc) from exc
+                _retry_pause(self.options, attempts)
 
     # -- metadata ------------------------------------------------------------------
 

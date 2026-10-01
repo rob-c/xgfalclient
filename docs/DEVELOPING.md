@@ -53,8 +53,15 @@ unchanged. The only runtime dependency anywhere is the optional `xrdclient`
    and never `bytes` concatenation in a loop. Parallelism where the protocol
    has it (HTTP ranges, GridFTP MODE E). Target: at least gfal2's
    throughput through its Python bindings.
-8. Code style: `ruff check` and `ruff format` clean, `mypy --strict` clean.
-   Docstrings explain *why*; match the density of the existing modules.
+8. **No quality regressions.** `ruff check` (including the enabled
+   high-confidence security rules), `ruff format`, and `mypy --strict` must
+   all be clean. New and refactored functions have cognitive complexity at
+   most 15. The checked-in Complexipy snapshot freezes older hotspots until
+   they are simplified; never raise a value in it. Docstrings explain *why*;
+   match the density of the existing modules.
+9. **Distributions are tested artifacts.** Both wheels and source archives
+   must pass `twine check --strict`; typed packages carry their `py.typed`
+   marker. Python 3.9 through 3.14 are exercised in CI.
 
 ## Layout
 
@@ -135,6 +142,54 @@ comment.
 ```console
 $ .venv/bin/pytest -n auto --cov --cov-report=term-missing
 $ XGFAL_CONDCOV=1 .venv/bin/pytest -n auto      # condition coverage; not with --cov
-$ .venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
+$ .venv/bin/ruff check src tests benchmarks
+$ .venv/bin/ruff format --check src tests benchmarks
 $ .venv/bin/mypy
+$ .venv/bin/complexipy --quiet
+$ git diff --exit-code -- complexipy-snapshot.json
+$ .venv/bin/python -m build && .venv/bin/twine check --strict dist/*
 ```
+
+The external BRIX network-fault integration is opt-in. Point the test at a
+built proxy; it then exercises streamed reads, positioned reads, WebDAV
+uploads and metadata through real mid-body truncations and a temporary
+refused endpoint. Further cases keep truncating until self-heal, strip `Range`
+as a broken middlebox would, corrupt bodies without changing their length,
+and combine tiny segments, jitter, and a silent firewall reap:
+
+```console
+$ BRIX_FAULT_PROXY=/path/to/brix-fault-proxy \
+    .venv/bin/pytest tests/test_http_brix_fault_proxy.py
+```
+
+The external BRIX FUSE integration exercises short and zero-progress I/O,
+partial-write `ENOSPC`, torn and silently dropped writes, lying metadata,
+repeating stale-handle bursts, live file replacement, volatile writeback,
+dishonest `fsync` acknowledgement, and late or post-commit `fsync` failure.
+Its durability cases ensure `filecopy` cannot return success while output
+bytes remain only in a fallible filesystem cache:
+
+```console
+$ BRIX_FAULT_FS=/path/to/brix-fault-fs \
+    .venv/bin/pytest tests/test_brix_fault_fs.py
+```
+
+Both tools are built by the adjacent `brix-cache/client` project. The suites
+are skipped when their environment variable is unset, so normal development
+does not require FUSE.
+
+Complexipy allows a function already recorded in `complexipy-snapshot.json`
+to stay at its current complexity, but rejects a new hotspot or any increase.
+When a function is simplified, the tool lowers the snapshot automatically;
+commit that improvement. A snapshot change that raises a value is a failed
+review, not a way to make CI green.
+
+Before publishing a performance-sensitive change, run the paired benchmark
+beside the target service with native `python3-gfal2` installed:
+
+```console
+$ .venv/bin/python benchmarks/bench_vs_gfal2.py \
+    --base davs://server:8443/data/bench --repeat 9 --gate --min-ratio 1.10
+```
+
+The gate rejects xgfalclient's own `gfal2` compatibility shim as a reference.

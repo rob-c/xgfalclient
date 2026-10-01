@@ -1,10 +1,12 @@
 [build-system]
-requires = ["hatchling"]
+# Hatchling 1.32 emits Core Metadata 2.5, which Twine 6.2 cannot validate.
+# Keep isolated and CI builds reproducible until the inspection tool catches up.
+requires = ["hatchling>=1.27,<1.32"]
 build-backend = "hatchling.build"
 
 [project]
 name = "xgfalclient"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A pure-Python, drop-in gfal2 client: WebDAV/HTTP, S3, Google Cloud Storage, XRootD, GridFTP, SRM, SFTP, dCap, LFC and local files, with X.509/GSI, token, Kerberos and SSH auth"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,8 +33,10 @@ dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/rob-c/xgfalclient"
+Documentation = "https://rob-c.github.io/xgfalclient/"
 Repository = "https://github.com/rob-c/xgfalclient"
 Issues = "https://github.com/rob-c/xgfalclient/issues"
+Changelog = "https://github.com/rob-c/xgfalclient/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # root:// and roots:// are spoken by xrdclient, which is itself pure Python.
@@ -41,13 +45,17 @@ xrootd = ["xrdclient>=0.1.0"]
 # with it installed, python-gssapi is used instead.
 krb5 = ["gssapi>=1.6"]
 dev = [
+  "build>=1,<2",
+  "complexipy>=6,<7",
   "mypy>=1.10",
   "pytest>=8",
   "pytest-cov",
   "pytest-timeout",
   "pytest-xdist",
   "ruff>=0.5",
+  "twine>=6,<7",
 ]
+docs = ["mkdocs>=1.6,<2", "mkdocs-material>=9.5,<10"]
 
 [project.scripts]
 gfal-archivepoll = "xgfalclient.cli:archivepoll"
@@ -81,8 +89,15 @@ packages = ["src/xgfalclient", "src/gfal2", "src/gfal2_util"]
 [tool.hatch.build.targets.wheel.shared-data]
 "share/man/man1" = "share/man/man1"
 
+[tool.hatch.version]
+# Keep the distribution metadata and the public VERSION/__version__ API identical.
+path = "src/xgfalclient/_version.py"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Benchmark gate helpers are tested as ordinary project modules, while the
+# installed packages themselves still come from the editable ``src`` build.
+pythonpath = ["."]
 timeout = 120
 addopts = "-ra"
 markers = [
@@ -111,11 +126,25 @@ target-version = "py39"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+select = [
+  "E", "F", "W", "I", "B", "UP", "SIM", "RUF",
+  # High-confidence security checks. The wider S family contains unavoidable
+  # false positives for protocol-defined hashes, XML and subprocess transports.
+  "S102", "S307", "S506", "S602", "S608", "S609", "S701",
+]
 ignore = ["RUF012", "SIM105", "UP007", "UP045", "RUF022"]
+
+[tool.ruff.lint.per-file-ignores]
+# The condition-coverage test intentionally executes an AST compiled entirely
+# from a test-owned string; production code is still forbidden from using exec.
+"tests/test_condcov.py" = ["S102"]
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
-files = ["src/xgfalclient", "src/gfal2", "src/gfal2_util"]
-warn_unused_ignores = false
+files = ["src/xgfalclient", "src/gfal2", "src/gfal2_util", "benchmarks"]
+
+[tool.complexipy]
+paths = ["src", "tests", "benchmarks"]
+max-complexity-allowed = 15
+failed = true

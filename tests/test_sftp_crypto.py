@@ -513,6 +513,60 @@ def test_libcrypto_version_without_symbol() -> None:
     assert lib.version == "libcrypto"
 
 
+def test_libcrypto_rejects_a_bad_aes_ctr_known_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BadCipher:
+        @staticmethod
+        def update(_payload: bytes) -> bytes:
+            return bytes(16)
+
+    lib = libcrypto.LibCrypto.__new__(libcrypto.LibCrypto)
+    monkeypatch.setattr(lib, "aes_ctr", lambda _key, _iv: BadCipher())
+    with pytest.raises(RuntimeError, match="AES-CTR known answer failed"):
+        lib._ctr_known_answer()
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("seal", "AES-GCM seal failed"),
+        ("ciphertext", "AES-GCM known answer failed"),
+        ("open", "AES-GCM open failed"),
+        ("roundtrip", "AES-GCM round trip failed"),
+    ],
+)
+def test_libcrypto_rejects_bad_gcm_known_answers(
+    monkeypatch: pytest.MonkeyPatch, failure: str, message: str
+) -> None:
+    sealed = bytes.fromhex("0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")
+
+    class FakeGCM:
+        def __init__(self, encrypt: bool) -> None:
+            self.encrypt = encrypt
+
+        def apply(
+            self,
+            _iv: bytes,
+            _aad: bytes,
+            buffer: bytearray,
+            _offset: int,
+            _length: int,
+        ) -> bool:
+            if self.encrypt:
+                if failure == "seal":
+                    return False
+                buffer[:] = bytes(32) if failure == "ciphertext" else sealed
+                return True
+            if failure == "open":
+                return False
+            buffer[:16] = b"x" * 16 if failure == "roundtrip" else bytes(16)
+            return True
+
+    lib = libcrypto.LibCrypto.__new__(libcrypto.LibCrypto)
+    monkeypatch.setattr(lib, "aes_gcm", lambda _key, encrypt: FakeGCM(encrypt))
+    with pytest.raises(RuntimeError, match=message):
+        lib._gcm_known_answer()
+
+
 def test_libcrypto_without_mac_symbols() -> None:
     lib = libcrypto.LibCrypto(_fake_handle(with_mac=False), "fake")
     assert not lib.has_poly1305

@@ -55,6 +55,9 @@ Where this differs from gfal2, deliberately:
 * ``timeout = 0`` means no limit; gfal2's local copy expires at once.
 * ``strict_copy`` truncates the destination (``O_TRUNC``); gfal2 writes
   over it in place and leaves a longer file's tail behind.
+* A completed regular ``file://`` destination gets one final ``fsync`` before
+  success, so a cache or failing filesystem's delayed ENOSPC/EIO is not a
+  false success. This is outside the chunk loop; pipes and devices are skipped.
 * A bulk copy's per-file ``"ALG:value"`` replaces the algorithm and value
   but keeps the parameters' mode, as in gfal2, without gfal2's bugs: the
   caller's parameters are not modified, the algorithm name is not cut one
@@ -65,6 +68,7 @@ Where this differs from gfal2, deliberately:
 from __future__ import annotations
 
 import errno
+import os
 import queue
 import stat as stat_module
 import threading
@@ -398,6 +402,37 @@ def _is_special(mode: int) -> bool:
     return stat_module.S_ISCHR(mode) or stat_module.S_ISFIFO(mode) or stat_module.S_ISSOCK(mode)
 
 
+def _sync_local_destination(transfer: Transfer) -> None:
+    """Commit a regular local destination before a copy reports success.
+
+    A final durability barrier catches delayed ENOSPC/EIO from disks, network
+    filesystems and FUSE caches without adding work to the hot chunk loop.
+    Non-file URLs and special-file streams deliberately have no such contract.
+    """
+    if not transfer.destination.startswith("file:///"):
+        return
+    path = transfer.destination[len("file://") :]
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if stat_module.S_ISREG(info.st_mode):
+                os.fsync(fd)
+                info = os.fstat(fd)
+                if info.st_size != transfer.transferred:
+                    raise OSError(
+                        errno.EIO,
+                        "local destination has "
+                        f"{info.st_size} bytes after sync; expected {transfer.transferred}",
+                    )
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        error = from_oserror(exc)
+        raise GError(f"Could not sync destination: {error.message}", error.code) from exc
+
+
 def _cleanup(transfer: Transfer, plugin_copy: bool) -> None:
     """Remove a destination this failed copy wrote.
 
@@ -474,6 +509,7 @@ def run_copy(
         else:
             transfer.event(ev.TRANSFER_TYPE, "streamed")
             stream(transfer)
+        _sync_local_destination(transfer)
         if narrate:
             transfer.event(ev.TRANSFER_EXIT, transfer.pair)
         if verify:

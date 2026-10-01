@@ -1,0 +1,366 @@
+[
+  {
+    "path": "src/xgfalclient/cli/_copy.py",
+    "file_name": "_copy.py",
+    "functions": [
+      {
+        "name": "_Copier::copy",
+        "complexity": 17
+      },
+      {
+        "name": "_Copier::copy_file",
+        "complexity": 21
+      },
+      {
+        "name": "_Copier::run",
+        "complexity": 23
+      },
+      {
+        "name": "_Copier::parameters",
+        "complexity": 24
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/context.py",
+    "file_name": "context.py",
+    "functions": [
+      {
+        "name": "Gfal2Context::_mkdir_parents",
+        "complexity": 17
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/creds.py",
+    "file_name": "creds.py",
+    "functions": [
+      {
+        "name": "find_x509",
+        "complexity": 17
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/crypto/sshkeys.py",
+    "file_name": "sshkeys.py",
+    "functions": [
+      {
+        "name": "KnownHosts::check",
+        "complexity": 16
+      },
+      {
+        "name": "load_private",
+        "complexity": 17
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/dcap/file.py",
+    "file_name": "file.py",
+    "functions": [
+      {
+        "name": "DcapFile::_read",
+        "complexity": 18
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/file.py",
+    "file_name": "file.py",
+    "functions": [
+      {
+        "name": "_digest",
+        "complexity": 16
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/gridftp/data.py",
+    "file_name": "data.py",
+    "functions": [
+      {
+        "name": "DataTransfer::_await",
+        "complexity": 16
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/gridftp/plugin.py",
+    "file_name": "plugin.py",
+    "functions": [
+      {
+        "name": "GridFTPPlugin::_filecopy",
+        "complexity": 18
+      },
+      {
+        "name": "_ThirdParty::run",
+        "complexity": 23
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/http/_client.py",
+    "file_name": "_client.py",
+    "functions": [
+      {
+        "name": "HTTPClient::request",
+        "complexity": 20
+      },
+      {
+        "name": "HTTPClient::_perform",
+        "complexity": 21
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/http/_copy.py",
+    "file_name": "_copy.py",
+    "functions": [
+      {
+        "name": "_follow",
+        "complexity": 16
+      },
+      {
+        "name": "_parallel",
+        "complexity": 36
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/http/_s3.py",
+    "file_name": "_s3.py",
+    "functions": [
+      {
+        "name": "_listing",
+        "complexity": 26
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/lfc/plugin.py",
+    "file_name": "plugin.py",
+    "functions": [
+      {
+        "name": "LFCPlugin::_mkdir_rec",
+        "complexity": 16
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/mock.py",
+    "file_name": "mock.py",
+    "functions": [
+      {
+        "name": "_entries",
+        "complexity": 16
+      },
+      {
+        "name": "MockPlugin::copy",
+        "complexity": 20
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/sftp/client.py",
+    "file_name": "client.py",
+    "functions": [
+      {
+        "name": "SFTPClient::read_into",
+        "complexity": 25
+      },
+      {
+        "name": "SFTPClient::stream_read",
+        "complexity": 52
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/sftp/ssh.py",
+    "file_name": "ssh.py",
+    "functions": [
+      {
+        "name": "SSHTransport::_handle_channel",
+        "complexity": 16
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/srm/bdii.py",
+    "file_name": "bdii.py",
+    "functions": [
+      {
+        "name": "read_cache",
+        "complexity": 16
+      },
+      {
+        "name": "decode_filter",
+        "complexity": 17
+      },
+      {
+        "name": "_parse",
+        "complexity": 24
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/srm/transport.py",
+    "file_name": "transport.py",
+    "functions": [
+      {
+        "name": "Transport::call",
+        "complexity": 18
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/plugins/xrootd.py",
+    "file_name": "xrootd.py",
+    "functions": [
+      {
+        "name": "_judge",
+        "complexity": 19
+      },
+      {
+        "name": "_Rendezvous::run",
+        "complexity": 20
+      },
+      {
+        "name": "describe",
+        "complexity": 20
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/testing/dcap.py",
+    "file_name": "dcap.py",
+    "functions": [
+      {
+        "name": "_Mover::serve",
+        "complexity": 28
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/testing/gridftp.py",
+    "file_name": "gridftp.py",
+    "functions": [
+      {
+        "name": "_Session::transfer",
+        "complexity": 17
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/testing/ldap.py",
+    "file_name": "ldap.py",
+    "functions": [
+      {
+        "name": "BDIIServer::_handle",
+        "complexity": 21
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/testing/lfc.py",
+    "file_name": "lfc.py",
+    "functions": [
+      {
+        "name": "_Connection::listing",
+        "complexity": 16
+      },
+      {
+        "name": "_h_addreplica",
+        "complexity": 20
+      },
+      {
+        "name": "_h_rename",
+        "complexity": 23
+      },
+      {
+        "name": "_new_entry",
+        "complexity": 28
+      },
+      {
+        "name": "_parse",
+        "complexity": 82
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/testing/sftp.py",
+    "file_name": "sftp.py",
+    "functions": [
+      {
+        "name": "_SSHServerConn::_authenticate",
+        "complexity": 17
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/testing/srm.py",
+    "file_name": "srm.py",
+    "functions": [
+      {
+        "name": "SRMServer::_new_request",
+        "complexity": 25
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/testing/webdav.py",
+    "file_name": "webdav.py",
+    "functions": [
+      {
+        "name": "_Handler::_route",
+        "complexity": 17
+      },
+      {
+        "name": "_Handler::_refused",
+        "complexity": 19
+      },
+      {
+        "name": "_Handler::_s3",
+        "complexity": 20
+      },
+      {
+        "name": "_Handler::_tape",
+        "complexity": 45
+      }
+    ]
+  },
+  {
+    "path": "src/xgfalclient/transfer.py",
+    "file_name": "transfer.py",
+    "functions": [
+      {
+        "name": "run_bulk",
+        "complexity": 20
+      },
+      {
+        "name": "run_copy",
+        "complexity": 29
+      }
+    ]
+  },
+  {
+    "path": "tests/krb5_fakes.py",
+    "file_name": "krb5_fakes.py",
+    "functions": [
+      {
+        "name": "fake_gssapi_module",
+        "complexity": 24
+      }
+    ]
+  },
+  {
+    "path": "tests/test_cli_parity.py",
+    "file_name": "test_cli_parity.py",
+    "functions": [
+      {
+        "name": "differences",
+        "complexity": 16
+      }
+    ]
+  }
+]

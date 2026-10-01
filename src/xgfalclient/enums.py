@@ -48,7 +48,7 @@ class BoostEnum(int):
 
     def __reduce__(self) -> tuple[Any, tuple[str, int, bool]]:
         named = "name" in self.__dict__
-        return (_lookup, (type(self).__name__, int(self), named))  # type: ignore[return-value]
+        return (_lookup, (type(self).__name__, int(self), named))
 
 
 def _define(cls: type[E], members: list[tuple[str, int]]) -> None:
@@ -105,4 +105,4 @@ _ENUMS: dict[str, type[BoostEnum]] = {
 def _lookup(kind: str, value: int, named: bool = True) -> BoostEnum:
     """Unpickle: the member registered for ``value``, or a nameless instance again."""
     cls = _ENUMS[kind]
-    return cls.values[value] if named else cls(value)  # type: ignore[no-any-return]
+    return cls.values[value] if named else cls(value)

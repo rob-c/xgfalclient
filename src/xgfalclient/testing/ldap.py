@@ -146,7 +146,7 @@ class BDIIServer:
     def _handle(self, sock: socket.socket, raw: bytes) -> bool:
         """Answer one request; ``False`` to hang up."""
         message_id, operation = children(decode(raw))[:2]
-        number = int.from_bytes(message_id[1], "big")  # type: ignore[arg-type]
+        number = int.from_bytes(message_id[1], "big")
         if "hang" in self.faults:
             self._stop.wait()
             return False

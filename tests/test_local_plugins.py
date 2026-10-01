@@ -311,6 +311,17 @@ def test_file_pwrite_retries_short_writes(monkeypatch: pytest.MonkeyPatch, tmp_p
     rw.close()
 
 
+def test_file_pwrite_refuses_zero_progress(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(file_plugin.os, "pwrite", lambda *_: 0)
+    handle = LocalFile("file://x", str(tmp_path / "f"), O_WRONLY | O_CREAT, 0o644)
+    try:
+        with pytest.raises(GError) as caught:
+            handle.pwrite(b"payload", 0)
+        assert caught.value.code == errno.EIO
+    finally:
+        handle.close()
+
+
 @pytest.mark.parametrize(
     ("name", "expected"),
     [

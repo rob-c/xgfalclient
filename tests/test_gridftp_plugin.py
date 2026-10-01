@@ -32,11 +32,19 @@ from test_gridftp_helpers import (  # noqa: F401 - fixtures
     write,
 )
 from xgfalclient.errors import ECOMM, GError
+from xgfalclient.plugins.gridftp import plugin as gridftp_plugin
 from xgfalclient.plugins.gridftp.data import DataConn
 from xgfalclient.testing.gridftp import FEATURES, GridFTPServer
 from xgfalclient.testing.pki import PKI
 
 Ctx = xgfalclient.Gfal2Context
+
+
+def test_local_download_refuses_zero_pwrite_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gridftp_plugin.os, "pwrite", lambda *_: 0)
+    with pytest.raises(OSError) as caught:
+        gridftp_plugin._pwrite(123, memoryview(b"payload"), 0)
+    assert caught.value.errno == errno.EIO
 
 
 def root_of(server: GridFTPServer) -> Path:

@@ -19,8 +19,10 @@ server, in the same run.
   proxy from a throwaway test CA.
 * **Method.** `benchmarks/bench_vs_gfal2.py`: every sample runs in a fresh
   interpreter, so neither library benefits from the other's imports or warm
-  connections; five samples per case, median reported with the range. Data
-  cases move a 512 MiB random file with `filecopy` (to or from a local
+  connections. Contenders alternate who runs first in each paired round;
+  the median and full range are reported. `--gate` requires both the chosen
+  median speedup and a one-sided sign-test result at the requested alpha.
+  Data cases move a 512 MiB random file with `filecopy` (to or from a local
   file); metadata cases run 200 `stat`s, 200 `listdir`s of a 300-entry
   directory, or 200 ADLER32 `checksum`s in a loop.
 * **Warm-up.** gfal2 loads every plugin inside `creat_context()`, before any
@@ -137,8 +139,13 @@ bounded by the server's fsync and its fixed 2 MiB channel window.
 ```console
 $ python benchmarks/bench_vs_gfal2.py --base davs://server:8443/data/bench \
       --size 512 --repeat 5 --json results.json
+$ python benchmarks/bench_vs_gfal2.py --base davs://server:8443/data/bench \
+      --size 512 --repeat 9 --gate --min-ratio 1.10
 ```
 
 `--base` is a writable directory URL; the harness creates its fixtures there.
 Run it in a container on the same network as the server, with both gfal2's
-bindings and xgfalclient importable.
+bindings and xgfalclient importable. The gate deliberately rejects
+xgfalclient's `gfal2` compatibility shim as the reference implementation.
+Checksum is report-only by default because it is normally bounded by the
+server reading the file, not by either client.

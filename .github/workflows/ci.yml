@@ -22,10 +22,40 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev,xrootd]"
-      - name: ruff
+      - name: ruff lint and security checks
         run: ruff check src tests benchmarks
+      - name: ruff format
+        run: ruff format --check src tests benchmarks
       - name: mypy --strict
         run: mypy
+      - name: cognitive-complexity ratchet
+        run: |
+          complexipy --quiet
+          git diff --exit-code -- complexipy-snapshot.json
+      - name: build and inspect distributions
+        run: |
+          python -m build
+          twine check --strict dist/*
+      - name: smoke-test the built wheel
+        run: |
+          python -m venv /tmp/xgfalclient-wheel
+          /tmp/xgfalclient-wheel/bin/python -m pip install --no-deps dist/*.whl
+          /tmp/xgfalclient-wheel/bin/python -c 'import importlib.metadata as m, gfal2, gfal2_util, xgfalclient; assert m.version("xgfalclient") == xgfalclient.VERSION; assert gfal2.get_version() == "2.23.5"; assert gfal2_util.__name__ == "gfal2_util"'
+
+  condition-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,xrootd]"
+      # Every short-circuit operand, conditional expression and comprehension
+      # filter must be observed both ways. This complements line/branch coverage.
+      - name: condition coverage
+        env:
+          XGFAL_CONDCOV: "1"
+        run: pytest -q -p no:cacheprovider -n auto -m "not interop" --timeout=300
 
   test:
     runs-on: ${{ matrix.os }}
@@ -33,7 +63,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
         include:
           - os: macos-latest
             python-version: "3.12"
@@ -52,3 +82,14 @@ jobs:
         run: >-
           pytest -q -p no:cacheprovider -n auto --timeout=300
           --cov --cov-report=term-missing --cov-fail-under=0
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[docs]"
+      - name: build documentation without warnings
+        run: mkdocs build --strict

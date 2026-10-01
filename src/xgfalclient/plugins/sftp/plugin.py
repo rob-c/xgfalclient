@@ -575,6 +575,8 @@ def _pwrite_all(fd: int, view: memoryview, offset: int) -> None:
     data = view
     while len(data):
         written = os.pwrite(fd, data, offset)
+        if written <= 0:
+            raise OSError(errno.EIO, "local pwrite made no progress")
         offset += written
         data = data[written:]
 

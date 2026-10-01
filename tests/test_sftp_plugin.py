@@ -13,10 +13,18 @@ import pytest
 import xgfalclient
 from xgfalclient.crypto.sshkeys import PrivateKey, encode_openssh_private
 from xgfalclient.errors import GError
+from xgfalclient.plugins.sftp import plugin as sftp_plugin
 from xgfalclient.plugins.sftp import ssh
 from xgfalclient.plugins.sftp.endpoint import Endpoint
 from xgfalclient.plugins.sftp.plugin import SFTPPlugin
 from xgfalclient.testing.sftp import SFTPServer, SSHServer
+
+
+def test_local_download_refuses_zero_pwrite_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sftp_plugin.os, "pwrite", lambda *_: 0)
+    with pytest.raises(OSError) as caught:
+        sftp_plugin._pwrite_all(123, memoryview(b"payload"), 0)
+    assert caught.value.errno == errno.EIO
 
 
 @pytest.fixture

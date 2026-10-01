@@ -7,13 +7,13 @@ underneath and no required dependency outside the standard library.
 ```python
 import xgfalclient as gfal2
 
-ctx = gfal2.creat_context()
-print(ctx.stat("davs://se.example.org/store/f.root").st_size)
+with gfal2.creat_context() as ctx:
+    print(ctx.stat("davs://se.example.org/store/f.root").st_size)
 
-params = ctx.transfer_parameters()
-params.overwrite = True
-params.set_checksum(gfal2.checksum_mode.both, "ADLER32", "")
-ctx.filecopy(params, "file:///tmp/f.root", "root://se.example.org//store/f.root")
+    params = ctx.transfer_parameters()
+    params.overwrite = True
+    params.set_checksum(gfal2.checksum_mode.both, "ADLER32", "")
+    ctx.filecopy(params, "file:///tmp/f.root", "root://se.example.org//store/f.root")
 ```
 
 Unmodified code that says `import gfal2` works as it is: the wheel also
@@ -51,7 +51,7 @@ As in gfal2, each protocol is a plugin, loaded the first time a URL needs it.
 
 | Scheme | Plugin | Notes |
 | --- | --- | --- |
-| `http`, `https`, `dav`, `davs` | http | WebDAV, HTTP third-party copy (pull, push, streamed fallback), gridsite delegation, WLCG tape REST API, SE-issued tokens, CDMI QoS |
+| `http`, `https`, `dav`, `davs` | http | WebDAV, HTTP third-party copy (pull, push, streamed fallback), Link-discovered Metalink replica failover, gridsite delegation, WLCG tape REST API, SE-issued tokens, CDMI QoS |
 | `s3`, `s3s` | http | AWS SigV4, multipart upload, pre-signed TPC |
 | `gcloud`, `gclouds` | http | service-account V4 signed URLs, as davix does |
 | `swift`, `swifts` | http | OpenStack Swift with a configured token (`[SWIFT]`), as davix does |
@@ -97,6 +97,32 @@ store through the built-in SSH-2 client.
 The stock gfal2 defaults are built in, and `$GFAL_CONFIG_DIR` (or an existing
 `/etc/gfal2.d`) is layered on top, so a site's gfal2 tuning applies unchanged.
 `get_opt_*`/`set_opt_*` behave as GLib key files do, error codes included.
+Setting `[HTTP PLUGIN] METALINK=true` enables Davix-compatible recovery for
+failed HTTP stats, reads, positioned reads and downloads. Discovery uses the
+server's Metalink `Link` or content type, caches the catalogue, and only pays
+that network cost after the original endpoint fails.
+
+HTTP `GET`, `HEAD`, `OPTIONS` and `PROPFIND` operations retry connection
+failures up to `[CORE] CONN_RETRY` times; streamed and positioned reads resume
+from the last byte received, and uploads restart only where replay is safe.
+When `CONN_RETRY_INTERVAL` is absent, retries use a 50 ms exponential backoff
+capped at one second so a brief outage cannot consume the entire retry count
+immediately. Setting the interval explicitly to `0` keeps fail-fast retry
+timing. Timeouts and server refusals are not mistaken for broken links.
+
+Completed copies to regular `file://` destinations issue one final durability
+barrier before reporting success. Delayed `ENOSPC`/`EIO` from a FUSE cache,
+network filesystem or failing disk therefore reaches the caller. The barrier
+is outside the transfer loop, so it does not reduce streaming throughput. The
+stable size must also match the transferred byte count, catching a cache that
+acknowledges `fsync` without publishing its writeback journal.
+
+Read-only local opens and reads recover from transient `EAGAIN`, `EBUSY`,
+`EINTR`, `ESTALE`, and `ETIMEDOUT` using `[CORE] CONN_RETRY` and
+`CONN_RETRY_INTERVAL`. Only a reader that actually faults downshifts to 4 KiB,
+and it reopens only if device, inode, size, and nanosecond timestamps still
+identify the same file generation. A replaced source therefore fails with
+`ESTALE` instead of producing a mixed-generation copy.
 
 ## Command line
 
@@ -170,7 +196,9 @@ Tests are hermetic: every protocol has an in-process server in
 `xgfalclient.testing`, and a throwaway grid PKI (`xgfalclient.testing.pki`)
 mints CAs, host certificates and proxies at run time. Tests against real
 servers in Docker are marked `interop` and run with `XGFAL_INTEROP=1`. See
-[docs/DEVELOPING.md](docs/DEVELOPING.md).
+[the documentation](docs/index.md), [developer guide](docs/DEVELOPING.md),
+[security policy](SECURITY.md), [contribution guide](CONTRIBUTING.md) and
+[0.2.0 release notes](CHANGELOG.md).
 
 ## Licence
 

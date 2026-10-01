@@ -77,10 +77,19 @@ def test_stale_pooled_connection_is_retried(
     dav.fault("PROPFIND", drop=True)
     assert hctx.stat(dav.url("/data/f")).st_size == 1
     assert dav.connections == 2
-    dav.fault("PROPFIND", drop=True, times=2)
+    dav.fault("PROPFIND", drop=True, times=50)
     with pytest.raises(GError) as caught:
         hctx.stat(dav.url("/data/f"))
     assert caught.value.code == errno.ECONNRESET or caught.value.message.startswith("Result")
+
+
+def test_truncated_propfind_body_is_retried(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
+    write(dav, "/data/f", b"payload")
+    dav.fault("PROPFIND", status=207, body=b"x" * 100, truncate=10)
+    assert hctx.stat(dav.url("/data/f")).st_size == 7
+    assert dav.methods().count("PROPFIND") == 2
 
 
 def test_stale_connection_on_an_upload(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:

@@ -405,7 +405,7 @@ def test_tape_call_transport_failure(
     with pytest.raises(GError) as caught:
         hctx.archive_poll(dav.url("/data/a"))
     assert caught.value.message.startswith("[Tape REST API] Archive polling call failed:")
-    dav.fault("GET", path="/api/v1/", drop=True, times=2)
+    dav.fault("GET", path="/api/v1/", drop=True, times=50)
     with pytest.raises(GError) as caught:
         hctx.bring_online_poll(dav.url("/data/a"), "id")
     assert caught.value.message.startswith("[Tape REST API] Stage pooling call failed:")

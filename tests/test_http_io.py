@@ -16,7 +16,8 @@ from test_http_helpers import dav, dav2, hctx, write  # noqa: F401 - fixtures
 from xgfalclient import GError
 from xgfalclient.checksum import crc32c
 from xgfalclient.plugin import O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY
-from xgfalclient.plugins.http import _dav
+from xgfalclient.plugins.http import _dav, _io
+from xgfalclient.plugins.http._client import TransportError
 from xgfalclient.testing.webdav import WebDAVServer
 
 WRITE = O_WRONLY | O_CREAT | O_TRUNC
@@ -341,6 +342,64 @@ def test_a_dropped_read_resumes_from_where_it_got_to(
     assert any(r.header("Range") for r in dav.requests if r.method == "GET")
 
 
+def test_a_dropped_pread_resumes_only_the_missing_range(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
+    body = bytes(range(256)) * 40
+    write(dav, "/data/f", body)
+    dav.fault("GET", body=body, truncate=3000, times=1)
+    handle = hctx.open(dav.url("/data/f"), "r")
+    assert handle.pread_bytes(0, len(body)) == body
+    handle.close()
+    ranges = [request.header("Range") for request in dav.requests if request.method == "GET"]
+    assert ranges[0] == f"bytes=0-{len(body) - 1}"
+    assert ranges[1].startswith("bytes=3000-")
+
+
+@pytest.mark.parametrize("status,first", [(206, b"0123"), (416, b"")])
+def test_pread_recovers_from_a_clean_short_range(
+    status: int,
+    first: bytes,
+    hctx: xgfalclient.Gfal2Context,
+    dav: WebDAVServer,
+) -> None:
+    body = b"0123456789"
+    write(dav, "/data/f", body)
+    # A proxy can turn a cut into a cleanly terminated, short HTTP response;
+    # a stale cache can also answer 416 despite the preceding stat. In both
+    # cases the known size says that the range is not complete yet.
+    dav.fault("GET", status=status, body=first)
+    with hctx.open(dav.url("/data/f"), "r") as handle:
+        assert handle.pread_bytes(0, len(body)) == body
+
+
+def test_pread_gives_up_after_clean_short_responses(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
+    write(dav, "/data/f", b"0123456789")
+    hctx.set_opt_integer("CORE", "CONN_RETRY", 1)
+    dav.fault("GET", status=206, body=b"", times=50)
+    with hctx.open(dav.url("/data/f"), "r") as handle, pytest.raises(GError) as caught:
+        handle.pread_bytes(0, 10)
+    assert caught.value.code == errno.EIO
+
+
+def test_pread_does_not_retry_a_timeout(
+    hctx: xgfalclient.Gfal2Context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeout = TransportError("timed out", errno.ETIMEDOUT)
+
+    def timed_out(_self: _io.HTTPReadFile, _offset: int, _view: memoryview) -> int:
+        raise _io._PartialRange(0, timeout)
+
+    monkeypatch.setattr(_io.HTTPReadFile, "_read_range", timed_out)
+    reader = _io.HTTPReadFile(plugin(hctx), "dav://host/data", 1)
+    with pytest.raises(TransportError) as caught:
+        reader.pread(0, 1)
+    assert caught.value is timeout
+
+
 def test_a_read_gives_up_after_conn_retry_drops(
     hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
 ) -> None:
@@ -355,7 +414,7 @@ def test_a_read_gives_up_after_conn_retry_drops(
     handle.close()
 
 
-def test_retry_pause_waits_only_when_an_interval_is_set(
+def test_retry_pause_backs_off_unless_zero_is_explicit(
     hctx: xgfalclient.Gfal2Context, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from xgfalclient.plugins.http import plugin as plugin_module
@@ -363,10 +422,13 @@ def test_retry_pause_waits_only_when_an_interval_is_set(
     slept: list[float] = []
     monkeypatch.setattr(plugin_module.time, "sleep", slept.append)
     http = plugin(hctx)
-    http.retry_pause(2)  # no interval configured: no wait
-    assert slept == []
+    http.retry_pause(2)
+    assert slept == [0.1]
+    hctx.set_opt_integer("CORE", "CONN_RETRY_INTERVAL", 0)
+    http.retry_pause(2)
+    assert slept == [0.1]
     hctx.set_opt_integer("CORE", "CONN_RETRY_INTERVAL", 1)
     http.retry_pause(1)
-    http.retry_pause(5)  # capped at the interval * attempts, but never below it
-    assert slept == [1, 1]
+    http.retry_pause(5)
+    assert slept == [0.1, 1.0, 1.0]
     assert http.conn_retry() == 3  # the default when nothing is set

@@ -20,6 +20,7 @@ from __future__ import annotations
 import errno
 import sys
 import tempfile
+import threading
 from typing import TYPE_CHECKING
 
 from ...errors import GError
@@ -45,10 +46,15 @@ def check_upload(response: Response) -> None:
 class HTTPReadFile(PluginFile):
     """A remote file opened for reading."""
 
-    def __init__(self, plugin: HTTPPlugin, url: str, size: int) -> None:
+    def __init__(
+        self, plugin: HTTPPlugin, url: str, size: int, *, active: str | None = None
+    ) -> None:
         super().__init__(url)
         self._plugin = plugin
         self._size = size
+        self._active = active or url
+        self._tried = {self._active}
+        self._replica_lock = threading.Lock()
         self._stream: Response | None = None
         self._stream_at = 0
 
@@ -65,7 +71,7 @@ class HTTPReadFile(PluginFile):
             return self._stream
         self._drop()
         headers = {"Range": f"bytes={self.position}-"} if self.position else {}
-        response = self._plugin._get(self.url, headers)
+        response = self._plugin._get(self._active, headers)
         if response.status == 416:
             response.close()
             raise _EOFError
@@ -90,21 +96,12 @@ class HTTPReadFile(PluginFile):
                 count = stream.readinto(view)
             except _EOFError:
                 return 0
-            except TransportError:
-                # The body was cut short mid-flight: the stream is spent, but
-                # the file is not (this call added nothing, and the guard above
-                # means ``position`` is still short of the end) - reconnect and
-                # resume from ``position``, up to CONN_RETRY times.
-                self._drop()
-                attempts += 1
-                if attempts <= self._plugin.conn_retry():
-                    self._plugin.retry_pause(attempts)
-                    continue
-                raise GError(
-                    f"connection closed at {self.position} of {self._size} bytes "
-                    f"reading {self.url}",
-                    errno.EIO,
-                ) from None
+            except TransportError as exc:
+                attempts = self._retry_stream(exc, attempts)
+                continue
+            except GError as exc:
+                attempts = self._failover_stream(exc)
+                continue
             if count > 0:
                 self._stream_at += count
                 self.position += count
@@ -112,6 +109,27 @@ class HTTPReadFile(PluginFile):
             # A clean end of this response - honoured, not resumed.
             self._drop()
             return 0
+
+    def _retry_stream(self, error: TransportError, attempts: int) -> int:
+        """Resume a dropped body, then try another replica if retries run out."""
+        self._drop()
+        attempts += 1
+        if attempts <= self._plugin.conn_retry():
+            self._plugin.retry_pause(attempts)
+            return attempts
+        if error.code != errno.ETIMEDOUT and self._next_replica():
+            return 0
+        raise GError(
+            f"connection closed at {self.position} of {self._size} bytes reading {self.url}",
+            errno.EIO,
+        ) from None
+
+    def _failover_stream(self, error: GError) -> int:
+        """Try another replica for a server failure, or preserve the failure."""
+        self._drop()
+        if error.code != errno.ETIMEDOUT and self._next_replica():
+            return 0
+        raise error
 
     def read(self, size: int) -> bytes:
         buffer = bytearray(max(size, 0))
@@ -127,16 +145,99 @@ class HTTPReadFile(PluginFile):
         return bytes(buffer)
 
     def pread(self, offset: int, size: int) -> bytes:
+        size = min(size, max(self._size - offset, 0))
         if size <= 0:
             return b""
-        headers = {"Range": f"bytes={offset}-{offset + size - 1}"}
-        response = self._plugin._get(self.url, headers)
-        with response:
-            if response.status == 416:
-                return b""
-            if response.status == 200:
-                _skip(response, offset)
-            return _read_exactly(response, size)
+        buffer = bytearray(size)
+        view = memoryview(buffer)
+        got = attempts = 0
+        try:
+            while got < size:
+                before = got
+                try:
+                    got += self._read_range(offset + got, view[got:])
+                    if got >= size:
+                        break
+                    # The stat said these bytes exist. A cleanly short body is
+                    # therefore a lost transfer too, even when http.client did
+                    # not turn the premature EOF into an exception.
+                    error = TransportError(
+                        "Connection terminated before the range arrived", errno.EIO
+                    )
+                except _PartialRange as cut:
+                    got += cut.count
+                    error = cut.error
+                except GError as caught:
+                    if caught.code == errno.ETIMEDOUT or not self._next_replica():
+                        raise
+                    attempts = 0
+                    continue
+                attempts = self._retry_pread(
+                    error,
+                    attempts,
+                    progressed=got > before,
+                    position=offset + got,
+                    end=offset + size,
+                )
+            return bytes(view[:got])
+        finally:
+            view.release()
+
+    def _read_range(self, offset: int, view: memoryview) -> int:
+        """Read one HTTP range, retaining its byte count if the link drops."""
+        headers = {"Range": f"bytes={offset}-{offset + len(view) - 1}"}
+        got = 0
+        try:
+            response = self._plugin._get(self._active, headers)
+            with response:
+                if response.status == 416:
+                    return 0
+                if response.status == 200:
+                    _skip(response, offset)
+                while got < len(view):
+                    count = response.readinto(view[got:])
+                    if count <= 0:
+                        break
+                    got += count
+        except TransportError as error:
+            raise _PartialRange(got, error) from error
+        return got
+
+    def _retry_pread(
+        self,
+        error: TransportError,
+        attempts: int,
+        *,
+        progressed: bool,
+        position: int,
+        end: int,
+    ) -> int:
+        """Retry one interrupted range, switch replica, or report a short read."""
+        if error.code == errno.ETIMEDOUT:
+            raise error
+        attempts = 1 if progressed else attempts + 1
+        if attempts <= self._plugin.conn_retry():
+            self._plugin.retry_pause(attempts)
+            return attempts
+        if self._next_replica():
+            return 0
+        raise GError(
+            f"connection closed at {position} of {end} bytes reading {self.url}", errno.EIO
+        ) from None
+
+    def _next_replica(self) -> bool:
+        """Switch to an advertised replica not tried by this handle."""
+        try:
+            replicas = self._plugin._metalink_replicas(self.url)
+        except GError:
+            return False
+        with self._replica_lock:
+            candidate = next((item for item in replicas if item not in self._tried), None)
+            if candidate is None:
+                return False
+            self._tried.add(candidate)
+            self._active = candidate
+        return True
 
     def close(self) -> None:
         self._drop()
@@ -145,6 +246,15 @@ class HTTPReadFile(PluginFile):
 
 class _EOFError(Exception):
     """A ranged read that started at or past the end of the file."""
+
+
+class _PartialRange(Exception):
+    """A range body that failed after ``count`` bytes had already landed."""
+
+    def __init__(self, count: int, error: TransportError) -> None:
+        super().__init__(str(error))
+        self.count = count
+        self.error = error
 
 
 def _skip(response: Response, count: int) -> None:
@@ -156,20 +266,6 @@ def _skip(response: Response, count: int) -> None:
         if got <= 0:
             return
         count -= got
-
-
-def _read_exactly(response: Response, size: int) -> bytes:
-    buffer = bytearray(size)
-    view = memoryview(buffer)
-    got = 0
-    while got < size:
-        count = response.readinto(view[got:])
-        if count <= 0:
-            break
-        got += count
-    view.release()
-    del buffer[got:]
-    return bytes(buffer)
 
 
 class HTTPWriteFile(PluginFile):
