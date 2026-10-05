@@ -1,9 +1,10 @@
 # xgfalclient
 
-`xgfalclient` is a pure-Python replacement for the `gfal2` Python bindings and
+`xgfalclient` is a Python 3 replacement for the `gfal2` Python bindings and
 gfal2-util commands. It keeps the API, plugin model, error codes and command
-line that FTS, Rucio and DIRAC integrations expect, without a compiled gfal2,
-Davix, XrdCl, Globus or SRM stack.
+line that FTS, Rucio and DIRAC integrations expect. Generic libraries provide
+ASN.1, cryptographic primitives, AWS signing, JWT decoding, GSS-API and HTTP
+connection management.
 
 ```python
 import gfal2

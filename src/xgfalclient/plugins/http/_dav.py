@@ -1,9 +1,8 @@
 """WebDAV and RFC 3230 parsing: ``PROPFIND`` multistatus bodies and ``Digest`` headers.
 
-A multistatus is parsed with :mod:`xml.etree`, which never fetches an
-external entity, and a body that declares a DTD at all is refused before it
-is parsed - an entity-expansion bomb is a DTD feature, and no WebDAV server
-needs one. A body that does not parse is ``EIO`` ``XML Parsing Error: ...``
+A multistatus is loaded through the local standard-library XML wrapper,
+which refuses DTDs, entities and external resources. A body that does not parse
+is ``EIO`` ``XML Parsing Error: ...``
 as in davix, but the rest of the message is expat's diagnosis, not
 libxml2's (``XML parse error at line 1: Document is empty``).
 
@@ -26,6 +25,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
+from ..._xml import UnsafeXML, fromstring
 from ...errors import GError
 from ...types import Stat
 
@@ -56,10 +56,10 @@ DIR_MODE = _stat.S_IFDIR | 0o777
 
 def parse_xml(payload: bytes, what: str = "WebDAV response") -> ET.Element:
     """Parse an XML body, refusing any document that carries a DTD."""
-    if b"<!DOCTYPE" in payload or b"<!ENTITY" in payload:
-        raise GError(f"Refusing a {what} with a document type declaration", errno.EIO)
     try:
-        return ET.fromstring(payload)
+        return fromstring(payload)
+    except UnsafeXML as exc:
+        raise GError(f"Refusing a {what} with a document type declaration", errno.EIO) from exc
     except ET.ParseError as exc:
         # davix's WebDavPropertiesParsingError, which gfal2 reports as EIO.
         raise GError(f"XML Parsing Error: {what}: {exc}", errno.EIO) from exc

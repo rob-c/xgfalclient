@@ -20,6 +20,7 @@ import time
 import urllib.parse
 import zlib
 from collections.abc import Iterator
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -110,7 +111,8 @@ def test_without_xrdclient_root_urls_say_how_to_fix_it(monkeypatch: pytest.Monke
         assert not any(name.startswith("xrootd") for name in context.get_plugin_names())
         failure = _gerror(context.stat, "root://host//f")
     assert failure.code == errno.EPROTONOSUPPORT
-    assert "pip install 'xgfalclient[xrootd]'" in failure.message
+    assert "required xrdclient package" in failure.message
+    assert "pip install --upgrade --force-reinstall xgfalclient" in failure.message
 
 
 def test_available_when_xrdclient_imports() -> None:
@@ -1295,22 +1297,35 @@ def test_a_session_without_the_bulk_api_is_not_borrowed() -> None:
 
 
 def test_an_upload_that_cannot_settle_its_connection_says_so() -> None:
-    upload: Any = object.__new__(xrootd._Upload)
-    upload.torn, upload.inflight = False, {1: (0, 1)}
-
-    def lost() -> None:
-        raise ConnectionError("gone")
-
-    upload._collect = lost
-    assert upload._settle() is False
-    upload.wire = SimpleNamespace(receive_into=lambda view: 0)
+    channel, session = _upload_channel(lambda view: 0)
+    channel._begin()
+    channel._owed.add(channel._leased[0])
+    with pytest.raises(xe.TimeoutError, match="connection closed"):
+        channel.settle()
+    assert session.broken
+    wire = SimpleNamespace(receive_into=lambda view: 0)
     with pytest.raises(xe.ConnectionError):
-        upload._receive(8)
+        xrootd._receive(wire, 8)
+
+
+def _upload_channel(receive_into: Any) -> tuple[Any, Any]:
+    from xrdclient.config import Config
+    from xrdclient.proto.machine import SessionMachine, State
+    from xrdclient.session.bulk import BulkReader
+
+    machine = SessionMachine(host="local-test")
+    machine.state = State.READY
+    session = SimpleNamespace(
+        config=Config(request_timeout=0.01),
+        machine=machine,
+        transport=SimpleNamespace(send=lambda part: None, receive_into=receive_into),
+        broken=False,
+    )
+    session.mark_broken = lambda: setattr(session, "broken", True)
+    return BulkReader(session, bytes(4), chunk=4096, depth=1), session
 
 
 def test_an_upload_refuses_a_reply_to_a_write_it_did_not_send() -> None:
-    upload: Any = object.__new__(xrootd._Upload)
-    upload.inflight = {1: (0, 1)}
     pending = bytearray(xrootd._RESPONSE_HEADER.pack(7, 0, 0))  # stream 7: never used
 
     def receive_into(view: memoryview) -> int:
@@ -1319,10 +1334,36 @@ def test_an_upload_refuses_a_reply_to_a_write_it_did_not_send() -> None:
         del pending[:count]
         return count
 
-    upload.wire = SimpleNamespace(receive_into=receive_into)
+    channel, session = _upload_channel(receive_into)
     with pytest.raises(xe.ProtocolError, match="stream 7"):
-        upload._collect()
-    assert upload.torn and upload.inflight == {1: (0, 1)}
+        channel.write_chunks([memoryview(b"x")], strict_replies=True)
+    assert channel._torn and session.broken
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_shared_upload_preserves_timeout_and_closed_connection_errors(
+    monkeypatch: pytest.MonkeyPatch, closed: bool
+) -> None:
+    def receive_into(view: memoryview) -> int:
+        if closed:
+            return 0
+        raise xe.TimeoutError("server took too long")
+
+    channel, session = _upload_channel(receive_into)
+    session.bulk = lambda *args, **kwargs: channel
+    monkeypatch.setattr(
+        xrootd, "ReadAhead", lambda *args, **kwargs: nullcontext([memoryview(b"x")])
+    )
+    transfer = SimpleNamespace(check=lambda: None, progress=lambda *args, **kwargs: None)
+    handle = SimpleNamespace(session=session, handle=bytes(4))
+    upload = xrootd._Upload(transfer, None, None, handle)
+    expected = xe.ConnectionError if closed else xe.TimeoutError
+    with pytest.raises(expected) as caught:
+        upload.run()
+    assert str(caught.value) == (
+        "the server closed the connection" if closed else "server took too long"
+    )
+    assert session.broken and upload.done == 0
 
 
 def test_an_upload_that_comes_up_short_fails(

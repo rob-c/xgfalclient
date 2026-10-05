@@ -20,14 +20,11 @@ Nothing about Kerberos itself is implemented in Python. The tokens come
 from the platform's GSS-API library, which is the only thing that can use
 the machine's credential cache as configured (KCM via sssd on EL9,
 ``FILE:``, ``KEYRING:``, macOS's ``API:``) and the only thing the site's KDC
-is tested against. Two ways to reach it, chosen once per process:
+is tested against. The optional ``krb5`` extra provides maintained native bindings:
 
-* the ``gssapi`` package (python-gssapi), when it is importable;
-* otherwise ``ctypes`` straight into ``libgssapi_krb5`` (MIT) or Heimdal's
-  library - Apple's ``GSS.framework`` on macOS - with no dependency at all.
-
-``XGFAL_KRB5_BACKEND=gssapi|ctypes`` forces one, ``XGFAL_GSSAPI_LIBRARY``
-names the library for the second. Credentials are the library's defaults:
+``XGFAL_KRB5_BACKEND=gssapi`` selects it explicitly; the old ``ctypes``
+selection remains a compatibility alias, not a separate implementation.
+ Credentials are the library's defaults:
 ``KRB5CCNAME`` or the configured default cache for an initiator,
 ``KRB5_KTNAME`` or ``/etc/krb5.keytab`` for an acceptor; ``ccache=`` and
 ``keytab=`` pick others per context. gfal2 itself has no Kerberos options,
@@ -63,6 +60,7 @@ __all__ = [
     "reset",
     "BACKEND_ENV",
     "HINT",
+    "inspect_cache",
     "DELEG_FLAG",
     "MUTUAL_FLAG",
     "REPLAY_FLAG",
@@ -75,8 +73,8 @@ __all__ = [
 BACKEND_ENV = "XGFAL_KRB5_BACKEND"
 
 HINT = (
-    "install the system Kerberos library (krb5-libs on EL, libgssapi-krb5-2 on Debian) "
-    "or the Python gssapi package"
+    "install the Kerberos extra with python -m pip install 'xgfalclient[krb5]'. "
+    "Linux source installs also need Kerberos development headers and a C compiler"
 )
 
 # ``gss_init_sec_context`` request flags (RFC 2744).
@@ -91,6 +89,13 @@ _BACKENDS: dict[str, Backend] = {}
 _LOCK = threading.Lock()
 
 
+def inspect_cache(name: str | None = None) -> dict[str, str | int]:
+    """Read the cache name, principal and latest ticket expiry through pykrb5."""
+    from ._cache import inspect_cache as inspect
+
+    return inspect(name)
+
+
 def _load_gssapi() -> Backend:
     import gssapi  # type: ignore[import-not-found,unused-ignore]
 
@@ -99,33 +104,15 @@ def _load_gssapi() -> Backend:
     return GssapiBackend(gssapi)
 
 
-def _load_ctypes() -> Backend:
-    from ._ctypes import load
-
-    return load()
-
-
 def _select(choice: str) -> Backend:
-    """The backend for ``choice`` (``auto``, ``gssapi`` or ``ctypes``), or raise."""
     if choice not in ("auto", "gssapi", "ctypes"):
+        raise KerberosError(f"unknown Kerberos backend {choice!r} (expected gssapi)", errno.EINVAL)
+    try:
+        return _load_gssapi()
+    except (ImportError, OSError) as exc:
         raise KerberosError(
-            f"unknown Kerberos backend {choice!r} (expected gssapi or ctypes)", errno.EINVAL
-        )
-    reasons: list[str] = []
-    if choice in ("auto", "gssapi"):
-        try:
-            return _load_gssapi()
-        except ImportError as exc:
-            reasons.append(f"the gssapi package cannot be imported ({exc})")
-    if choice in ("auto", "ctypes"):
-        try:
-            return _load_ctypes()
-        except OSError as exc:
-            reasons.append(str(exc))
-    raise KerberosError(
-        "Kerberos 5 (GSS-API) is not available: " + "; ".join(reasons) + f"; {HINT}",
-        errno.EPROTONOSUPPORT,
-    )
+            f"Kerberos 5 (GSS-API) is not available: {exc}; {HINT}", errno.EPROTONOSUPPORT
+        ) from exc
 
 
 def load_backend(name: str | None = None) -> Backend:
@@ -159,7 +146,7 @@ def available(name: str | None = None) -> str | None:
 
 
 def backend(name: str | None = None) -> str | None:
-    """``ctypes-mit``, ``ctypes-heimdal`` or ``gssapi``; ``None`` if there is none."""
+    """``gssapi``; ``None`` if the system binding is unavailable."""
     try:
         return load_backend(name).name
     except KerberosError:

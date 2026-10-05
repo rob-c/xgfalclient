@@ -11,7 +11,7 @@ import sys
 from datetime import datetime
 
 from ..errors import GError
-from ._base import Command, Spec, arg, out, surl
+from ._base import Command, Spec, arg, out, output, stat_record, surl
 from ._utils import file_mode_str, file_type_str
 
 __all__ = ["SPECS"]
@@ -28,24 +28,30 @@ def mkdir(cmd: Command) -> None:
         except ValueError:
             pass  # -m 999: gfal2-util falls back to 0755 without a word
     for directory in cmd.params.directory:
+        output.identify("mkdir", url=directory)
         if cmd.params.parents:
             cmd.context.mkdir_rec(directory, mode)
         else:
             cmd.context.mkdir(directory, mode)
+        output.record(status="succeeded", mode=mode)
 
 
 def save(cmd: Command) -> None:
     # Bytes from stdin untouched, as cat writes them: gfal2-util's text-mode
     # read dies on input that is not UTF-8 (UnicodeEncodeError, empty file).
+    output.identify("save", url=cmd.params.file)
     handle = cmd.context.open(cmd.params.file, "w")
+    received = 0
     try:
         while True:
             data = sys.stdin.buffer.read(CHUNK)
             if not data:
                 break
             handle.write(data)
+            received += len(data)
     finally:
         handle.close()
+    output.record(status="succeeded", bytes_read=received)
 
 
 def cat(cmd: Command) -> None:
@@ -54,6 +60,7 @@ def cat(cmd: Command) -> None:
     # character split across two reads.
     sys.stdout.flush()
     for name in cmd.params.file:
+        output.identify("cat", url=name)
         handle = cmd.context.open(name, "r")
         try:
             while True:
@@ -64,27 +71,37 @@ def cat(cmd: Command) -> None:
                 sys.stdout.buffer.flush()
         finally:
             handle.close()
+        output.record(status="succeeded")
 
 
 def xattr(cmd: Command) -> None:
     path, attribute = cmd.params.file, cmd.params.attribute
+    output.identify("xattr", url=path, attribute=attribute)
     if attribute is not None:
         if "=" in attribute:
             name, _, value = attribute.partition("=")
             if name and value:
                 cmd.context.setxattr(path, name, value, 0)
+                output.record(status="succeeded", name=name)
         else:
-            out(cmd.context.getxattr(path, attribute) + "\n")
+            value = cmd.context.getxattr(path, attribute)
+            output.record(status="succeeded", name=attribute, value=value)
+            out(value + "\n")
         return
     for name in cmd.context.listxattr(path):
         try:
-            out(f"{name} = {cmd.context.getxattr(path, name)}\n")
+            value = cmd.context.getxattr(path, name)
+            output.record(status="succeeded", name=name, value=value)
+            out(f"{name} = {value}\n")
         except GError as exc:
+            output.error(exc, name=name)
             out(f"{name} FAILED: {exc}\n")
 
 
 def checksum(cmd: Command) -> None:
+    output.identify("checksum", url=cmd.params.file)
     value = cmd.context.checksum(cmd.params.file, cmd.params.checksum_type)
+    output.record(status="succeeded", algorithm=cmd.params.checksum_type, value=value)
     out(f"{cmd.params.file} {value}\n")
 
 
@@ -93,7 +110,9 @@ def _time(stamp: int) -> str:
 
 
 def stat_(cmd: Command) -> None:
+    output.identify("stat", url=cmd.params.file)
     info = cmd.context.stat(cmd.params.file)
+    output.record(status="succeeded", value=stat_record(info))
     mode = info.st_mode
     out(
         f"  File: '{cmd.params.file}'\n"
@@ -107,21 +126,27 @@ def stat_(cmd: Command) -> None:
 
 
 def rename(cmd: Command) -> None:
+    output.identify("rename", source=cmd.params.source, target=cmd.params.destination)
     cmd.context.rename(cmd.params.source, cmd.params.destination)
+    output.record(status="succeeded")
 
 
 def chmod(cmd: Command) -> None:
+    output.identify("chmod", url=cmd.params.file)
     try:
         mode = int(cmd.params.mode, 8)
     except ValueError:
         cmd.parser.error("Mode must be an octal number (i.e. 0755)")
     cmd.context.chmod(cmd.params.file, mode)
+    output.record(status="succeeded", mode=mode)
 
 
 def token(cmd: Command) -> int:
     params = cmd.params
+    output.identify("token", url=params.path)
     if params.validity < 0:
-        sys.stderr.write("Validity must be a number >= 0\n")
+        output.error(ValueError("Token validity must be zero or greater"), code=1)
+        output.message("Validity must be a number >= 0\n", stderr=True)
         return 1
     if params.verbose:
         if params.activities:
@@ -132,6 +157,7 @@ def token(cmd: Command) -> int:
     issuer = params.issuer if params.issuer is not None else ""
     access = params.activities if params.activities else params.write_access
     value = cmd.context.token_retrieve(params.path, issuer, params.validity, access)
+    output.record(status="succeeded", value=value)
     out(value + "\n")
     return 0
 

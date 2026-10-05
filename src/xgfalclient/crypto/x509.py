@@ -1,4 +1,4 @@
-"""X.509 certificates and RFC 3820 proxies, read and built in pure Python.
+"""Library-backed X.509 inspection and RFC 3820 proxy adapters.
 
 The client needs three things from X.509:
 
@@ -24,18 +24,21 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from xrdclient.crypto.x509 import ATTRIBUTE_NAMES as ATTRIBUTE_NAMES
+from xrdclient.crypto.x509 import ATTRIBUTE_OIDS as ATTRIBUTE_OIDS
+from xrdclient.crypto.x509 import Name as Name
+from xrdclient.crypto.x509 import _decode_name as _decode_name
+from xrdclient.crypto.x509 import _extensions as _extensions
+from xrdclient.crypto.x509 import certificate_data
+from xrdclient.crypto.x509 import decode_name as decode_name
+from xrdclient.crypto.x509 import encode_name as encode_name
+
 from .._compat import SLOTS
 from .der import (
     TAG_BIT_STRING,
-    TAG_BOOLEAN,
-    TAG_INTEGER,
-    TAG_OCTET_STRING,
-    TAG_SEQUENCE,
     DERError,
-    Element,
     bit_string,
     boolean,
-    decode_time,
     explicit,
     integer,
     null,
@@ -44,12 +47,8 @@ from .der import (
     oid_string,
     parse,
     parse_one,
-    printable_string,
-    read_integer,
     sequence,
-    set_of,
     tlv,
-    utf8_string,
     validity_time,
 )
 from .rsa import (
@@ -57,13 +56,13 @@ from .rsa import (
     RSAPublicKey,
     load_private_key,
     pem_blocks,
-    public_key_from_bitstring,
 )
 
 __all__ = [
     "Name",
     "Certificate",
     "Credential",
+    "decode_name",
     "load_certificates",
     "load_credential",
     "pem",
@@ -77,20 +76,6 @@ __all__ = [
     "LIMITED_PROXY_OID",
     "INDEPENDENT_OID",
 ]
-
-ATTRIBUTE_NAMES = {
-    "2.5.4.3": "CN",
-    "2.5.4.6": "C",
-    "2.5.4.7": "L",
-    "2.5.4.8": "ST",
-    "2.5.4.10": "O",
-    "2.5.4.11": "OU",
-    "2.5.4.5": "serialNumber",
-    "1.2.840.113549.1.9.1": "emailAddress",
-    "0.9.2342.19200300.100.1.25": "DC",
-    "0.9.2342.19200300.100.1.1": "UID",
-}
-ATTRIBUTE_OIDS = {short: dotted for dotted, short in ATTRIBUTE_NAMES.items()}
 
 #: ``id-pe-proxyCertInfo``: its presence makes a certificate an RFC 3820 proxy.
 PROXY_CERT_INFO_OID = "1.3.6.1.5.5.7.1.14"
@@ -113,76 +98,6 @@ _SIGNATURE_OIDS = {
 }
 _DIGEST_FOR_OID = {value: key for key, value in _SIGNATURE_OIDS.items()}
 _RSA_OID = "1.2.840.113549.1.1.1"
-
-
-@dataclass(frozen=True, **SLOTS)
-class Name:
-    """A distinguished name: ``(type, value)`` pairs plus the DER they came from."""
-
-    rdns: tuple[tuple[str, str], ...] = ()
-    der: bytes = field(default=b"", compare=False, repr=False)
-
-    @property
-    def cn(self) -> str:
-        common = [value for key, value in self.rdns if key == "CN"]
-        return common[-1] if common else ""
-
-    def get(self, key: str) -> list[str]:
-        return [value for name, value in self.rdns if name == key]
-
-    def __str__(self) -> str:
-        """OpenSSL's one-line form: ``/DC=org/DC=example/CN=Jane Doe``."""
-        return "".join(f"/{key}={value}" for key, value in self.rdns)
-
-    def __bool__(self) -> bool:
-        return bool(self.rdns)
-
-    def encoded(self) -> bytes:
-        return self.der or encode_name(self.rdns)
-
-
-def encode_name(rdns: Sequence[tuple[str, str]]) -> bytes:
-    """A ``Name`` from ``(type, value)`` pairs, one attribute per RDN."""
-    parts = []
-    for key, value in rdns:
-        kind = ATTRIBUTE_OIDS.get(key, key)
-        parts.append(set_of(sequence(oid(kind), _attribute_value(kind, value))))
-    return sequence(*parts)
-
-
-#: Attributes RFC 4519 types as IA5String: domainComponent and emailAddress.
-_IA5_ATTRIBUTES = ("0.9.2342.19200300.100.1.25", "1.2.840.113549.1.9.1")
-
-
-def _attribute_value(kind: str, value: str) -> bytes:
-    if kind in _IA5_ATTRIBUTES:
-        return tlv(0x16, value.encode("ascii"))
-    if _printable(value):
-        return printable_string(value)
-    return utf8_string(value)
-
-
-def _printable(value: str) -> bool:
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 '()+,-./:=?")
-    return bool(value) and all(char in allowed for char in value)
-
-
-def _decode_name(element: Element) -> Name:
-    rdns: list[tuple[str, str]] = []
-    for rdn in element.children():
-        for attribute in rdn.children():
-            parts = attribute.children()
-            if len(parts) != 2:
-                continue
-            key = oid_string(parts[0])
-            rdns.append((ATTRIBUTE_NAMES.get(key, key), _decode_string(parts[1])))
-    return Name(tuple(rdns), element.encoded)
-
-
-def _decode_string(element: Element) -> str:
-    if element.tag == 0x1E:  # BMPString
-        return element.value.decode("utf-16-be", "replace")
-    return element.value.decode("utf-8", "replace")
 
 
 def pem(label: str, der: bytes) -> bytes:
@@ -287,54 +202,22 @@ def _policy_language(value: bytes) -> str:
         return ""
 
 
-def _extensions(fields: list[Element]) -> dict[str, tuple[bool, bytes]]:
-    found: dict[str, tuple[bool, bytes]] = {}
-    for extra in fields:
-        if extra.tag != 0xA3:
-            continue
-        for extension in extra.children()[0].children():
-            parts = extension.children()
-            critical = len(parts) == 3 and parts[1].tag == TAG_BOOLEAN and parts[1].value != b"\x00"
-            if parts[-1].tag == TAG_OCTET_STRING:
-                found[oid_string(parts[0])] = (critical, parts[-1].value)
-    return found
-
-
 def parse_certificate(der: bytes) -> Certificate:
-    """Decode one DER certificate; ``DERError`` if it is not one."""
-    certificate = parse_one(der)
-    top = certificate.children()
-    if len(top) != 3 or top[0].tag != TAG_SEQUENCE or top[2].tag != TAG_BIT_STRING:
-        raise DERError("not an X.509 certificate")
-    fields = top[0].children()
-    index = 1 if fields and fields[0].tag == 0xA0 else 0
-    if len(fields) < index + 6:
-        raise DERError("certificate body is missing required fields")
-    serial = read_integer(fields[index]) if fields[index].tag == TAG_INTEGER else 0
-    validity = fields[index + 3].children()
-    if len(validity) != 2:
-        raise DERError("certificate validity is not a pair of times")
-    spki = fields[index + 5]
-    parts = spki.children()
-    key: RSAPublicKey | None = None
-    if len(parts) == 2 and parts[1].tag == TAG_BIT_STRING:
-        try:
-            key = public_key_from_bitstring(parts[1])
-        except DERError:
-            key = None  # an EC certificate: readable, just not RSA
+    """Adapt the canonical decoded view without parsing a second time."""
+    data = certificate_data(der)
     return Certificate(
-        subject=_decode_name(fields[index + 4]),
-        issuer=_decode_name(fields[index + 2]),
-        serial=serial,
-        not_before=decode_time(validity[0]),
-        not_after=decode_time(validity[1]),
-        public_key=key,
-        extensions=_extensions(fields[index + 6 :]),
-        der=bytes(der),
-        tbs=top[0].encoded,
-        signature=top[2].value[1:],
-        signature_oid=oid_string(top[1].children()[0]),
-        spki=spki.encoded,
+        subject=data.subject,
+        issuer=data.issuer,
+        serial=data.serial,
+        not_before=data.not_before,
+        not_after=data.not_after,
+        public_key=data.public_key,
+        extensions=data.extension_values,
+        der=data.der,
+        tbs=data.tbs,
+        signature=data.signature,
+        signature_oid=data.signature_oid,
+        spki=data.spki,
     )
 
 

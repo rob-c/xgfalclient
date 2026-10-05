@@ -2,8 +2,8 @@
 
 Everything goes through the entry points (``xgfalclient.cli.ls([...])``) with
 stdout and stderr captured, against ``file://`` in ``tmp_path`` and ``mock://``.
-Expected outputs are gfal2-util 1.9.1's; ``test_cli_parity.py`` checks them
-against the real thing.
+Interfaces and exit codes follow gfal2-util 1.9.1. User-facing error wording
+is a deliberate difference; ``test_cli_parity.py`` checks successful operations.
 """
 
 from __future__ import annotations
@@ -41,6 +41,11 @@ from xgfalclient.types import Stat
 Run = Callable[..., tuple[int, str, str]]
 
 OLD = 1577934245  # 2020-01-02 03:04:05 UTC
+MISSING = "File or folder not found. Check the path and try again."
+DENIED = "Permission denied. Check that your account can access this file or service."
+INVALID = "A setting or path is invalid. Check the command and configuration."
+EXISTS = "This path already exists. Choose another path or explicitly enable overwrite."
+UNKNOWN = "The request failed. Check the command and service configuration."
 
 
 @pytest.fixture(autouse=True)
@@ -193,14 +198,13 @@ def test_definitions_client_info_and_flags(
     assert seen["options"]["CORE"]["CHECKSUM_TIMEOUT"] == "77"
 
 
-def test_bad_definition_is_a_traceback(run: Run, tree: Path) -> None:
+def test_bad_definition_has_a_plain_setting_error(run: Run, tree: Path) -> None:
     code, out, err = run("ls", "-D", "CORE:X", url(tree))
     assert code == 1
     assert out == ""
-    assert err.startswith("Traceback (most recent call last):\n")
-    assert err.endswith(
-        "ValueError: parameter 'CORE:X' doesn't include value, use 'group:option=value'\n"
-    )
+    assert "CORE:X" in err
+    assert "group:option=value" in err
+    assert "Traceback" not in err
 
 
 def test_cert_sets_environment(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -230,7 +234,8 @@ def test_verbose_logging_to_stdout_and_file(run: Run, tree: Path) -> None:
 def test_log_file_in_missing_directory(run: Run, tree: Path) -> None:
     code, _out, err = run("ls", "--log-file", str(tree / "no" / "log"), url(tree))
     assert code == 1
-    assert "FileNotFoundError" in err
+    assert "File or folder not found." in err
+    assert "Traceback" not in err
 
 
 def test_log_formatter() -> None:
@@ -269,7 +274,7 @@ def test_isatty() -> None:
 def test_gerror_out_of_range_exits_255(run: Run) -> None:
     code, _, err = run("stat", "mock://h/f?errno=300")
     assert code == 255
-    assert err.startswith(f"gfal-stat error: 300 ({os.strerror(300)}) - ")
+    assert err == f"gfal-stat: {UNKNOWN} (error 300)\n"
 
 
 def test_unexpected_exception_in_command(run: Run, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -279,14 +284,21 @@ def test_unexpected_exception_in_command(run: Run, monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(tape, "read_list", broken)
     code, _out, err = run("bringonline", "--from-file", "list")
     assert code == 255
-    assert err.startswith("Exception in thread Thread-1:\nTraceback (most recent call last):")
-    assert err.endswith("ValueError: unreadable list\n")
+    assert (
+        err == "gfal-bringonline: The command failed unexpectedly. "
+        "Run with -vvv for technical details.\n"
+    )
+    code, _out, err = run("bringonline", "-vvv", "--from-file", "list")
+    assert code == 255
+    assert "Traceback" in err
+    assert "ValueError: unreadable list" in err
 
 
 def test_oserror_in_command(run: Run, tree: Path) -> None:
     code, _, err = run("archivepoll", "--from-file", str(tree / "missing.list"))
     assert code == 255
-    assert "FileNotFoundError" in err
+    assert "File or folder not found." in err
+    assert "Traceback" not in err
 
 
 def test_broken_pipe_is_quiet(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -447,7 +459,9 @@ def test_chmod_negative_mode(run: Run, tree: Path) -> None:
     before = (tree / "a.txt").stat().st_mode
     code, _, err = run("chmod", "--", "-1", url(tree / "a.txt"))
     assert code == 255
-    assert err.endswith("OverflowError: can't convert negative value to unsigned int\n")
+    assert "A numeric value is out of range" in err
+    assert "file permission mode" in err
+    assert "Traceback" not in err
     assert (tree / "a.txt").stat().st_mode == before
 
 
@@ -523,7 +537,7 @@ def test_stat_mock_and_errors(run: Run) -> None:
     assert run("stat", "mock://h/f?errno=13") == (
         13,
         "",
-        "gfal-stat error: 13 (Permission denied) - Permission denied\n",
+        f"gfal-stat: {DENIED} (error 13)\n",
     )
 
 
@@ -547,10 +561,7 @@ def test_cat(tree: Path, capsysbinary: pytest.CaptureFixture[bytes]) -> None:
 def test_cat_missing(run: Run, tree: Path) -> None:
     code, _, err = run("cat", url(tree / "nope"))
     assert code == 2
-    assert err == (
-        "gfal-cat error: 2 (No such file or directory) - "
-        "errno reported by local system call No such file or directory\n"
-    )
+    assert err == (f"gfal-cat: {MISSING} (error 2)\n")
 
 
 def test_save(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -576,8 +587,7 @@ def test_xattr(run: Run, monkeypatch: pytest.MonkeyPatch) -> None:
     code, _, err = run("xattr", "mock://h/f", "user.nope")
     assert (code, err) == (
         errno.ENODATA,
-        f"gfal-xattr error: {errno.ENODATA} ({os.strerror(errno.ENODATA)}) - "
-        "Failed to retrieve xattr user.nope\n",
+        f"gfal-xattr: Failed to retrieve xattr user.nope (error {errno.ENODATA})\n",
     )
     original = MockPlugin.getxattr
 
@@ -628,10 +638,7 @@ def test_mkdir(run: Run, tree: Path) -> None:
     assert (tree / "p" / "q" / "r").is_dir()
     code, _, err = run("mkdir", url(tree / "m1"))
     assert code == errno.EEXIST
-    assert err == (
-        f"gfal-mkdir error: {errno.EEXIST} (File exists) - "
-        "errno reported by local system call File exists\n"
-    )
+    assert err == (f"gfal-mkdir: {EXISTS} (error {errno.EEXIST})\n")
 
 
 def _umask() -> int:
@@ -801,13 +808,11 @@ def test_ls_xattr(run: Run) -> None:
 def test_ls_errors(run: Run, tree: Path) -> None:
     code, _, err = run("ls", url(tree / "nope"))
     assert code == 2
-    assert err == (
-        "gfal-ls error: 2 (No such file or directory) - "
-        "errno reported by local system call No such file or directory\n"
-    )
+    assert err == (f"gfal-ls: {MISSING} (error 2)\n")
     code, _, err = run("ls", "nope://h/x")
     assert code == errno.EPROTONOSUPPORT
-    assert err.endswith("Protocol not supported or path/url invalid: nope://h/x\n")
+    assert "Protocol not supported or path/url invalid: nope://h/x" in err
+    assert f"(error {errno.EPROTONOSUPPORT})" in err
 
 
 # ---------------------------------------------------------------------------
@@ -824,9 +829,7 @@ def test_rm(run: Run, tree: Path) -> None:
 def test_rm_directory(run: Run, tree: Path) -> None:
     code, out, err = run("rm", url(tree / "sub"))
     assert code == errno.EISDIR
-    assert err == (
-        f"gfal-rm error: 21 (Is a directory) - Can not remove {url(tree / 'sub')}, is a directory\n"
-    )
+    assert err == (f"gfal-rm: Can not remove {url(tree / 'sub')}, is a directory (error 21)\n")
     code, out, _ = run("rm", "-r", "--dry-run", url(tree / "sub"))
     assert out == f"{url(tree / 'sub/b')}\tSKIP\n{url(tree / 'sub')}\tSKIP DIR\n"
     code, out, _ = run("rm", "-R", url(tree / "sub") + "/")
@@ -843,7 +846,8 @@ def test_rm_recursive_rmdir_failure(run: Run, tree: Path) -> None:
     finally:
         os.chmod(tree / "p", 0o755)
     assert (code, out) == (errno.EACCES, f"{url(tree / 'p' / 'd')}\tFAILED\n")
-    assert err.startswith("gfal-rm error: 13 (Permission denied) - ")
+    assert err.startswith("gfal-rm: Permission denied.")
+    assert "(error 13)" in err
 
 
 def test_rm_recursive_rmdir_missing(run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -861,7 +865,7 @@ def test_rm_recursive_rmdir_missing(run: Run, tree: Path, monkeypatch: pytest.Mo
 def test_rm_failures(run: Run) -> None:
     code, out, err = run("rm", "mock://h/f?errno=13", "mock://h/g")
     assert (code, out) == (13, "mock://h/f?errno=13\tFAILED\n")
-    assert err == "gfal-rm error: 13 (Permission denied) - Permission denied\n"
+    assert err == f"gfal-rm: {DENIED} (error 13)\n"
     code, out, _ = run("rm", "--just-delete", "mock://h/f?errno=2", "mock://h/g")
     assert (code, out) == (2, "mock://h/f?errno=2\tMISSING\nmock://h/g\tDELETED\n")
     code, out, _ = run("rm", "-r", "mock://h/d?list=&errno=2")
@@ -901,8 +905,7 @@ def test_rm_bulk(run: Run, tree: Path) -> None:
     assert code == 2
     assert out == (
         f"{url(tree / 'a.txt')}\tDELETED\n"
-        f"{url(tree / 'nope')}\tFAILED: errno reported by local system call "
-        "No such file or directory\n"
+        f"{url(tree / 'nope')}\tFAILED: {MISSING}\n"
         "mock://h/x\tDELETED\n"
     )
     code, out, _ = run("rm", "--just-delete", url(tree / "nope"), "mock://h/x?errno=5")
@@ -912,7 +915,8 @@ def test_rm_bulk(run: Run, tree: Path) -> None:
 def test_rm_unexpected_error_exits_zero(run: Run, tree: Path) -> None:
     code, _, err = run("rm", "--from-file", str(tree / "missing"))
     assert code == 0  # gfal-rm starts from 0, as gfal2-util's does
-    assert "FileNotFoundError" in err
+    assert "File or folder not found." in err
+    assert "Traceback" not in err
 
 
 # ---------------------------------------------------------------------------
@@ -945,7 +949,7 @@ def test_bringonline(run: Run, no_sleep: list[float]) -> None:
     assert lines[0].startswith("Bringonline token: ")
     assert lines[1:] == ["mock://h/f QUEUED"]
     code, out, _ = run("bringonline", "mock://h/f?staging_errno=22")
-    assert out.splitlines()[1:] == ["mock://h/f?staging_errno=22 => FAILED: Invalid argument"]
+    assert out.splitlines()[1:] == [f"mock://h/f?staging_errno=22 => FAILED: {INVALID}"]
     assert no_sleep == []
 
 
@@ -987,7 +991,7 @@ def test_bringonline_from_file(run: Run, tree: Path, no_sleep: list[float]) -> N
     )
     assert out.splitlines()[1:] == [
         "mock://h/a QUEUED",
-        "mock://h/b?staging_errno=2 => FAILED: No such file or directory",
+        f"mock://h/b?staging_errno=2 => FAILED: {MISSING}",
     ]
     assert run("bringonline", "--from-file", str(listing), "mock://h/a") == (
         1,
@@ -1009,7 +1013,7 @@ def test_archivepoll(run: Run, no_sleep: list[float], monkeypatch: pytest.Monkey
     assert run("archivepoll", "mock://h/f") == (0, "mock://h/f READY\n", "")
     assert run("archivepoll", "mock://h/f?archiving_errno=22") == (
         0,
-        "mock://h/f?archiving_errno=22 => FAILED: Invalid argument\n",
+        f"mock://h/f?archiving_errno=22 => FAILED: {INVALID}\n",
         "",
     )
     assert run("archivepoll") == (1, "", "Missing surl\n")
@@ -1023,7 +1027,7 @@ def test_evict(run: Run) -> None:
     assert run("evict", "mock://h/f?release_errno=22", "token") == (
         22,
         "",
-        "gfal-evict error: 22 (Invalid argument) - Invalid argument\n",
+        f"gfal-evict: {INVALID} (error 22)\n",
     )
 
 
@@ -1062,10 +1066,34 @@ def test_legacy_bringonline(run: Run, no_sleep: list[float]) -> None:
     assert out.startswith(notice + "Bringonline token: ")
 
 
-def test_legacy_replicas_without_catalogue(run: Run, tree: Path) -> None:
+def test_legacy_replicas_without_catalogue(
+    run: Run, tree: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exercise the exact missing-metadata contract independently of whether
+    # the test filesystem supports extended attributes (Nix overlays may not).
+    def missing(path: str, name: str) -> bytes:
+        assert os.fspath(path) == os.fspath(tree / "a.txt")
+        assert name == "user.replicas"
+        raise OSError(errno.ENODATA, os.strerror(errno.ENODATA))
+
+    monkeypatch.setattr(os, "getxattr", missing, raising=False)
     code, out, err = run("legacy_replicas", url(tree / "a.txt"))
     assert (code, out) == (errno.ENODATA, "")
-    assert err.startswith(f"gfal-legacy-replicas error: {errno.ENODATA} (")
+    assert err.startswith("gfal-legacy-replicas: The requested file metadata is not available.")
+    assert f"(error {errno.ENODATA})" in err
+
+
+def test_legacy_replicas_preserves_the_actual_filesystem_error(run: Run, tree: Path) -> None:
+    getter = getattr(os, "getxattr", None)
+    expected = errno.ENODATA  # the documented fallback without an OS getter
+    if getter is not None:
+        with pytest.raises(OSError) as caught:
+            getter(tree / "a.txt", "user.replicas")
+        expected = caught.value.errno
+    code, out, err = run("legacy_replicas", url(tree / "a.txt"))
+    assert (code, out) == (expected, "")
+    assert err.startswith("gfal-legacy-replicas: ")
+    assert err.endswith(f"(error {expected})\n")
 
 
 @pytest.fixture
@@ -1090,7 +1118,41 @@ def test_legacy_register_replicas_unregister(run: Run, lfc: LFCServer) -> None:
     assert run("legacy_replicas", entry) == (0, f"{second}\n", "")
     code, _, err = run("legacy_unregister", entry, first)
     assert code == errno.ENOENT
-    assert err.startswith("gfal-legacy-unregister error: 2 (No such file or directory) - ")
+    assert err.startswith("gfal-legacy-unregister: ")
+    assert "(error 2)" in err
     code, _, err = run("legacy_register", entry, "file:///no/host")
     assert code == errno.EINVAL
-    assert err.startswith("gfal-legacy-register error: 22 (Invalid argument) - ")
+    assert err.startswith("gfal-legacy-register: ")
+    assert "(error 22)" in err
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_unexpected_setup_failure_is_plain_unless_debug_is_requested(
+    run, monkeypatch, tree, verbose
+):
+    def broken(*args):
+        raise RuntimeError("internal failure")
+
+    monkeypatch.setattr(base, "apply_options", broken)
+    arguments = ["-vvv", url(tree)] if verbose else [url(tree)]
+    code, _, error = run("ls", *arguments)
+    assert code == 1
+    if verbose:
+        assert "Traceback" in error
+        assert "RuntimeError: internal failure" in error
+    else:
+        assert "The command failed unexpectedly" in error
+        assert "-vvv" in error
+        assert "Traceback" not in error
+
+
+def test_oserror_without_a_filename_still_has_a_plain_message(run, monkeypatch):
+    def failed(path):
+        raise OSError(errno.EIO, "storage unavailable")
+
+    monkeypatch.setattr(tape, "read_list", failed)
+    code, _, error = run("archivepoll", "--from-file", "list")
+    assert code == 255
+    assert "could not be read or written" in error
+    assert "(error 5)" in error
+    assert "Traceback" not in error

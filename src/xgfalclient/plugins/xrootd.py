@@ -3,9 +3,8 @@
 gfal2's xrootd plugin is a thin layer over ``libXrdCl`` (and ``XrdPosix``,
 which it uses for most of the namespace). This one is the same thin layer
 over `xrdclient <https://github.com/rob-c/xrdclient>`_, the same author's
-pure-Python XRootD client, which is an optional dependency: without it the
-plugin reports itself unavailable and a ``root://`` URL says how to install
-it.
+pure-Python XRootD client, which is a required dependency. A broken
+installation still reports an actionable repair message.
 
 Everything a user can observe is gfal2's, read off its source (2.23.5) and
 checked against it:
@@ -108,7 +107,6 @@ import errno
 import importlib
 import json
 import os
-import queue
 import socket
 import stat as _stat
 import struct
@@ -121,6 +119,8 @@ import weakref
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
+
+from xrdclient.copy._pipeline import ReadAhead
 
 from .. import events as ev
 from .._compat import TIMEOUTS
@@ -151,7 +151,10 @@ __all__ = ["XRootDPlugin", "XRootDFile", "MISSING_HINT", "KXR_ERRNO", "SCHEMES"]
 T = TypeVar("T")
 
 #: What ``root://`` says when xrdclient cannot be imported.
-MISSING_HINT = "root:// needs xrdclient: pip install 'xgfalclient[xrootd]'"
+MISSING_HINT = (
+    "The required xrdclient package is missing or cannot be imported. "
+    "Repair this environment with: python -m pip install --upgrade --force-reinstall xgfalclient"
+)
 
 SCHEMES = ("root", "roots", "xroot", "xroots")
 
@@ -1935,35 +1938,14 @@ class _Verification:
             ) from exc
 
 
-#: ``kXR_write``'s request header: stream id, opcode, file handle, offset,
-#: path id and three reserved bytes, then the payload length.
-_WRITE_HEADER = struct.Struct(">HH4sqB3xI")
 #: A response header: stream id, status, body length.
 _RESPONSE_HEADER = struct.Struct(">HHI")
-_KXR_WRITE, _KXR_OK, _KXR_ERROR, _KXR_WAIT = 3019, 0, 4003, 4005
+_KXR_OK, _KXR_ERROR = 0, 4003
 _KXR_ATTN, _KXR_WAITRESP, _KXR_ASYNRESP, _KXR_QOPAQUG = 4001, 4006, 5008, 64
 
 
 class _Upload:
-    """A local file into an open ``root://`` handle, ``UPLOAD_DEPTH`` writes in flight.
-
-    ``File.write`` is one request at a time, and copies each chunk four times
-    on its way to the socket (a ``bytes`` of the slice, the frame, the send
-    queue, the queue drained); for a large upload those copies and the wait
-    per request are the whole cost. Here the handle's connection is borrowed
-    the way xrdclient's own bulk reader borrows it - ``Session.bulk`` holds
-    it idle and exclusive, stream ids are leased from its protocol machine -
-    and each ``kXR_write`` goes out as a header and then the buffer itself,
-    read straight from the file. One connection, one writer: what a stock
-    xrootd admits. A second thread reads the file ahead of the sends, so
-    the disk and the network are busy at once.
-
-    The server answers each write ``kXR_ok``, ``kXR_error`` (the first one
-    fails the upload, once every reply still owed is in) or ``kXR_wait``
-    (that chunk is written again afterwards, the ordinary way, which knows
-    how to wait). Anything else, or a connection that cannot be settled,
-    marks the session broken so that nobody reuses it.
-    """
+    """GFAL progress and WAIT-replay policy around Xrd's bulk writer."""
 
     def __init__(
         self, transfer: Transfer, reader: PluginFile, writer: XRootDFile, handle: File
@@ -1973,12 +1955,7 @@ class _Upload:
         self.writer = writer
         self.handle = handle
         self.session: Any = handle.session
-        self.wire: Any = self.session.transport
-        self.inflight: dict[int, tuple[int, int]] = {}
-        self.free: list[int] = []
         self.again: list[tuple[int, int]] = []
-        self.failure: Exception | None = None
-        self.torn = False
         self.done = 0
 
     @staticmethod
@@ -1994,127 +1971,41 @@ class _Upload:
         )
 
     def run(self) -> int:
-        machine = self.session.machine
-        with self.session.bulk(self.handle.handle, chunk=1, depth=1):
-            leased = machine.lease_sids(UPLOAD_DEPTH)
-            self.free = list(leased)
-            try:
-                self._stream()
-            finally:
-                if self._settle():
-                    machine.release_sids(leased)
-                else:
-                    # A reply may still be in transit on these ids: keep them
-                    # leased and the connection out of anyone else's hands.
-                    self.session.mark_broken()
-        if self.failure is not None:
-            raise posix_error("Failed while writing to file", self.failure) from self.failure
+        try:
+            with (
+                self.session.bulk(
+                    self.handle.handle, chunk=UPLOAD_CHUNK, depth=UPLOAD_DEPTH
+                ) as channel,
+                ReadAhead(
+                    self.reader,
+                    UPLOAD_CHUNK,
+                    UPLOAD_BUFFERS,
+                    recycle=True,
+                    thread_name="xgfal-upload",
+                ) as pieces,
+            ):
+                channel.write_chunks(
+                    pieces,
+                    acknowledged=lambda at, count: self._acked(count),
+                    waited=lambda at, count: self.again.append((at, count)),
+                    check=self.transfer.check,
+                    strict_replies=True,
+                )
+        except _import().errors.TimeoutError as exc:
+            if str(exc).startswith("connection closed with "):
+                raise _import().errors.ConnectionError("the server closed the connection") from exc
+            raise
+        except _import().errors.ServerError as exc:
+            raise posix_error("Failed while writing to file", exc) from exc
         for offset, length in self.again:
             self.writer.pwrite(self.reader.pread(offset, length), offset)
             self._acked(length)
         self.transfer.progress(self.done, always=True)
         return self.done
 
-    def _stream(self) -> None:
-        """Send the file as it is read; a thread reads ahead while this one sends."""
-        buffers: queue.Queue[bytearray] = queue.Queue()
-        for _ in range(UPLOAD_BUFFERS):
-            buffers.put(bytearray(UPLOAD_CHUNK))
-        filled: queue.Queue[tuple[bytearray, int] | BaseException | None] = queue.Queue()
-        stop = threading.Event()
-        reader = threading.Thread(
-            target=self._read, args=(buffers, filled, stop), name="xgfal-upload", daemon=True
-        )
-        reader.start()
-        fhandle = self.handle.handle
-        offset = 0
-        try:
-            while self.failure is None:
-                if not self.free:
-                    self._collect()
-                    continue
-                item = filled.get()
-                if item is None:
-                    break
-                if isinstance(item, BaseException):
-                    raise item
-                buffer, count = item
-                sid = self.free.pop()
-                self.inflight[sid] = (offset, count)
-                self.wire.send(_WRITE_HEADER.pack(sid, _KXR_WRITE, fhandle, offset, 0, count))
-                self.wire.send(memoryview(buffer)[:count])
-                buffers.put(buffer)  # sent is copied: the kernel has it now
-                offset += count
-                self.transfer.check()
-            while self.inflight:
-                self._collect()
-        finally:
-            stop.set()
-            buffers.put(bytearray(0))  # a reader waiting for a buffer wakes to stop
-            reader.join()
-
-    def _read(
-        self,
-        buffers: queue.Queue[bytearray],
-        filled: queue.Queue[tuple[bytearray, int] | BaseException | None],
-        stop: threading.Event,
-    ) -> None:
-        try:
-            while True:
-                buffer = buffers.get()
-                if stop.is_set():
-                    return
-                count = self.reader.readinto(buffer)
-                if not count:
-                    filled.put(None)
-                    return
-                filled.put((buffer, count))
-        except BaseException as exc:  # handed to the sending thread to raise
-            filled.put(exc)
-
-    def _settle(self) -> bool:
-        """Take every reply still owed off the wire; False if that cannot be done."""
-        if self.torn:
-            return False
-        try:
-            while self.inflight:
-                self._collect()
-        except Exception:
-            return False
-        return True
-
-    def _collect(self) -> None:
-        """One reply: its chunk is written, refused, or to be written again."""
-        self.torn = True  # until a whole reply is in
-        header = self._receive(_RESPONSE_HEADER.size)
-        sid, status, length = _RESPONSE_HEADER.unpack(header)
-        body = self._receive(length)
-        self.torn = False
-        span = self.inflight.pop(sid, None)
-        if span is None or status not in (_KXR_OK, _KXR_ERROR, _KXR_WAIT):
-            self.torn = True
-            raise _import().errors.ProtocolError(
-                f"unexpected reply to a write: stream {sid}, status {status}"
-            )
-        self.free.append(sid)
-        if status == _KXR_OK:
-            self._acked(span[1])
-        elif status == _KXR_WAIT:
-            self.again.append(span)
-        elif self.failure is None:
-            code = int.from_bytes(body[:4], "big")
-            message = bytes(body[4:]).rstrip(b"\x00").decode("utf-8", "replace")
-            try:
-                _import().errors.raise_for_status(code, message, path=self.handle.url.path)
-            except Exception as exc:
-                self.failure = exc
-
     def _acked(self, count: int) -> None:
         self.done += count
         self.transfer.progress(self.done)
-
-    def _receive(self, size: int) -> bytearray:
-        return _receive(self.wire, size)
 
 
 def _receive(wire: Any, size: int) -> bytearray:

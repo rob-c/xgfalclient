@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from xgfalclient.crypto import der, libcrypto, p256, rsa, x509
+from xgfalclient.crypto import der, p256, rsa, x509
 from xgfalclient.crypto.der import DERError
 from xgfalclient.crypto.proxy import (
     BACKDATE,
@@ -71,7 +71,7 @@ def test_der_times() -> None:
         (b"\x30\x80", "indefinite"),
         (b"\x30\x85\x01\x01\x01\x01\x01", "implausible"),
         (b"\x30\x82\x01", "runs past the end"),
-        (b"\x30\x05\x01", "claims 5 bytes"),
+        (b"\x30\x05\x01", "5 bytes requested"),
         (b"\x1f\x01\x00", "multi-byte tags"),
     ],
 )
@@ -526,11 +526,6 @@ def test_split_der_rejects_garbage() -> None:
 # -- P-256 -------------------------------------------------------------------------------------
 
 
-def test_p256_adding_a_point_to_itself_doubles_it() -> None:
-    g = (*p256.G, 1)
-    assert p256._affine(p256._add(g, g)) == p256._affine(p256._double(g))
-
-
 def test_p256_decode_point_rejects() -> None:
     x, y = (value.to_bytes(32, "big") for value in p256.G)
     too_big = p256.P.to_bytes(32, "big")
@@ -558,78 +553,3 @@ def test_p256_verify_summing_to_infinity() -> None:
 
 
 # -- libcrypto, against a fake library -------------------------------------------------------
-
-
-class _Function:
-    """A ctypes foreign function: ``argtypes``/``restype`` settable, results scripted."""
-
-    def __init__(self, *results: object) -> None:
-        self.results = list(results) or [1]
-        self.argtypes: object = None
-        self.restype: object = None
-
-    def __call__(self, *args: object) -> object:
-        return self.results.pop(0) if len(self.results) > 1 else self.results[0]
-
-
-class _Handle:
-    """Every symbol the backend looks up, each answering 1 unless told otherwise."""
-
-    def __init__(self, **results: tuple[object, ...]) -> None:
-        for name in (*libcrypto._REQUIRED, *libcrypto._GCM, *libcrypto._MAC):
-            setattr(self, name, _Function(*results.get(name, ())))
-
-
-@pytest.fixture
-def no_known_answers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The fakes here script each call, so keep the load-time known-answer gate off them."""
-    for name in ("_ctr_known_answer", "_chacha_known_answer", "_gcm_known_answer"):
-        monkeypatch.setattr(libcrypto.LibCrypto, name, lambda self: None)
-
-
-@pytest.mark.usefixtures("no_known_answers")
-def test_libcrypto_poly1305_unavailable_when_fetch_fails() -> None:
-    lib = libcrypto.LibCrypto(_Handle(EVP_MAC_fetch=(None,)), None)
-    assert not lib.has_poly1305 and lib.has_gcm and lib.version == "libcrypto"
-
-
-@pytest.mark.usefixtures("no_known_answers")
-@pytest.mark.parametrize("failing", ["EVP_MAC_init", "EVP_MAC_update", "EVP_MAC_final"])
-def test_libcrypto_poly1305_failures(failing: str) -> None:
-    lib = libcrypto.LibCrypto(_Handle(**{failing: (0,)}), None)
-    with pytest.raises(RuntimeError, match="Poly1305 failed"):
-        lib.poly1305(bytes(32), b"data")
-
-
-@pytest.mark.usefixtures("no_known_answers")
-def test_libcrypto_gcm_failures() -> None:
-    key, nonce = bytes(16), bytes(12)
-    with pytest.raises(RuntimeError, match="EVP_CipherInit_ex"):
-        libcrypto.LibCrypto(_Handle(EVP_CipherInit_ex=(0,)), None).aes_gcm(key, True)
-    # The key schedule takes, the per-packet restart with the nonce does not.
-    restart = libcrypto.LibCrypto(_Handle(EVP_CipherInit_ex=(1, 0)), None).aes_gcm(key, True)
-    with pytest.raises(RuntimeError, match="AES-GCM failed"):
-        restart.apply(nonce, b"", bytearray(32), 0, 16)
-    # Opening a packet first hands over the tag to check; that can fail too.
-    opener = libcrypto.LibCrypto(_Handle(EVP_CIPHER_CTX_ctrl=(0,)), None).aes_gcm(key, False)
-    with pytest.raises(RuntimeError, match="AES-GCM failed"):
-        opener.apply(nonce, b"", bytearray(32), 0, 16)
-
-
-@pytest.mark.usefixtures("no_known_answers")
-def test_libcrypto_find_skips_libraries_missing_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
-    full = _Handle()
-    handles = {"partial": object(), "full": full}
-    monkeypatch.setattr(libcrypto, "candidates", lambda: ["partial", "full"])
-    monkeypatch.setattr(libcrypto, "_open", handles.get)
-    found = libcrypto._find()
-    assert found is not None and found.c is full and found.path == "full"
-
-
-def test_libcrypto_usr_lib_is_fine_off_macos(monkeypatch: pytest.MonkeyPatch) -> None:
-    import ctypes.util
-    import sys
-
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(ctypes.util, "find_library", lambda name: "/usr/lib/libcrypto.so.3")
-    assert libcrypto.candidates()[-1] == "/usr/lib/libcrypto.so.3"

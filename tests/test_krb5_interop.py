@@ -5,8 +5,8 @@ krb5 1.21, sssd's KCM, python3-gssapi, Python 3.9) creates realm
 ``XGFAL.TEST`` with ``user@XGFAL.TEST`` and ``host/kdc.xgfal.test`` in
 ``/etc/krb5.keytab``, runs ``kinit`` into a ``FILE:``, ``KCM:`` or ``DIR:``
 default cache, and then ``driver.py`` - with this checkout's ``src``
-bind-mounted - performs handshakes through the ctypes backend and the
-``gssapi`` package and across the two, wrap/unwrap/MIC round trips, replay
+bind-mounted - performs handshakes through python-gssapi and its compatibility
+backend-selection aliases, wrap/unwrap/MIC round trips, replay
 and tamper detection, ``ccache=``/``keytab=`` selection, and the failures:
 no ticket, unknown service, wrong keytab, KDC down.
 
@@ -174,7 +174,7 @@ def test_macos_heimdal(image: None, library: str, mode: str, tmp_path: Path) -> 
             env=env, capture_output=True, text=True, timeout=120, check=False,
         )  # fmt: skip
         assert done.returncode == 0, done.stderr
-        assert done.stdout.strip() == "ctypes-heimdal"
+        assert done.stdout.strip() == "gssapi"
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
 

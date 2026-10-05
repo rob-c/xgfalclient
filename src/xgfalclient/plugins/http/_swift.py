@@ -28,7 +28,7 @@ from __future__ import annotations
 import errno
 import stat as _stat
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -197,7 +197,14 @@ def provider(url: str) -> str:
 
 
 def rename(
-    plugin: HTTPPlugin, old: str, new: str, *, copy_header: str, source: str, ok: int
+    plugin: HTTPPlugin,
+    old: str,
+    new: str,
+    *,
+    copy_header: str,
+    source: str,
+    ok: int,
+    verify: Callable[[bytes], None] | None = None,
 ) -> None:
     """Copy on the server, then delete the original - how object stores rename.
 
@@ -213,12 +220,14 @@ def rename(
             errno.ENOSYS,
         )
     response = plugin._request("PUT", new, headers={copy_header: source}, body=b"")
-    response.body()
+    payload = response.body()
     if response.status != ok:
         raise GError(
             f"Received code {response.status} when trying to copy file - will not perform deletion",
             errno.EIO,
         )
+    if verify is not None:
+        verify(payload)
     removal = plugin._request("DELETE", old)
     removal.body()
     if removal.status >= 300:

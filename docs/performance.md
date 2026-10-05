@@ -114,9 +114,9 @@ byte-identical. There is no gfal2 upload number to compare against.
 
 Passwords are only ever used inside the process - never handed to an `ssh`
 subprocess - so a password login takes the in-process SSH-2 transport. It
-negotiates aes128-gcm@openssh.com through the `libcrypto` that Python's
-`ssl` already links (via `ctypes`, no extra package), and falls back to
-pure-Python ciphers only where no libcrypto can be found. Upload there is
+now negotiates aes128-gcm@openssh.com through `cryptography`; the local
+OpenSSL ctypes and pure-Python fallback backends have been removed. The
+measurements below predate that rebase and need to be rerun for the new backend. Upload there is
 bounded by the server's fsync and its fixed 2 MiB channel window.
 
 ## Where the speed comes from

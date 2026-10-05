@@ -12,7 +12,7 @@ import stat
 import sys
 
 from ..errors import GError
-from ._base import Command, Spec, arg, out, surl
+from ._base import Command, Spec, arg, out, output, surl
 
 __all__ = ["SPECS", "read_list"]
 
@@ -36,6 +36,7 @@ class _Remover:
     def failed(self, url: str, exc: GError) -> None:
         """``MISSING`` is reported and survived; anything else stops the command."""
         self.propagate(exc.code)
+        output.error(exc, url=url)
         if exc.code == errno.ENOENT:
             out(f"{url}\tMISSING\n")
             return
@@ -43,6 +44,7 @@ class _Remover:
         raise exc
 
     def remove(self, url: str) -> None:
+        output.identify("rm", url=url)
         if not self.params.just_delete:
             try:
                 info = self.context.stat(url)
@@ -53,6 +55,7 @@ class _Remover:
                 self.remove_directory(url)
                 return
         if self.params.dry_run:
+            output.record(status="planned")
             out(f"{url}\tSKIP\n")
             return
         try:
@@ -61,6 +64,7 @@ class _Remover:
             self.failed(url, exc)
             return
         out(f"{url}\tDELETED\n")
+        output.record(status="succeeded")
 
     def remove_directory(self, url: str) -> None:
         if not self.params.recursive:
@@ -69,7 +73,9 @@ class _Remover:
         for name in self.context.listdir(url):
             if name not in (".", ".."):
                 self.remove(base + name)
+        output.identify("rmdir", url=url)
         if self.params.dry_run:
+            output.record(status="planned")
             out(f"{url}\tSKIP DIR\n")
             return
         try:
@@ -78,17 +84,22 @@ class _Remover:
             self.failed(url, exc)
             return
         out(f"{url}\tRMDIR\n")
+        output.record(status="succeeded")
 
     def bulk(self, urls: list[str]) -> None:
         if self.params.dry_run:
+            for url in urls:
+                output.record(operation="rm", url=url, status="planned")
             out("\tBULK DELETION\n")
             return
         results = self.context.unlink(urls)
         assert isinstance(results, list)
         for url, error in zip(urls, results):
             if error is None:
+                output.record(operation="rm", url=url, status="succeeded")
                 out(f"{url}\tDELETED\n")
             else:
+                output.error(error, operation="rm", url=url)
                 out(f"{url}\tFAILED: {error}\n")
                 self.propagate(error.code)
 

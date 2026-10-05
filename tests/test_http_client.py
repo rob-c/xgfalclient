@@ -553,11 +553,6 @@ class _FakeConn:
         self.closed = True
 
 
-def test_alive() -> None:
-    assert not _client._alive(_FakeConn())  # type: ignore[arg-type]
-    assert not _client._alive(_FakeConn(_FakeSock()))  # type: ignore[arg-type]
-
-
 class _Raw:
     """Stands in for an ``http.client.HTTPResponse``."""
 

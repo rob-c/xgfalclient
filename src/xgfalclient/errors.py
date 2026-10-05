@@ -3,8 +3,9 @@
 gfal2 reports every failure as a ``GError``: an ``errno`` value in ``code``
 and a human sentence in ``message``. Code written against the C-backed
 bindings catches ``gfal2.GError`` and switches on ``e.code``, so that is
-exactly the shape here - ``args`` is ``(message, code)`` and ``str()`` is the
-message alone, as it is there.
+exactly the shape here - ``args`` is ``(message, code)``. ``message`` retains
+the compatibility payload; ``str()`` and ``user_message`` provide plain display
+text and remove internal scope prefixes.
 
 It deliberately does not subclass :class:`OSError`: a ``GError`` is a plain
 ``Exception``, as in gfal2, so an ``except OSError`` in caller code does not
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 from typing import NoReturn
 
 __all__ = [
@@ -49,7 +51,22 @@ class GError(Exception):
         self.code = code
 
     def __str__(self) -> str:
-        return self.message
+        return self.user_message
+
+    @property
+    def user_message(self) -> str:
+        """Plain text for people; ``message``, ``args`` and ``code`` stay compatible."""
+        message = re.sub(r"^(?:\[[^\]\n]+\])+\s*", "", self.message).strip()
+        generic = {
+            "",
+            os.strerror(self.code),
+            f"errno reported by local system call {os.strerror(self.code)}",
+        }
+        if message in generic:
+            return _USER_ERRORS.get(
+                self.code, "The request failed. Check the command and service configuration."
+            )
+        return message
 
     def __repr__(self) -> str:
         return f"GError({self.message!r}, {self.code})"
@@ -127,3 +144,41 @@ def errno_for_http(status: int) -> int:
     if status in HTTP_ERRNO:
         return HTTP_ERRNO[status]
     return ECOMM if status >= 500 else errno.EIO
+
+
+# Display wording is deliberately separate from protocol payloads and numeric codes.
+_USER_ERRORS: dict[int, str] = {
+    errno.ENOENT: "File or folder not found. Check the path and try again.",
+    errno.EACCES: "Permission denied. Check that your account can access this file or service.",
+    errno.EPERM: "Permission denied. Check that your account can perform this operation.",
+    errno.EEXIST: "This path already exists. Choose another path or explicitly enable overwrite.",
+    errno.ENOTDIR: "Part of this path is a file, not a folder. Check the path.",
+    errno.EISDIR: "This path names a folder, not a file. Choose a file path.",
+    errno.ENOTEMPTY: "The folder is not empty. Check its contents before removing it.",
+    errno.ENOSPC: "Storage is full. Free space or choose another destination.",
+    errno.EDQUOT: "Your storage quota is full. Free space or ask for a larger quota.",
+    errno.ENODATA: (
+        "The requested file metadata is not available. "
+        "Check the attribute name or service configuration."
+    ),
+    errno.EROFS: "This storage is read-only. Choose a writable destination.",
+    errno.EIO: (
+        "The file or service could not be read or written. Check the connection and storage."
+    ),
+    errno.EINVAL: "A setting or path is invalid. Check the command and configuration.",
+    errno.ETIMEDOUT: (
+        "The request timed out. Check your connection and whether the service is available."
+    ),
+    errno.ECONNREFUSED: (
+        "Connection refused. Check the server name, port and whether it is running."
+    ),
+    errno.ECONNRESET: (
+        "The connection was interrupted. Check whether the transfer completed before retrying."
+    ),
+    errno.EHOSTUNREACH: "Cannot reach the server. Check the server name and your network or VPN.",
+    errno.ENETUNREACH: "The network is unavailable. Check your network or VPN connection.",
+    errno.EBUSY: "The file or service is busy. Try again later.",
+    errno.EAGAIN: "The service is temporarily unavailable. Try again later.",
+    errno.ENOSYS: "This operation is not supported. Check the URL and available client features.",
+    errno.ECANCELED: "The operation was canceled.",
+}

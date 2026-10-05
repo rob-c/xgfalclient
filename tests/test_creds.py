@@ -198,8 +198,12 @@ def test_bearer_token_tmp_fallback() -> None:
 
 def test_ca_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert find_ca_path({"X509_CERT_DIR": str(tmp_path)}) == str(tmp_path)
+    monkeypatch.setattr("xgfalclient.creds.sys.platform", "linux")
     monkeypatch.setattr("os.path.isdir", lambda path: path == "/etc/grid-security/certificates")
     assert find_ca_path({}) == "/etc/grid-security/certificates"
+    monkeypatch.setattr("xgfalclient.creds.sys.platform", "darwin")
+    monkeypatch.setattr("os.path.isdir", lambda path: path.startswith("/opt/homebrew"))
+    assert find_ca_path({}) == "/opt/homebrew/etc/grid-security/certificates"
     monkeypatch.setattr("os.path.isdir", lambda path: False)
     assert find_ca_path({}) is None
     monkeypatch.setenv("X509_CERT_DIR", "/x")

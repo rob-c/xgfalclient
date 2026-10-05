@@ -1,9 +1,7 @@
-"""GSS-API through the optional ``gssapi`` package (python-gssapi).
+"""GSS-API through the optional python-gssapi package.
 
-When the package is installed it is preferred: it is a maintained binding
-over the same system library, it knows that library's quirks, and a site
-that installed it (``xrdclient[krb5]`` does) has chosen it. The module is
-passed in rather than imported here, so this file never needs it to exist.
+The maintained binding owns native handles and ABI differences. Passing
+its module in keeps error/handshake tests independent of an installed KDC.
 """
 
 from __future__ import annotations

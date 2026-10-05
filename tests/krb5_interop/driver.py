@@ -62,7 +62,7 @@ def full_round(client_backend: str, server_backend: str, **client_options: Any) 
     client = krb5.ClientContext("host", HOST, backend=client_backend, **client_options)
     server = krb5.AcceptorContext(backend=server_backend)
     handshake(client, server)
-    assert client.backend.startswith(client_backend), client.backend
+    assert client.backend == "gssapi", client.backend
     assert client.initiator_name == server.initiator_name == "user@XGFAL.TEST"
     assert client.target_name == f"host/{HOST}@XGFAL.TEST", client.target_name
     assert client.flags & krb5.MUTUAL_FLAG and client.flags & krb5.CONF_FLAG

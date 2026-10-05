@@ -49,19 +49,23 @@ import io
 import logging
 import os
 import re
-import select
 import socket
 import ssl
 import threading
 import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, BinaryIO, Protocol, Union, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Protocol, Union, cast
+
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from xrdclient.http._engine import REDIRECTS, Request, attempt, redirects
+from xrdclient.http.expect import InterimAnswer, await_continue
 
 from ..._compat import TIMEOUTS
-from ...creds import BEARER
+from ...creds import BEARER, check_bearer_token
 from ...errors import ECOMM, GError
 from ...url import URL, parse, scheme_of
+from ._connection import HTTPConnection, HTTPSConnection
 
 if TYPE_CHECKING:
     from ...context import Gfal2Context
@@ -94,7 +98,6 @@ DIRECT_READ = 1 << 16
 #: How long an upload waits for ``100 Continue`` before sending anyway, as curl does.
 CONTINUE_WAIT = 1.0
 #: Redirect statuses, and how many hops are followed before giving up.
-REDIRECTS = frozenset({301, 302, 303, 307, 308})
 MAX_REDIRECTS = 10
 #: Schemes whose requests are signed (or carry a Swift token) instead of a bearer token.
 OBJECT_STORES = frozenset({"s3", "s3s", "gcloud", "gclouds", "swift", "swifts"})
@@ -572,24 +575,11 @@ class _Exchange:
         buffered read could swallow the start of a final answer the server
         sends straight after it, and then nobody would ever read that.
         """
-        sock = self.conn.sock
-        assert sock is not None
-        readable, _, _ = select.select([sock], [], [], CONTINUE_WAIT)
-        if not readable:
-            return None
-        raw = sock.makefile("rb", buffering=0)
         try:
-            first = _line(raw)
-            if first[:5] == b"HTTP/" and first[9:12] == b"100":
-                while _line(raw) not in (b"\r\n", b"\n", b""):
-                    pass
-                return None
-        finally:
-            raw.close()
-        response = http.client.HTTPResponse(sock, method=method)
-        response.fp = _Replay(first, response.fp)  # type: ignore[assignment]
-        response.begin()
-        return response
+            await_continue(self.conn, method, CONTINUE_WAIT)
+        except InterimAnswer as early:
+            return early.response
+        return None
 
     def send(self, data: bytes | bytearray | memoryview) -> None:
         self.conn.send(data)
@@ -655,33 +645,12 @@ def _line(raw: io.RawIOBase) -> bytes:
     return bytes(found)
 
 
-class _Replay:
-    """A response stream whose status line has already been read once."""
-
-    def __init__(self, first: bytes, fp: BinaryIO) -> None:
-        self._first: bytes | None = first
-        self._fp = fp
-
-    def readline(self, limit: int = -1) -> bytes:
-        if self._first is not None:
-            line, self._first = self._first, None
-            return line
-        return self._fp.readline(limit)
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(self._fp, name)
-
-
-def _alive(conn: http.client.HTTPConnection) -> bool:
-    """False for a pooled connection the server has closed (it reads as EOF)."""
-    sock = conn.sock
-    if sock is None:
-        return False
-    try:
-        readable, _, _ = select.select([sock], [], [], 0)
-    except (OSError, ValueError):
-        return False
-    return not readable
+def _idle_count(pool: HTTPConnectionPool) -> int:
+    queue = pool.pool
+    if queue is None:
+        return 0
+    with queue.mutex:
+        return sum(conn is not None for conn in queue.queue)
 
 
 class Signer(Protocol):
@@ -721,7 +690,7 @@ class HTTPClient:
         self.context = context
         self.group = group
         self._lock = threading.Lock()
-        self._idle: dict[_PoolKey, list[http.client.HTTPConnection]] = {}
+        self._pools: dict[_PoolKey, HTTPConnectionPool] = {}
         #: S3 credentials for a URL, when there are any; set by the plugin.
         self.signer_for: Callable[[URL], Signer | None] = lambda url: None
 
@@ -733,50 +702,44 @@ class HTTPClient:
 
     def _checkout(self, target: Target, tls: ssl.SSLContext | None, timeout: float) -> _Exchange:
         key: _PoolKey = (target.scheme, target.host, target.port, id(tls))
-        while True:
-            with self._lock:
-                idle = self._idle.get(key)
-                conn = idle.pop() if idle else None
-            if conn is None:
-                break
-            if _alive(conn):
-                conn.timeout = timeout
-                assert conn.sock is not None
-                conn.sock.settimeout(timeout)
-                return _Exchange(key, conn, True)
-            conn.close()
-        made: http.client.HTTPConnection
-        if target.scheme == "https":
-            made = http.client.HTTPSConnection(
-                target.host, target.port, timeout=timeout, context=tls, blocksize=BLOCK
-            )
-        else:
-            made = http.client.HTTPConnection(
-                target.host, target.port, timeout=timeout, blocksize=BLOCK
-            )
-        return _Exchange(key, made, False)
+        with self._lock:
+            pool = self._pools.get(key)
+            if pool is None:
+                if target.scheme == "https":
+                    pool = HTTPSConnectionPool(
+                        target.host, target.port, maxsize=MAX_IDLE, ssl_context=tls, blocksize=BLOCK
+                    )
+                    pool.ConnectionCls = cast("Any", HTTPSConnection)
+                else:
+                    pool = HTTPConnectionPool(
+                        target.host, target.port, maxsize=MAX_IDLE, blocksize=BLOCK
+                    )
+                    pool.ConnectionCls = cast("Any", HTTPConnection)
+                self._pools[key] = pool
+        conn = cast("http.client.HTTPConnection", pool._get_conn())
+        reused = conn.sock is not None
+        conn.timeout = timeout
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)
+        return _Exchange(key, conn, reused)
 
     def _checkin(self, exchange: _Exchange) -> None:
-        if not self.keep_alive:
-            exchange.close()
-            return
         with self._lock:
-            idle = self._idle.setdefault(exchange.key, [])
-            if len(idle) < MAX_IDLE:
-                idle.append(exchange.conn)
-                return
-        exchange.close()
+            pool = self._pools.get(exchange.key)
+        if not self.keep_alive or pool is None:
+            exchange.close()
+        else:
+            pool._put_conn(cast("Any", exchange.conn))
 
     def close(self) -> None:
         with self._lock:
-            pools, self._idle = self._idle, {}
-        for idle in pools.values():
-            for conn in idle:
-                conn.close()
+            pools, self._pools = self._pools, {}
+        for pool in pools.values():
+            pool.close()
 
     def idle_count(self) -> int:
         with self._lock:
-            return sum(len(idle) for idle in self._idle.values())
+            return sum(_idle_count(pool) for pool in self._pools.values())
 
     # -- credentials ---------------------------------------------------------------
 
@@ -806,6 +769,7 @@ class HTTPClient:
         scheme = parsed.scheme.partition("+")[0]
         if scheme in ("cs3", "cs3s"):
             configured = self.context.options.string("BEARER", "TOKEN")
+            check_bearer_token(configured)
             return Auth({"Authorization": f"Bearer {configured}"} if configured else {}, tls)
         query = parsed.query_dict()
         if "X-Amz-Signature" in query or "AWSAccessKeyId" in query:
@@ -814,6 +778,7 @@ class HTTPClient:
             return Auth(tls=tls, signer=self.signer_for(parsed))
         token = self.bearer(url, parsed)
         if token:
+            check_bearer_token(token)
             return Auth({"Authorization": f"Bearer {token}"}, tls)
         user, password = _basic(self.context, url, parsed)
         if user:
@@ -869,33 +834,43 @@ class HTTPClient:
     ) -> Response:
         """Send one request (following redirects) and return the unread response."""
         auth = auth if auth is not None else self.auth(cred_url or url)
-        current = url
         first = Target.of(url, s3=auth.signer is not None)
-        for _ in range(MAX_REDIRECTS + 1):
-            target = Target.of(current, s3=auth.signer is not None)
+
+        def send(request: Request[str, Body]) -> Response:
+            target = Target.of(request.url, s3=auth.signer is not None)
             sent = self.standing_headers(target, first.url)
             if auth.headers and _may_forward(first, target):
                 sent.update(auth.headers)
             sent.update(headers or {})
-            length = _length(body)
+            length = _length(request.body)
             if length is not None:
                 sent["Content-Length"] = str(length)
-                if method == "PUT" and length > 0:
+                if request.method == "PUT" and length > 0:
                     sent["Expect"] = "100-continue"
             if auth.signer is not None:
-                target = auth.signer.target(method, target)
-                sent.update(auth.signer.sign(method, target, sent, body))
-            raw, exchange, reusable = self._perform(method, target, sent, body, timeout, auth.tls)
-            response = Response(self, exchange, raw, current, reusable)
+                target = auth.signer.target(request.method, target)
+                sent.update(auth.signer.sign(request.method, target, sent, request.body))
+            raw, exchange, reusable = self._perform(
+                request.method, target, sent, request.body, timeout, auth.tls
+            )
+            return Response(self, exchange, raw, request.url, reusable)
+
+        def advance(request: Request[str, Body], response: Response) -> str | None:
             location = response.header("Location")
             if not (follow and response.status in REDIRECTS and location):
-                return response
+                return None
             response.close()
-            current = _resolve(current, location)
-            _log.debug("%s redirected to %s", method, current)
-            if response.status == 303:
-                method, body = "GET", None
-        raise GError(f"Too many redirections for {url}", errno.ELOOP)
+            target = _resolve(request.url, location)
+            _log.debug("%s redirected to %s", request.method, target)
+            return target
+
+        return redirects(
+            Request[str, Body](method, url, body),
+            send,
+            advance,
+            MAX_REDIRECTS,
+            lambda: GError(f"Too many redirections for {url}", errno.ELOOP),
+        )
 
     def _perform(
         self,
@@ -906,35 +881,26 @@ class HTTPClient:
         timeout: float,
         tls: ssl.SSLContext | None,
     ) -> tuple[http.client.HTTPResponse, _Exchange, bool]:
-        retried = False
-        while True:
-            exchange = self._checkout(target, tls, timeout)
+        def send(exchange: _Exchange) -> tuple[http.client.HTTPResponse, _Exchange, bool]:
+            exchange.send_head(method, target.path, headers)
+            if body is not None and "Expect" in headers:
+                early = exchange.wait_continue(method)
+                if early is not None:
+                    return early, exchange, False
             try:
-                exchange.send_head(method, target.path, headers)
-                if body is not None and "Expect" in headers:
-                    early = exchange.wait_continue(method)
-                    if early is not None:
-                        # Answered before the body was sent: the connection is
-                        # in no state for another request.
-                        return early, exchange, False
                 if body is not None:
                     self._send_body(exchange, body)
-                return exchange.response(), exchange, True
             except _Early as early:
                 return early.response, exchange, False
-            except _STALE as exc:
-                exchange.close()
-                if not retried and exchange.reused:
-                    retried = True
-                    _log.debug("retrying %s %s on a fresh connection: %s", method, target.path, exc)
-                    continue
-                raise transport_error(exc) from exc
-            except (OSError, http.client.HTTPException) as exc:
-                exchange.close()
-                raise transport_error(exc) from exc
-            except BaseException:
-                exchange.close()
-                raise
+            return exchange.response(), exchange, True
+
+        return attempt(
+            lambda: self._checkout(target, tls, timeout),
+            send,
+            lambda item: item.close(),
+            lambda item, error: item.reused and isinstance(error, _STALE),
+            transport_error,
+        )
 
     def _send_body(self, exchange: _Exchange, body: Body) -> None:
         try:
@@ -999,23 +965,17 @@ class HTTPClient:
         tls: ssl.SSLContext | None,
         length: int,
     ) -> tuple[_Exchange, http.client.HTTPResponse | None]:
-        retried = False
-        while True:
-            exchange = self._checkout(target, tls, timeout)
-            try:
-                exchange.send_head("PUT", target.path, headers)
-                if length > 0:
-                    return exchange, exchange.wait_continue("PUT")
-                return exchange, exchange.response()
-            except _STALE as exc:
-                exchange.close()
-                if not retried and exchange.reused:
-                    retried = True
-                    continue
-                raise transport_error(exc) from exc
-            except (OSError, http.client.HTTPException) as exc:
-                exchange.close()
-                raise transport_error(exc) from exc
+        def send(exchange: _Exchange) -> tuple[_Exchange, http.client.HTTPResponse | None]:
+            exchange.send_head("PUT", target.path, headers)
+            return exchange, exchange.wait_continue("PUT") if length > 0 else exchange.response()
+
+        return attempt(
+            lambda: self._checkout(target, tls, timeout),
+            send,
+            lambda item: item.close(),
+            lambda item, error: item.reused and isinstance(error, _STALE),
+            transport_error,
+        )
 
 
 class _Early(Exception):

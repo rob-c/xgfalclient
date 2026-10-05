@@ -27,6 +27,20 @@ from xgfalclient.testing.sftp import (
 # -- portable_status ----------------------------------------------------------
 
 
+def test_eof_fault_always_emits_eof_and_close_before_dropping_the_wire() -> None:
+    packets = []
+    peer = tsftp._SSHServerConn.__new__(tsftp._SSHServerConn)
+    peer.remote_channel = 7
+    peer.server = type("Fault", (), {"fault": "eof_close"})()
+    peer.send_packet = packets.append
+    with pytest.raises(EOFError):
+        peer._emit_channel_faults()
+    assert [packet[0] for packet in packets] == [
+        tsftp._ssh.MSG_CHANNEL_EOF,
+        tsftp._ssh.MSG_CHANNEL_CLOSE,
+    ]
+
+
 @pytest.mark.parametrize(
     ("code", "status"),
     [

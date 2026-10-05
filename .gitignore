@@ -1,4 +1,5 @@
 .venv/
+.dependencies/
 __pycache__/
 *.pyc
 .coverage
@@ -10,4 +11,5 @@ coverage.xml
 .ruff_cache/
 dist/
 build/
+site/
 *.egg-info/

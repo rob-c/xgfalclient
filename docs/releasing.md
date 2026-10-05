@@ -3,6 +3,12 @@
 A release is made from one reviewed commit. The version tag, source version,
 built metadata and installed runtime must all agree.
 
+The current candidate is **0.3.0**, requiring `xrdclient==0.3.0`. Keep its
+changelog entry `Unreleased` until the release is approved. Python 3.9.2 remains
+the declared floor, but the botocore/urllib3 clean-install conflict is a release
+blocker, not a permitted skip. See [Platforms](platforms.md) for outstanding
+native-platform checks and the scope of pre-version-bump validation.
+
 ## Prepare
 
 1. Work from a clean checkout and review every untracked file.
@@ -14,8 +20,13 @@ built metadata and installed runtime must all agree.
    version, the strict documentation build and the performance gate.
 5. Run the real-service interop suite. For transfer, retry or filesystem
    changes, run both BRIX suites described in [Developing](DEVELOPING.md).
-6. Release the required `xrdclient` version first when the `xrootd` extra's
-   lower bound changes.
+6. Release the exact-pinned `xrdclient` version first. It supplies the shared
+   security/parsing APIs and must be available on PyPI before xgfalclient is
+   tagged. Update the mandatory dependency pin when those APIs change.
+7. Run the [shared platform/package matrix](platforms.md) with matching
+   candidate refs. Build and validate fresh 0.3.0 artifacts, including the exact
+   native-package dependency and installed command versions; old 0.2.0
+   working-tree packages are not final release artifacts.
 
 ## Validate the artifacts
 

@@ -11,20 +11,21 @@ gfal2-util's ``CommandBase`` does:
   to a fresh context, whose user agent is ``gfal2-util/1.9.1``;
 * the command run in a daemon thread, so that ``Ctrl-C`` cancels it and
   ``-t`` bounds it, with a ``GError`` reported as
-  ``gfal-ls error: 2 (No such file or directory) - <message>`` and its errno
+  ``gfal-ls: <plain explanation and next step> (error 2)`` and its errno
   becoming the exit status.
 
 The exit statuses follow from that: whatever the command returns (``None``
 is 0), the ``GError`` code (255 if out of range), 255 when the command died
 of anything else, ``ETIMEDOUT`` on ``-t`` and ``EINTR`` on ``Ctrl-C``.
 
-Behaviour, wording and layout are gfal2-util's (Apache-2.0, (c) CERN); the
-code is a reimplementation.
+Interfaces and layout follow gfal2-util (Apache-2.0, (c) CERN); error display
+prioritises clear explanations while keeping the original numeric exit codes.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextvars
 import errno
 import logging
 import os
@@ -35,12 +36,15 @@ import traceback
 from collections.abc import Sequence
 from typing import IO, TYPE_CHECKING, Any, Callable, Optional, Union
 
+from xrdclient.cli import _output as output
+
 from .. import _log
-from ..errors import GError
+from ..errors import GError, from_oserror
 from ._utils import ls_colors
 
 if TYPE_CHECKING:
     from ..context import Gfal2Context
+    from ..types import Stat
     from ._progress import Progress
 
 __all__ = [
@@ -52,6 +56,7 @@ __all__ = [
     "exit_status",
     "main",
     "out",
+    "output",
     "surl",
 ]
 
@@ -105,8 +110,15 @@ class Spec:
 
 def out(text: str) -> None:
     """Write to stdout and flush: gfal2-util runs under ``python -u``."""
-    sys.stdout.write(text)
-    sys.stdout.flush()
+    output.message(text)
+
+
+def stat_record(info: Stat | None) -> dict[str, int] | None:
+    from ..types import Stat
+
+    if output.current() is None or info is None:
+        return None
+    return {name: getattr(info, name) for name in Stat.__slots__}
 
 
 def surl(value: str) -> str:
@@ -159,7 +171,9 @@ class _VersionAction(argparse.Action):
 
         text = f"gfal2-util version {VERSION} (gfal2 {get_version()})"
         context = creat_context()
-        for plugin in sorted(context.get_plugin_names()):
+        plugins = sorted(context.get_plugin_names())
+        output.record("version", gfal2_util=VERSION, gfal2=get_version(), plugins=plugins)
+        for plugin in plugins:
             text += "\n\t" + plugin
         context.free()
         out(text + "\n")
@@ -172,7 +186,7 @@ def build_parser(
     description = f"Gfal util {command.upper()} command. {doc}"
     if not description.endswith("."):
         description += "."
-    parser = argparse.ArgumentParser(
+    parser = output.Parser(
         prog=prog, description=description, add_help=True, formatter_class=_HelpFormatter
     )
     parser._optionals.title = "optional arguments"  # Python 3.10+ says "options"
@@ -229,6 +243,7 @@ def build_parser(
         default=None,
         help="write Gfal2 library logs to the given file location",
     )
+    output.flags(parser)
     for flags, options in arguments:
         parser.add_argument(*flags, **options)
     return parser
@@ -407,6 +422,10 @@ class Command:
             self.prog, getattr(func, "__name__", "")[8:], doc, getattr(func, "arguments", [])
         )
         self.params = self.parser.parse_args(list(a[1:]))
+        report = output.current()
+        if report is not None:
+            report.command = getattr(func, "name", getattr(func, "__name__", ""))
+        output.identify(report.command if report is not None else self.prog)
 
     def execute(self, func: Runner) -> int | None:
         params = self.params
@@ -421,8 +440,7 @@ class Command:
             from .. import creat_context
 
             self.context = creat_context()
-            # A malformed -D escapes, as it escapes gfal2-util's: main() makes
-            # it a traceback and status 1.
+            # A malformed -D is reported by main() as a setting error, status 1.
             apply_options(self.context, params)
             self.context.set_user_agent("gfal2-util", VERSION)
             return self._run_threaded(func)
@@ -435,16 +453,21 @@ class Command:
         The thread is named as gfal2-util's unnamed one is on Python 3.9, for
         the ``Exception in thread Thread-1:`` header of a traceback.
         """
-        worker = threading.Thread(target=self.executor, args=(func,), name="Thread-1")
+        worker = threading.Thread(
+            target=contextvars.copy_context().run, args=(self.executor, func), name="Thread-1"
+        )
         worker.daemon = True
         try:
             worker.start()
             timeout = self.params.timeout
             _wait(worker, timeout + TIMEOUT_GRACE if timeout > 0 else None)
             if worker.is_alive():
+                if output.current() is not None:
+                    self.interrupted = True
+                    output.error(TimeoutError("The command timed out"), code=errno.ETIMEDOUT)
                 if self.progress_bar is not None:
                     self.progress_bar.stop(False)
-                sys.stderr.write(f"Command timed out after {timeout} seconds!\n")
+                output.message(f"Command timed out after {timeout} seconds!\n", stderr=True)
                 return errno.ETIMEDOUT
             self.context.free()
             return self.return_code
@@ -452,7 +475,7 @@ class Command:
             return self._interrupted()
 
     def _interrupted(self) -> int:
-        sys.stderr.write("Caught keyboard interrupt. Canceling...")
+        output.message("Caught keyboard interrupt. Canceling...", stderr=True)
         self.interrupted = True
         previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
@@ -460,7 +483,7 @@ class Command:
             canceller.start()
             canceller.join(CANCEL_WAIT)
             if canceller.is_alive():
-                sys.stderr.write("failed to cancel after waiting some time\n")
+                output.message("failed to cancel after waiting some time\n", stderr=True)
         finally:
             signal.signal(signal.SIGINT, previous)
         return errno.EINTR
@@ -473,20 +496,42 @@ class Command:
             # The ECANCELED of a Ctrl-C'd command is not reported: gfal2-util
             # has returned (EINTR) before its thread gets to say anything.
             if not self.interrupted:
+                output.error(exc)
                 sys.stdout.flush()
-                sys.stderr.write(
-                    f"{self.prog} error: {exc.code} ({os.strerror(exc.code)}) - {exc.message}\n"
-                )
+                output.message(f"{self.prog}: {exc.user_message} (error {exc.code})\n", stderr=True)
             self.return_code = exc.code if 0 <= exc.code <= 255 else 255
         except OSError as exc:
             if exc.errno != errno.EPIPE:
-                _thread_traceback()
+                output.error(exc)
+                _report_oserror(self.prog, exc)
+                # Keep the command's existing exit-status policy for raw OSErrors.
             else:
                 _silence_stdout()
         except SystemExit:
             pass  # parser.error() inside the command: argparse has printed why
-        except Exception:
-            _thread_traceback()
+        except OverflowError as exc:
+            output.error(exc)
+            output.message(
+                f"{self.prog}: A numeric value is out of range. "
+                "Check sizes, timeouts or the file permission mode.\n",
+                stderr=True,
+            )
+        except Exception as exc:
+            output.error(exc)
+            if getattr(self.params, "verbose", 0) >= 3:
+                _thread_traceback()
+            else:
+                output.message(
+                    f"{self.prog}: The command failed unexpectedly. "
+                    "Run with -vvv for technical details.\n",
+                    stderr=True,
+                )
+
+
+def _report_oserror(program: str, exc: OSError) -> None:
+    error = from_oserror(exc)
+    where = f" [{exc.filename}]" if exc.filename else ""
+    output.message(f"{program}: {error.user_message}{where} (error {error.code})\n", stderr=True)
 
 
 def _silence_stdout() -> None:
@@ -513,8 +558,8 @@ def _wait(worker: threading.Thread, timeout: float | None) -> None:
 def _thread_traceback() -> None:
     """What ``threading`` prints for an exception that ends a thread."""
     sys.stdout.flush()
-    sys.stderr.write(f"Exception in thread {threading.current_thread().name}:\n")
-    sys.stderr.write(traceback.format_exc())
+    output.message(f"Exception in thread {threading.current_thread().name}:\n", stderr=True)
+    output.message(traceback.format_exc(), stderr=True)
 
 
 def exit_status(code: int | None) -> int:
@@ -523,6 +568,10 @@ def exit_status(code: int | None) -> int:
 
 
 def main(command: str, spec: Spec, argv: Sequence[str] | None = None) -> int:
+    return output.run_cli(f"gfal-{command}", argv, lambda: _main(command, spec, argv))
+
+
+def _main(command: str, spec: Spec, argv: Sequence[str] | None = None) -> int:
     """Run ``gfal-<command>`` with ``argv`` (default ``sys.argv[1:]``); the exit status."""
     ls_colors()  # gfal2-util reads LS_COLORS (and warns) whatever the command
     args = list(sys.argv[1:] if argv is None else argv)
@@ -533,6 +582,22 @@ def main(command: str, spec: Spec, argv: Sequence[str] | None = None) -> int:
         return exit_status(runner.execute(spec))
     except SystemExit as exc:  # --help, --version, a usage error
         return int(exc.code or 0)
-    except Exception:  # what escapes gfal2-util's main(): a traceback and status 1
-        traceback.print_exc()
+    except OSError as exc:
+        output.error(exc)
+        _report_oserror(runner.prog, exc)
+        return 1
+    except ValueError as exc:
+        output.error(exc)
+        print(f"{runner.prog}: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        output.error(exc)
+        if getattr(runner.params, "verbose", 0) >= 3:
+            traceback.print_exc()
+        else:
+            print(
+                f"{runner.prog}: The command failed unexpectedly. "
+                "Run with -vvv for technical details.",
+                file=sys.stderr,
+            )
         return 1

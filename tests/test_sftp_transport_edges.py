@@ -340,7 +340,7 @@ def test_gcm_cipher_round_trip_and_rejections(keylen: int) -> None:
 def test_gcm_negotiated_first_with_libcrypto() -> None:
     preferred = ssh._ciphers_preferred(_GCM)
     assert preferred[:2] == ("aes128-gcm@openssh.com", "aes256-gcm@openssh.com")
-    assert "aes128-gcm@openssh.com" not in ssh._ciphers_preferred(ciphers.PURE)
+    assert ssh._ciphers_preferred(ciphers.PURE) == preferred
     cipher = ssh.make_cipher(
         _GCM, "aes256-gcm@openssh.com", "hmac-sha2-256", 12345, b"h" * 32, b"s" * 32, "sha256",
         ("A", "C", "E"),

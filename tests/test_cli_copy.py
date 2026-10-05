@@ -95,8 +95,7 @@ def test_copy(run: Run, tree: Path) -> None:
     assert run(source, target) == (
         17,
         "",
-        "gfal-copy error: 17 (File exists) - "
-        f"Destination {target} exists and overwrite is not set\n",
+        f"gfal-copy: Destination {target} exists and overwrite is not set (error 17)\n",
     )
     (tree / "a.txt").write_text("again\n")
     assert run("-f", source, target)[0] == 0
@@ -120,7 +119,7 @@ def test_copy_into_directory(run: Run, tree: Path) -> None:
     assert out == f"Copying 6 bytes {source} => {url(tree / 'sub' / 'a.txt')}\n"
     assert (code, err) == (
         17,
-        "gfal-copy error: 17 (File exists) - The file exists and overwrite is not set\n",
+        "gfal-copy: The file exists and overwrite is not set (error 17)\n",
     )
 
 
@@ -128,8 +127,8 @@ def test_copy_missing_source(run: Run, tree: Path) -> None:
     assert run(url(tree / "nope"), url(tree / "o")) == (
         2,
         "",
-        "gfal-copy error: 2 (No such file or directory) - Could not stat the source: "
-        "errno reported by local system call No such file or directory\n",
+        "gfal-copy: Could not stat the source: "
+        "File or folder not found. Check the path and try again. (error 2)\n",
     )
 
 
@@ -157,8 +156,8 @@ def test_copy_checksums(run: Run, tree: Path, params: list[TransferParameters]) 
     code, _, err = run("-K", "ADLER32:deadbeef", source, url(tree / "o3"))
     assert code == errno.EIO
     assert err == (
-        "gfal-copy error: 5 (Input/output error) - SOURCE CHECKSUM MISMATCH Source checksum "
-        "and user-specified checksum do not match: 084b021f != deadbeef\n"
+        "gfal-copy: SOURCE CHECKSUM MISMATCH Source checksum "
+        "and user-specified checksum do not match: 084b021f != deadbeef (error 5)\n"
     )
     code, _, err = run("-K", "MD5", "--checksum-mode", "target", source, url(tree / "o4"))
     assert code == errno.EINVAL
@@ -240,7 +239,8 @@ def test_copy_mock(run: Run) -> None:
     assert run("-f", source, failing) == (
         5,
         f"Copying 10 bytes {source} => {failing}\n",
-        "gfal-copy error: 5 (Input/output error) - Input/output error\n",
+        "gfal-copy: The file or service could not be read or written. "
+        "Check the connection and storage. (error 5)\n",
     )
 
 
@@ -280,8 +280,7 @@ def test_copy_force_reports_an_eexist_with_nothing_to_remove(
     code, _out, err = run("-f", source, target)
     assert (code, err) == (
         errno.EEXIST,
-        "gfal-copy error: 17 (File exists) - "
-        "TRANSFER ERROR: HTTP 409 : Conflict, File Exist  (destination)\n",
+        "gfal-copy: TRANSFER ERROR: HTTP 409 : Conflict, File Exist  (destination) (error 17)\n",
     )
 
     # Any other failure to remove it is reported as gfal2-util reports it.
@@ -292,7 +291,8 @@ def test_copy_force_reports_an_eexist_with_nothing_to_remove(
     code, _out, err = run("-f", source, target)
     assert (code, err) == (
         errno.EACCES,
-        "gfal-copy error: 13 (Permission denied) - Permission denied\n",
+        "gfal-copy: Permission denied. "
+        "Check that your account can access this file or service. (error 13)\n",
     )
 
 
@@ -456,7 +456,7 @@ def test_directory_over_file(run: Run, tree: Path) -> None:
     assert run("-f", url(tree / "sub"), url(tree / "a.txt")) == (
         21,
         "",
-        "gfal-copy error: 21 (Is a directory) - Can not copy a directory over a file\n",
+        "gfal-copy: Can not copy a directory over a file (error 21)\n",
     )
     assert run("-r", "-f", url(tree / "sub"), url(tree / "a.txt")) == (
         0,

@@ -1,0 +1,23 @@
+name: Distribution packages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      xrdclient-ref:
+        description: Matching shared-core candidate ref
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  platforms:
+    # The shared runner and reusable workflow must land in xrdclient first.
+    uses: rob-c/xrdclient/.github/workflows/platforms.yml@main
+    with:
+      xrdclient-ref: ${{ inputs.xrdclient-ref || 'main' }}
+      xgfalclient-ref: ${{ github.sha }}

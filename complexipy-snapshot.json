@@ -8,16 +8,16 @@
         "complexity": 17
       },
       {
+        "name": "_Copier::parameters",
+        "complexity": 18
+      },
+      {
         "name": "_Copier::copy_file",
         "complexity": 21
       },
       {
         "name": "_Copier::run",
         "complexity": 23
-      },
-      {
-        "name": "_Copier::parameters",
-        "complexity": 24
       }
     ]
   },
@@ -105,11 +105,7 @@
     "functions": [
       {
         "name": "HTTPClient::request",
-        "complexity": 20
-      },
-      {
-        "name": "HTTPClient::_perform",
-        "complexity": 21
+        "complexity": 17
       }
     ]
   },
@@ -133,7 +129,7 @@
     "functions": [
       {
         "name": "_listing",
-        "complexity": 26
+        "complexity": 17
       }
     ]
   },

@@ -69,12 +69,13 @@ from __future__ import annotations
 
 import errno
 import os
-import queue
 import stat as stat_module
 import threading
 import time
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
+
+from xrdclient.copy._pipeline import pump as _pump
 
 from . import events as ev
 from ._log import LOGGER
@@ -600,33 +601,6 @@ def run_bulk(
 # ---------------------------------------------------------------------------
 
 
-class _Stop:
-    """End-of-stream (or failure) marker on the pipeline queue."""
-
-    __slots__ = ("error",)
-
-    def __init__(self, error: BaseException | None = None) -> None:
-        self.error = error
-
-
-def _reader(
-    source: PluginFile,
-    buffers: queue.Queue[bytearray],
-    filled: queue.Queue[Any],
-    stop: threading.Event,
-) -> None:
-    try:
-        while not stop.is_set():
-            buffer = buffers.get()
-            count = source.readinto(buffer)
-            if count <= 0:
-                filled.put(_Stop())
-                return
-            filled.put((buffer, count))
-    except BaseException as exc:  # handed to the writer thread to re-raise
-        filled.put(_Stop(exc))
-
-
 def pump(
     transfer: Transfer,
     source: PluginFile,
@@ -636,38 +610,25 @@ def pump(
     depth: int = PIPELINE_DEPTH,
     final_report: bool = True,
 ) -> int:
-    """Copy ``source`` to ``destination`` with reads and writes overlapped.
-
-    ``final_report`` flushes the total to ``monitor_callback`` at the end
-    (gfal2's plugins do; its local copy does not).
-    """
+    """Stream through the shared pipeline, retaining GFAL progress/cancel policy."""
     size = buffer_size or transfer.context.options.integer("CORE", "COPY_BUFFERSIZE", 4194304)
-    buffers: queue.Queue[bytearray] = queue.Queue()
-    for _ in range(max(depth, 2)):
-        buffers.put(bytearray(size))
-    filled: queue.Queue[Any] = queue.Queue()
-    stop = threading.Event()
-    thread = threading.Thread(
-        target=_reader, args=(source, buffers, filled, stop), name="xgfal-reader", daemon=True
+
+    def report(done: int, total: int | None) -> None:
+        transfer.progress(done)
+        transfer.check()
+
+    total = _pump(
+        source,
+        destination,
+        None,
+        size,
+        report,
+        None,
+        max(depth, 2),
+        recycle=True,
+        thread_name="xgfal-reader",
+        short_write=lambda: GError("The destination stopped accepting data", errno.EIO),
     )
-    thread.start()
-    total = 0
-    try:
-        item = filled.get()
-        while not isinstance(item, _Stop):
-            buffer, count = item
-            destination.write(memoryview(buffer)[:count])
-            buffers.put(buffer)
-            total += count
-            transfer.progress(total)
-            transfer.check()
-            item = filled.get()
-        if item.error is not None:
-            raise item.error
-    finally:
-        stop.set()
-        buffers.put(bytearray(0))  # unblock a reader waiting for a buffer
-        thread.join()
     transfer.progress(total, force=final_report)
     return total
 

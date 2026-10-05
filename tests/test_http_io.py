@@ -70,6 +70,13 @@ def test_pread(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     handle.close()
 
 
+def test_server_rejects_a_range_beyond_eof(hctx, dav):
+    write(dav, "/data/f", b"hello")
+    with plugin(hctx)._get(dav.url("/data/f"), {"Range": "bytes=99-"}) as response:
+        assert response.status == 416
+        assert response.header("Content-Range") == "bytes */5"
+
+
 def test_short_and_refused_reads(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     write(dav, "/data/f", b"0123456789")
     handle = hctx.open(dav.url("/data/f"), "r")

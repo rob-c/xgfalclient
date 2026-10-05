@@ -16,7 +16,7 @@ What it negotiates, best first, matching what OpenSSH offers:
   against ``known_hosts`` with the endpoint's ``StrictHostKeyChecking``
   policy - a first key recorded, a changed key refused, a ``@revoked`` key
   always refused;
-* **cipher** ``aes{128,256}-gcm@openssh.com`` (libcrypto only - one EVP
+* **cipher** ``aes{128,256}-gcm@openssh.com`` (cryptography - one native
   pass per packet encrypts and authenticates, the fastest by far here),
   ``chacha20-poly1305@openssh.com`` and ``aes{128,192,256}-ctr``, the fast
   one first depending on what :func:`ciphers.get` found;
@@ -193,7 +193,7 @@ def _chacha_iv(seqno: int, counter: int) -> bytes:
 
     OpenSSH uses the packet sequence number as the nonce (the low state
     words) and a plain block counter; the same 16 bytes drive both the pure
-    and the libcrypto backends (:mod:`..crypto.ciphers`).
+    and compatibility backend aliases (:mod:`..crypto.ciphers`).
     """
     return struct.pack("<I", counter) + b"\x00\x00\x00\x00" + struct.pack(">Q", seqno)
 
@@ -460,7 +460,7 @@ _DH_GROUP = {
 
 
 def _ciphers_preferred(backend: ciphers.Backend) -> tuple[str, ...]:
-    """AES-GCM first when libcrypto has it; AES-CTR before a slow pure ChaCha."""
+    """AES-GCM first, then AES-CTR and ChaCha20 through cryptography."""
     gcm = ("aes128-gcm@openssh.com", "aes256-gcm@openssh.com") if backend.has_gcm else ()
     aes = ("aes256-ctr", "aes192-ctr", "aes128-ctr")
     chacha = ("chacha20-poly1305@openssh.com",)

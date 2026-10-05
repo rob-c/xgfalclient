@@ -65,7 +65,7 @@ class Mechanism:
 class Backend:
     """A GSS-API implementation able to build :class:`Mechanism` objects."""
 
-    #: ``ctypes-mit``, ``ctypes-heimdal`` or ``gssapi``.
+    #: ``gssapi`` (the required python-gssapi binding).
     name: str = ""
 
     def initiator(self, target: Target, flags: int, ccache: str | None) -> Mechanism:

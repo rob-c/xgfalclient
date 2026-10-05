@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Callable
 
 from ..types import Stat
-from ._base import Command, Spec, arg, out, stdout_isatty, surl
+from ._base import Command, Spec, arg, out, output, stat_record, stdout_isatty, surl
 from ._utils import file_mode_str, ls_colors
 
 __all__ = ["SPECS", "size_to_human", "TIME_FORMATS"]
@@ -69,6 +69,7 @@ class _Lister:
     def __init__(self, cmd: Command) -> None:
         self.cmd = cmd
         self.params = cmd.params
+        self.detailed = self.params.long or output.current() is not None
         if self.params.color == "always":
             self.colorize = True
         else:
@@ -96,6 +97,12 @@ class _Lister:
 
     def entry(self, name: str, info: Stat | None, extra: list[str]) -> None:
         """One line of output: long form given ``info``, just the name without it."""
+        output.record(
+            status="succeeded",
+            name=name,
+            value=stat_record(info),
+            attributes=dict(zip(self.params.xattr, extra)),
+        )
         if info is None:
             out(f"{self.color(name, None)}\n")
             return
@@ -114,17 +121,23 @@ class _Lister:
 
 def ls(cmd: Command) -> int:
     params = cmd.params
+    output.identify("ls", url=params.file)
     if params.full_time:
         params.time_style = "long-iso"
     lister = _Lister(cmd)
     info = cmd.context.stat(params.file)
+    detailed = lister.detailed
     if not stat.S_ISDIR(info.st_mode) or params.directory:
-        lister.entry(params.file, info if params.long else None, lister.extra(params.file))
+        lister.entry(
+            params.file,
+            info if detailed else None,
+            lister.extra(params.file),
+        )
         return 0
     directory = cmd.context.opendir(params.file)
     while True:
         entry: Stat | None = None
-        if params.long:
+        if detailed:
             dirent, entry = directory.readpp()
         else:
             dirent = directory.read()

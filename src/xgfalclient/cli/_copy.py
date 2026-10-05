@@ -31,7 +31,7 @@ from ..events import GfaltEvent
 from ..transfer import TransferParameters
 from ..types import Stat
 from . import _base as base
-from ._base import Command, Spec, arg, out, surl
+from ._base import Command, Spec, arg, out, output, surl
 
 __all__ = ["SPECS", "STDOUT_URL"]
 
@@ -62,14 +62,19 @@ class _Copier:
         self.cmd = cmd
         self.params = cmd.params
         self.context = cmd.context
+        self.transferred: int | None = None
 
     # -- the plan ------------------------------------------------------------------
 
     def run(self) -> int:
         params = self.params
         if params.from_file and params.src:
-            sys.stderr.write(
-                "Cannot combine '--from-file' with a source in the positional arguments\n"
+            output.error(
+                ValueError("Use either --from-file or a positional source, not both"), code=1
+            )
+            output.message(
+                "Cannot combine '--from-file' with a source in the positional arguments\n",
+                stderr=True,
             )
             return 1
         jobs: list[tuple[str, str]] = []
@@ -86,7 +91,8 @@ class _Copier:
                 else:
                     source = destination
         else:
-            sys.stderr.write("Missing source\n")
+            output.error(ValueError("Provide a source URL or use --from-file"), code=1)
+            output.message("Missing source\n", stderr=True)
             return 1
         for source, destination in jobs:
             if destination == "-":
@@ -105,8 +111,10 @@ class _Copier:
 
     def failure(self, message: str, code: int) -> None:
         """Fatal, unless this is a recursive copy that may carry on."""
+        error = GError(message, code)
+        output.error(error)
         if self.params.abort_on_failure or not self.params.recursive:
-            raise GError(message, code)
+            raise error
         out(f"ERROR ({code}): {message}\n")
 
     # -- one item --------------------------------------------------------------------
@@ -122,10 +130,11 @@ class _Copier:
         return True, info.is_dir(), url.startswith("file:") and _is_special(info)
 
     def copy(self, source: str, destination: str) -> None:
+        output.identify("copy", source=source, target=destination)
         try:
             info = self.context.stat(source)
         except GError as exc:
-            self.failure(f"Could not stat the source: {exc.message}", exc.code)
+            self.failure(f"Could not stat the source: {exc.user_message}", exc.code)
             return
         source_dir = info.is_dir()
         exists, dest_dir, special = self._destination(destination)
@@ -144,7 +153,7 @@ class _Copier:
             try:
                 self.mkdir(destination)
             except GError as exc:
-                self.failure(f"Could not create the directory: {exc.message}", exc.code)
+                self.failure(f"Could not create the directory: {exc.user_message}", exc.code)
                 return
             self.copy_tree(source, destination)
             return
@@ -152,6 +161,7 @@ class _Copier:
             if self.params.recursive:
                 self.copy_tree(source, destination)
             else:
+                output.record(status="skipped")
                 out(f"Skipping {source}\n")
             return
         if dest_dir:
@@ -161,9 +171,11 @@ class _Copier:
         self.copy_file(source, destination, info.st_size, special=special)
 
     def mkdir(self, url: str) -> None:
+        output.identify("mkdir", url=url)
         out(f"Mkdir {url}\n")
         if not self.params.dry_run:
             self.context.mkdir_rec(url, 0o755)
+        output.record(status="planned" if self.params.dry_run else "succeeded")
 
     def copy_tree(self, source: str, destination: str) -> None:
         names = self.context.listdir(source)
@@ -216,15 +228,41 @@ class _Copier:
                 self.context.set_opt_boolean("HTTP PLUGIN", "ENABLE_FALLBACK_TPC_COPY", fallback)
             self.context.set_opt_string("HTTP PLUGIN", "DEFAULT_COPY_MODE", default)
 
-        verbose = params.verbose
+        self._callbacks(transfer, size)
+        return transfer
+
+    def _callbacks(self, transfer: TransferParameters, size: int) -> None:
+        verbose = self.params.verbose
+        report = output.current()
 
         def event_callback(event: GfaltEvent) -> None:
+            if report is not None:
+                report.record(
+                    "event",
+                    **report.identity,
+                    side=event.side,
+                    timestamp_ms=event.timestamp,
+                    domain=event.domain,
+                    stage=event.stage,
+                    description=event.description,
+                )
             if verbose:
                 out(f"event: {event}\n")
 
         def monitor_callback(
             src: str, dst: str, average: int, instant: int, transferred: int, elapsed: int
         ) -> None:
+            self.transferred = transferred
+            if report is not None:
+                report.record(
+                    "progress",
+                    source=src,
+                    target=dst,
+                    bytes_transferred=transferred,
+                    seconds=elapsed,
+                    average_bytes_per_second=average,
+                    instantaneous_bytes_per_second=instant,
+                )
             if verbose:
                 out(f"monitor: {src} {dst} {average} {instant} {transferred} {elapsed}\n")
             bar = self.cmd.progress_bar
@@ -233,9 +271,10 @@ class _Copier:
 
         transfer.event_callback = event_callback
         transfer.monitor_callback = monitor_callback
-        return transfer
 
     def copy_file(self, source: str, destination: str, size: int, *, special: bool) -> None:
+        output.identify("copy", source=source, target=destination)
+        self.transferred = None
         transfer = self.parameters(size)
         params = self.params
         bar = None
@@ -273,7 +312,13 @@ class _Copier:
                 else:
                     self.copy_file(source, destination, size, special=special)
                     return
-            self.failure(exc.message, exc.code)
+            self.failure(exc.user_message, exc.code)
+            return
+        output.record(
+            status="planned" if params.dry_run else "succeeded",
+            expected_bytes=None if params.just_copy else size,
+            bytes_transferred=0 if params.dry_run else self.transferred,
+        )
 
     def stream(self, source: str, destination: str) -> None:
         """Copy onto a special file: read through the context, write to the device."""
@@ -295,6 +340,7 @@ class _Copier:
                         break
                     sink.write(data)
                     sink.flush()
+                    self.transferred = (self.transferred or 0) + len(data)
             finally:
                 if destination != STDOUT_URL:
                     sink.close()

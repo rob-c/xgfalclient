@@ -112,7 +112,7 @@ def test_response_without_a_part() -> None:
         (b'<e:Envelope xmlns:e="urn:e"/>', "no Body"),
         (ENV.format("").encode(), "Body is empty"),
         (b'<!DOCTYPE x [<!ENTITY a "b">]><x>&a;</x>', "DTD"),
-        (b"<x/><!ENTITY a 'b'>", "DTD"),
+        (b"<x/><!ENTITY a 'b'>", "not XML"),
     ],
 )
 def test_unreadable_replies(data: bytes, message: str) -> None:

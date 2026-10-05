@@ -2,20 +2,101 @@
 
 ## What this is
 
-A pure-Python, drop-in replacement for the `gfal2` Python bindings
+A Python 3, drop-in replacement for the `gfal2` Python bindings
 (`python3-gfal2`) and, in `xgfalclient.cli`, for the `gfal-*` commands of
 gfal2-util. `import xgfalclient as gfal2` must run existing gfal2 code
-unchanged. The only runtime dependency anywhere is the optional `xrdclient`
-(itself pure Python) for `root://`.
+unchanged. Required general-purpose dependencies are `botocore`,
+`PyJWT[crypto]`, `urllib3`, `asn1crypto` and `cryptography`. XML declaration
+checks and binary record readers are local standard-library helpers.
+Native `gssapi` and `krb5` bindings are in the optional `krb5`
+extra; `xrdclient==0.3.0` is required for shared security/parsing and `root://`.
+Do not add a compiler-dependent package to the default install. CI's
+wheel-only resolution and clean-install jobs cover supported platform families.
+Python 3.9 remains the declared compatibility floor, but its clean-install
+dependency conflict is a release blocker; see [Platforms](platforms.md).
+Current pyhanko-certvalidator requires Python 3.10 and is deferred rather than
+selecting an older validator.
+
+## Shared core ownership
+
+The dependency is one-way: `xgfalclient → xrdclient → general-purpose libraries`.
+Keep xrdclient independently installable: it must never import or depend on
+xgfalclient. The exact release pin prevents mixing incompatible shared APIs.
+Install both sibling checkouts when changing the common core:
+
+```console
+$ python -m pip install -e ../xrdclient -e '.[dev]'
+```
+
+| Shared implementation in xrdclient | xgfalclient compatibility surface |
+| --- | --- |
+| `crypto.voms`: claims, trust policy, diagnostics | `crypto.voms` |
+| `crypto.der`: bounded ASN.1 helpers and writers | `crypto.der` |
+| `crypto.rsa`: keys, signatures, key import/export | `crypto.rsa` |
+| `crypto.aes`: block/CBC/CTR adapters | `crypto.aes` |
+| `crypto.ed25519`, `crypto.p256` | same names under `crypto` |
+| `crypto.x509`: library-backed certificate inspection, names and legacy inspection fallback | `crypto.x509` certificate/credential models and proxy builders |
+| `_xml`: declaration-rejecting XML loading | `_xml` |
+| `http._engine`: bounded redirects, replay policy and failure cleanup | HTTP request/start adapters |
+| `http._connection`, `http.expect`: connections and interim responses | HTTP compatibility path and exchanges |
+| `copy._pipeline`: bounded read-ahead and complete chunk writes | streamed copies and XRootD upload read-ahead |
+| `session.bulk`: framing, acknowledgements, deferred replies and stream cleanup | upload progress, numeric errors and WAIT-range replay after settling |
+| `s3._codec`, `s3.sigv4`: botocore models, multipart XML and signing | addressing, credentials, metadata and transport policies |
+
+Compatibility modules alias the canonical modules, preserving old imports,
+exception identities and test hooks without duplicated implementations.
+VOMS accepts a read-only certificate view from either client; their distinct
+credential models and proxy rules remain intact. GFAL-only SSH, GridFTP, SRM,
+LFC and plugin/error translation stay in xgfalclient. XRootD framing, sessions
+and filesystem operations stay in xrdclient. HTTP credentials, connection-pool
+ownership and numeric-error policy remain client adapters around the shared
+request lifecycle. GFAL retains known-length/spooled uploads; Xrd retains
+buffered/chunked uploads. Copy preparation, cleanup, durability, replica recovery
+and GFAL event ordering stay with the endpoint/job adapters. The shared pipeline
+never retries a write: replay safety must be decided by the adapter.
+
+Both certificate facades use one decoder. Normal X.509 names, keys, validity,
+extensions and signatures come from cryptography; one bounded fallback retains
+the existing inspection behaviour for incomplete legacy certificates. Inspection
+is not certificate-path validation. S3 uses botocore's service models and XML
+serializer over the existing HTTP transports, not an SDK client's credential
+discovery, retry or TLS policy. Declaration checks precede model decoding.
+Copy/complete responses are checked for embedded errors even when HTTP says 200.
+
+Measure combined `src/` and test LoC separately when changing these boundaries,
+including new engines and adapters. Preserve fault scenarios and independent
+protocol vectors rather than deleting tests to improve the count. Shared HTTP
+and pipeline modules retain explicit coverage gates; run both suites and GFAL's
+condition-coverage pass. Verify read/write overlap, bounded buffers, worker
+shutdown, partial writes and representative throughput before acceptance.
+
+Run both clients' tests when changing shared code. xrdclient tests cover the
+common core without installing xgfalclient; xgfalclient tests cover the old import
+paths, credential interoperability, protocol adapters and end-user diagnostics.
+CI tests the sibling checkout as well as installing both built wheels. Release
+xrdclient first, then update the required pin before releasing xgfalclient.
 
 ## Hard rules
 
-1. **Standard library only** in `src/xgfalclient`. The exceptions are all
-   optional and imported lazily: `xrdclient` for the `xrootd` plugin,
-   `gssapi` for Kerberos (else `ctypes` into the system `libgssapi_krb5`),
-   `paramiko` for one sftp transport tier, and `ctypes` into the `libcrypto`
-   that `ssl` already links, for SSH bulk ciphers (else pure Python). No
-   `requests`, no `cryptography`, no `lxml`.
+Error messages are for physicists and people managing a service for the first
+time. Say what failed, identify the path or service when known, and give a short,
+safe next step. Keep numeric codes, exception types and raw compatibility fields
+stable; display wording is not required to reproduce the original bindings.
+Use `str(error)` or `error.user_message` for people and `error.message` for the
+raw compatibility text. Avoid internal function names and tracebacks in normal
+CLI output; `-vvv` provides technical details for unexpected failures.
+Never suggest disabling certificate checks, trusting a certificate copied from
+an untrusted proxy, or making private keys readable by everyone.
+Add Linux/macOS regression cases for the reason, path, code and suggested fix.
+
+1. **Reuse maintained libraries.** Use the declared, maintained
+   general-purpose libraries for AWS signing, JWTs, GSS-API, HTTP pooling/TLS,
+   ASN.1 and cryptographic primitives. Keep protocol and policy adapters small;
+   do not reintroduce cipher/curve arithmetic or ctypes ABI bindings.
+   `xrdclient` owns the common security/parsing core; `paramiko` remains
+   an optional SSH transport. JWT inspection is unverified diagnostics,
+   never a trust decision. Do not substitute a WebPKI verifier for RFC 3820
+   proxy or VOMS policy without explicitly testing that policy.
 2. **Python 3.9 compatible.** `from __future__ import annotations` in every
    module; no `match`; no `X | Y` outside annotations; `dataclass(**SLOTS)`
    from `_compat`, never `slots=True`; no `zip(strict=)`. Version-dependent

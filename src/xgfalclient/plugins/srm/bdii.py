@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from typing import Any, Union
 
 from ..._compat import SLOTS
+from ..._xml import UnsafeXML, fromstring
 from ...errors import ECOMM, GError
 
 __all__ = [
@@ -568,8 +569,8 @@ def read_cache(path: str, host: str) -> list[Endpoint]:
             text = handle.read()
         if text.lstrip().startswith("<?xml"):
             text = text.split("?>", 1)[1]
-        root = ElementTree.fromstring(f"<cache>{text}</cache>")
-    except (OSError, UnicodeError, ElementTree.ParseError) as exc:
+        root = fromstring(f"<cache>{text}</cache>")
+    except (OSError, UnicodeError, ElementTree.ParseError, UnsafeXML) as exc:
         _log.debug("Could not load BDII CACHE_FILE: %s", exc)
         return []
     found = []

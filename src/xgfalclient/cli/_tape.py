@@ -9,12 +9,11 @@ reported, not fatal: both staging commands exit 0, as in gfal2-util 1.9.1
 from __future__ import annotations
 
 import errno
-import sys
 import time
 from collections.abc import Callable, Sequence
 
 from ..errors import GError
-from ._base import Command, Spec, arg, out, surl
+from ._base import Command, Spec, arg, out, output, surl
 from ._rm import read_list
 
 __all__ = ["SPECS"]
@@ -29,13 +28,18 @@ def _evaluate(errors: Sequence[GError | None], urls: Sequence[str], polling: boo
     for url, error in zip(urls, errors):
         if error is not None:
             if error.code != errno.EAGAIN:
-                out(f"{url} => FAILED: {error.message}\n")
+                output.error(error, url=url)
+                output.record(url=url, status="failed", code=error.code)
+                out(f"{url} => FAILED: {error.user_message}\n")
                 terminal += 1
             else:
+                output.record(url=url, status="queued", code=error.code)
                 out(f"{url} QUEUED\n")
         elif not polling:
+            output.record(url=url, status="queued")
             out(f"{url} QUEUED\n")
         else:
+            output.record(url=url, status="ready")
             terminal += 1
             out(f"{url} READY\n")
     return terminal
@@ -44,13 +48,17 @@ def _evaluate(errors: Sequence[GError | None], urls: Sequence[str], polling: boo
 def _urls(cmd: Command) -> list[str] | None:
     params = cmd.params
     if params.from_file and params.surl:
-        sys.stderr.write("Could not combine --from-file with a surl in the positional arguments\n")
+        output.error(ValueError("Use either --from-file or a positional URL, not both"), code=1)
+        output.message(
+            "Could not combine --from-file with a surl in the positional arguments\n", stderr=True
+        )
         return None
     if params.from_file:
         return read_list(params.from_file)
     if params.surl:
         return [params.surl]
-    sys.stderr.write("Missing surl\n")
+    output.error(ValueError("Provide a file URL or use --from-file"), code=1)
+    output.message("Missing surl\n", stderr=True)
     return None
 
 
@@ -64,6 +72,7 @@ def _poll(
     wait = cmd.params.polling_timeout
     delay = 1
     while terminal != len(urls) and wait > 0:
+        output.record("wait", seconds=delay, remaining_budget=wait)
         out(f"{message}, sleep {delay} seconds...\n")
         wait -= delay
         sleep(delay)
@@ -76,6 +85,7 @@ def bringonline(cmd: Command) -> int | None:
     urls = _urls(cmd)
     if urls is None:
         return 1
+    output.identify("bringonline", urls=urls)
     params = cmd.params
     errors, token = cmd.context.bring_online(
         urls,
@@ -85,6 +95,7 @@ def bringonline(cmd: Command) -> int | None:
         True,
     )
     if token:
+        output.record("request", request_id=token, urls=urls)
         out(f"Bringonline token: {token}\n")
     terminal = _evaluate(errors, urls, polling=False)
     _poll(
@@ -101,13 +112,16 @@ def archivepoll(cmd: Command) -> int | None:
     urls = _urls(cmd)
     if urls is None:
         return 1
+    output.identify("archivepoll", urls=urls)
     terminal = _evaluate(cmd.context.archive_poll(urls), urls, polling=True)
     _poll(cmd, urls, terminal, "Archiving ongoing", lambda: cmd.context.archive_poll(urls))
     return None
 
 
 def evict(cmd: Command) -> None:
+    output.identify("evict", url=cmd.params.file, request_id=cmd.params.token)
     cmd.context.release(cmd.params.file, cmd.params.token)
+    output.record(status="succeeded")
 
 
 _POLLING = arg(

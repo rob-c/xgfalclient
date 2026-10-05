@@ -327,15 +327,13 @@ def test_kdcap_with_the_real_krb5_module(
     ctx: xgfalclient.Gfal2Context, root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """kdcap through :mod:`xgfalclient.crypto.krb5` over the fake GSS-API library."""
-    from krb5_fakes import FakeGSS
+    import sys
+
+    from krb5_fakes import fake_gssapi_module
     from xgfalclient.crypto import krb5
-    from xgfalclient.crypto.krb5 import _ctypes
     from xgfalclient.testing.dcap import ServerKerberosTunnel
 
-    fake = FakeGSS("mit")
-    monkeypatch.setattr(
-        _ctypes, "load", lambda: _ctypes.CtypesBackend(_ctypes.Library(fake, "fake"))
-    )
+    monkeypatch.setitem(sys.modules, "gssapi", fake_gssapi_module())
     monkeypatch.setenv(krb5.BACKEND_ENV, "ctypes")
     krb5.reset()
     try:

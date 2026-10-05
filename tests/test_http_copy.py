@@ -441,24 +441,35 @@ def test_streamed_http_copy_of_a_directory(
     assert caught.value.code == errno.EISDIR
 
 
+@pytest.mark.parametrize(
+    "method,status,body,code,ending",
+    [
+        ("GET", 200, b"012", errno.EIO, "the source has 10 (source)"),
+        ("GET", 403, b"", errno.EPERM, "HTTP 403 : Permission refused  (source)"),
+        ("PUT", 507, b"", errno.EIO, "HTTP 507 : Insufficient Storage  (destination)"),
+    ],
+    ids=["short-source", "source-forbidden", "destination-full"],
+)
 def test_streamed_errors_name_their_side(
-    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
+    hctx: xgfalclient.Gfal2Context,
+    dav: WebDAVServer,
+    dav2: WebDAVServer,
+    method: str,
+    status: int,
+    body: bytes,
+    code: int,
+    ending: str,
 ) -> None:
+    # Fresh servers per fault: an aborted PUT can still be processed remotely
+    # after its socket closes, and must not contaminate the next error case.
     hctx.set_opt_string("HTTP PLUGIN", "DEFAULT_COPY_MODE", "streamed")
     write(dav, "/data/src", b"0123456789")
-    dav.fault("GET", status=200, body=b"012")
+    server = dav if method == "GET" else dav2
+    server.fault(method, status=status, body=body)
     with pytest.raises(GError) as caught:
         hctx.filecopy(dav.url("/data/src"), dav2.url("/data/dst"))
-    assert caught.value.code == errno.EIO
-    assert caught.value.message.endswith("the source has 10 (source)")
-    dav.fault("GET", status=403)
-    with pytest.raises(GError) as caught:
-        hctx.filecopy(dav.url("/data/src"), dav2.url("/data/dst"))
-    assert caught.value.message.endswith("HTTP 403 : Permission refused  (source)")
-    dav2.fault("PUT", status=507)
-    with pytest.raises(GError) as caught:
-        hctx.filecopy(dav.url("/data/src"), dav2.url("/data/dst"))
-    assert caught.value.message.endswith("HTTP 507 : Insufficient Storage  (destination)")
+    assert caught.value.code == code
+    assert caught.value.message.endswith(ending)
 
 
 def test_content_md5_on_streamed_puts(

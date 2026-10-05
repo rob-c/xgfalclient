@@ -23,6 +23,7 @@ from __future__ import annotations
 import ast
 import importlib.abc
 import importlib.machinery
+import importlib.util
 import os
 import sys
 from collections.abc import Sequence
@@ -35,6 +36,24 @@ import pytest
 
 #: Every package the project ships; each is held to the same rule.
 PACKAGES = ("xgfalclient", "gfal2", "gfal2_util")
+# Moving implementations must not remove their condition-coverage gate.
+SHARED_MODULES = (
+    "xrdclient.copy._pipeline",
+    "xrdclient.http._engine",
+    "xrdclient.http._connection",
+    "xrdclient.http.expect",
+    "xrdclient._xml",
+    "xrdclient.crypto.aes",
+    "xrdclient.crypto.der",
+    "xrdclient.crypto.ed25519",
+    "xrdclient.crypto.p256",
+    "xrdclient.crypto.rsa",
+    "xrdclient.crypto.voms",
+    "xrdclient.crypto.x509",
+    "xrdclient.session.bulk",
+    "xrdclient.s3._codec",
+    "xrdclient.s3.sigv4",
+)
 PROBE = "__condcov__"
 ENABLED = bool(os.environ.get("XGFAL_CONDCOV"))
 OUTCOMES = ((1, "true"), (0, "false"))
@@ -177,7 +196,7 @@ def _after_preamble(body: list[ast.stmt]) -> int:
 
 class _Finder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname: str, path: Sequence[str] | None, target: Any = None) -> Any:
-        if fullname.split(".")[0] not in PACKAGES:
+        if not _in_scope(fullname):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is None or not isinstance(spec.loader, importlib.machinery.SourceFileLoader):
@@ -194,6 +213,21 @@ def _roots() -> list[Path]:
         if spec is not None and spec.submodule_search_locations:
             roots.append(Path(next(iter(spec.submodule_search_locations))))
     return roots
+
+
+def _in_scope(fullname: str) -> bool:
+    return fullname.split(".")[0] in PACKAGES or fullname in SHARED_MODULES
+
+
+def _sources() -> list[Path]:
+    paths = [path for root in _roots() for path in root.rglob("*.py")]
+    for name in SHARED_MODULES:
+        # Modules have already been imported before reporting coverage; find_spec
+        # can therefore resolve a dotted name without importing it for this probe.
+        spec = importlib.util.find_spec(name)
+        if spec is not None and spec.origin:
+            paths.append(Path(spec.origin))
+    return sorted(set(paths))
 
 
 def _relative(path: str) -> str:
@@ -213,7 +247,7 @@ def _package_parts(path: str) -> list[str]:
 
 def install() -> None:
     """Instrument the shipped packages; must run before anything imports them."""
-    already = [name for name in sys.modules if name.split(".")[0] in PACKAGES]
+    already = [name for name in sys.modules if _in_scope(name)]
     if already:
         raise RuntimeError(f"condcov: {already[0]} was imported before instrumentation")
     sys.meta_path.insert(0, _Finder())
@@ -226,7 +260,7 @@ def missing(hits: dict[str, set[int]]) -> tuple[list[tuple[str, Site, str]], int
     """Every probe short of an outcome, over every module of the package; and the probe count."""
     gaps = []
     total = 0
-    for path in sorted(path for root in _roots() for path in root.rglob("*.py")):
+    for path in _sources():
         relative = _relative(str(path))
         _, sites = instrument(path.read_text("utf-8"), str(path))
         total += len(sites)

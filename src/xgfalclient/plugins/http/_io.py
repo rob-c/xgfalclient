@@ -152,7 +152,7 @@ class HTTPReadFile(PluginFile):
         view = memoryview(buffer)
         got = attempts = 0
         try:
-            while got < size:
+            while True:
                 before = got
                 try:
                     got += self._read_range(offset + got, view[got:])

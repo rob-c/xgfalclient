@@ -4,9 +4,7 @@ Every primitive is pinned to a standard vector - RFC 7748 (X25519), RFC 8032
 (Ed25519), RFC 6979 (deterministic ECDSA P-256), FIPS-197/SP 800-38A (AES and
 CTR), NIST SP 800-38D / McGrew-Viega (AES-GCM), RFC 8439 (ChaCha20 and
 Poly1305) and the OpenBSD/Go ``bcrypt_pbkdf``
-known-answers - and the pure-Python backends are cross-checked against
-libcrypto where it is present. "libcrypto not found" is exercised by
-monkeypatching the lookup.
+known-answers. All production primitives now use cryptography.
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ from binascii import unhexlify as U
 
 import pytest
 
-from xgfalclient.crypto import aes, bcrypt, chacha, ciphers, ed25519, libcrypto, p256, x25519
+from xgfalclient.crypto import aes, bcrypt, chacha, ciphers, ed25519, p256, x25519
 
 # ---------------------------------------------------------------------------
 # X25519 - RFC 7748 section 5.2
@@ -110,22 +108,6 @@ def test_ed25519_expand_rejects_bad_seed() -> None:
         ed25519.public_key(b"short")
 
 
-def test_ed25519_decompress_edges() -> None:
-    # A y >= p has no point; a wrong-length input has none either.
-    assert ed25519._decompress(b"\xff" * 32) is None
-    assert ed25519._decompress(b"short") is None
-
-
-def test_ed25519_recover_x_edges() -> None:
-    # y == 1 gives x^2 == 0: x is 0 for an even sign, undefined for an odd one.
-    assert ed25519._recover_x(1, 0) == 0
-    assert ed25519._recover_x(1, 1) is None
-    # y >= p is out of range.
-    assert ed25519._recover_x(ed25519._P, 0) is None
-    # A y with no square root on the curve is rejected.
-    assert ed25519._recover_x(2, 0) is None
-
-
 # ---------------------------------------------------------------------------
 # ECDSA P-256 - RFC 6979 appendix A.2.5
 # ---------------------------------------------------------------------------
@@ -176,44 +158,6 @@ def test_p256_rejects_bad_scalars_and_signatures() -> None:
     assert not p256.verify(pub, b"sample", 1, 0)
     r, s = p256.sign(P256_X, b"sample")
     assert not p256.verify(pub, b"other", r, s)
-
-
-def test_p256_nonce_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    # RFC 6979's rejection loop almost never fires for P-256, so drive the PRF
-    # with a fixed sequence: the first candidate is out of range (>= N) and the
-    # regenerated one is valid, exercising the retry branch deterministically.
-    sequence = iter(
-        [
-            b"\x11" * 32,  # k after step d
-            b"\x22" * 32,  # v after step e
-            b"\x33" * 32,  # k after step f
-            b"\x44" * 32,  # v after step g
-            b"\xff" * 32,  # candidate 1: >= N, rejected
-            b"\x55" * 32,  # k regenerated
-            b"\x66" * 32,  # v regenerated
-            (12345).to_bytes(32, "big"),  # candidate 2: in range, accepted
-        ]
-    )
-
-    def fake_digest(key: bytes, msg: bytes, name: str) -> bytes:
-        return next(sequence)
-
-    monkeypatch.setattr(p256.hmac, "digest", fake_digest)
-    assert p256._rfc6979_nonce(P256_X, b"\x00" * 32) == 12345
-
-
-def test_p256_infinity_paths() -> None:
-    # Doubling the identity and adding it are both the identity.
-    assert p256._double(p256._INFINITY) == p256._INFINITY
-    assert p256._affine(p256._INFINITY) is None
-    inf_double = p256._double((0, 0, 1))
-    assert inf_double == p256._INFINITY
-    # p + (-p) is the point at infinity.
-    px, py = p256.public_key(P256_X)
-    neg = (px, (-py) % p256.P, 1)
-    assert p256._affine(p256._add((px, py, 1), neg)) is None
-    assert p256._add(p256._INFINITY, (px, py, 1)) == (px, py, 1)
-    assert p256._add((px, py, 1), p256._INFINITY) == (px, py, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -356,258 +300,21 @@ def test_bcrypt_pi_words_are_cached() -> None:
     assert first[0] == 0x243F6A88
 
 
-# ---------------------------------------------------------------------------
-# ciphers backend selection and libcrypto
-# ---------------------------------------------------------------------------
-
-
-def _reset_libcrypto() -> None:
-    libcrypto._loaded.clear()
-
-
-def test_ciphers_pure_backend() -> None:
-    pure = ciphers.get("pure")
-    assert pure.name == "pure" and not pure.accelerated and not pure.fast_chacha
-    key, iv = os.urandom(32), os.urandom(16)
-    assert bytes(pure.aes_ctr(key, iv).update(b"abc" * 8)) == aes.CTR(key, iv).update(b"abc" * 8)
-    cc = pure.chacha20(key)
-    assert bytes(cc.xor(bytes(16), b"x" * 40)) == chacha.chacha20_xor(key, bytes(16), b"x" * 40)
-    assert pure.poly1305(U(POLY_KEY), POLY_MSG).hex() == POLY_TAG
-    assert "pure" in repr(pure)
+@pytest.mark.parametrize("name", ciphers.BACKENDS)
+def test_cipher_backend_aliases(name: str) -> None:
+    backend = ciphers.get(name)
+    assert backend.name == "cryptography"
+    assert backend.accelerated and backend.fast_chacha and backend.has_gcm
+    assert "cryptography" in repr(backend)
+    key, iv = bytes(32), bytes(16)
+    assert backend.aes_ctr(key, iv).update(b"abc") == aes.CTR(key, iv).update(b"abc")
+    assert backend.chacha20(key).xor(iv, b"abc") == chacha.chacha20_xor(key, iv, b"abc")
+    assert backend.poly1305(U(POLY_KEY), POLY_MSG).hex() == POLY_TAG
 
 
 def test_ciphers_unknown_name() -> None:
     with pytest.raises(ValueError, match="unknown cipher backend"):
         ciphers.get("rot13")
-
-
-def test_ciphers_auto_without_libcrypto(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(libcrypto, "load", lambda: None)
-    assert ciphers.get("auto") is ciphers.PURE
-    # A blank name means auto.
-    assert ciphers.get("  ") is ciphers.PURE
-    with pytest.raises(ValueError, match="no usable libcrypto"):
-        ciphers.get("libcrypto")
-
-
-@pytest.mark.skipif(libcrypto.load() is None, reason="no libcrypto on this platform")
-def test_libcrypto_backend_matches_pure() -> None:
-    _reset_libcrypto()
-    backend = ciphers.get("libcrypto")
-    assert backend.accelerated and "libcrypto" in backend.name and "libcrypto" in repr(backend)
-    key, iv = os.urandom(32), os.urandom(16)
-    data = os.urandom(1000)
-    assert bytes(backend.aes_ctr(key, iv).update(data)) == aes.CTR(key, iv).update(data)
-    for klen in (16, 24, 32):
-        k = os.urandom(klen)
-        assert bytes(backend.aes_ctr(k, iv).update(data)) == aes.CTR(k, iv).update(data)
-    cc = backend.chacha20(key)
-    iv16 = os.urandom(16)
-    assert bytes(cc.xor(iv16, data)) == chacha.chacha20_xor(key, iv16, data)
-    # reset restarts the keystream at a new IV.
-    again = backend.chacha20(key)
-    assert bytes(again.xor(iv16, data)) == bytes(backend.chacha20(key).xor(iv16, data))
-    assert backend.fast_chacha == backend.lib.has_poly1305
-    if backend.lib.has_poly1305:
-        assert backend.poly1305(U(POLY_KEY), POLY_MSG).hex() == POLY_TAG
-
-
-@pytest.mark.skipif(libcrypto.load() is None, reason="no libcrypto on this platform")
-def test_libcrypto_rejects_bad_sizes() -> None:
-    lib = libcrypto.load()
-    assert lib is not None
-    with pytest.raises(ValueError, match="AES-CTR"):
-        lib.aes_ctr(b"short", bytes(16))
-    with pytest.raises(ValueError, match="AES-CTR"):
-        lib.aes_ctr(os.urandom(32), b"short")
-    with pytest.raises(ValueError, match="32-byte key"):
-        lib.chacha20(b"short")
-
-
-def test_libcrypto_poly1305_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    lib = libcrypto.load()
-    if lib is None:
-        pytest.skip("no libcrypto")
-    backend = ciphers._LibBackend(lib)
-    monkeypatch.setattr(type(lib), "has_poly1305", property(lambda self: False))
-    # With no EVP_MAC, the backend falls back to the pure Poly1305.
-    assert backend.poly1305(U(POLY_KEY), POLY_MSG).hex() == POLY_TAG
-    assert not backend.fast_chacha
-
-
-def test_libcrypto_candidates_and_load() -> None:
-    cands = libcrypto.candidates()
-    assert None in cands  # the running executable is always a candidate
-    _reset_libcrypto()
-    first = libcrypto.load()
-    assert libcrypto.load() is first  # memoised
-
-
-def test_libcrypto_find_returns_none_when_symbols_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(libcrypto, "candidates", lambda: [None])
-    monkeypatch.setattr(libcrypto, "_open", lambda path: None)
-    _reset_libcrypto()
-    assert libcrypto.load() is None
-    _reset_libcrypto()
-
-
-def test_libcrypto_open_handles_oserror() -> None:
-    assert libcrypto._open("/no/such/library.so.9") is None
-
-
-def test_libcrypto_candidates_env_branches(monkeypatch: pytest.MonkeyPatch) -> None:
-    import ctypes.util
-    import sys
-
-    # _ssl unavailable: the except branch is taken and nothing is appended for it.
-    monkeypatch.setitem(sys.modules, "_ssl", None)  # type: ignore[misc]
-    monkeypatch.setattr(ctypes.util, "find_library", lambda name: None)
-    assert libcrypto.candidates() == [None]
-    # A macOS /usr/lib stub is skipped (it aborts the process if loaded).
-    monkeypatch.setattr(sys, "platform", "darwin")
-    monkeypatch.setattr(ctypes.util, "find_library", lambda name: "/usr/lib/libcrypto.dylib")
-    assert "/usr/lib/libcrypto.dylib" not in libcrypto.candidates()
-    # A library elsewhere is a candidate.
-    monkeypatch.setattr(ctypes.util, "find_library", lambda name: "/opt/lib/libcrypto.so")
-    assert "/opt/lib/libcrypto.so" in libcrypto.candidates()
-
-
-class _Fn:
-    """A stand-in for a ctypes function: callable, with settable restype/argtypes."""
-
-    def __init__(self, result: object = 1) -> None:
-        self.result = result
-        self.restype: object = None
-        self.argtypes: object = None
-
-    def __call__(self, *args: object) -> object:
-        return self.result() if callable(self.result) else self.result
-
-
-def _fake_handle(
-    *, with_mac: bool = True, version: bool = True, with_gcm: bool = True, **results: object
-) -> object:
-    names = list(libcrypto._REQUIRED)
-    if with_mac:
-        names += list(libcrypto._MAC)
-    if with_gcm:
-        names += list(libcrypto._GCM)
-    if version:
-        names.append("OpenSSL_version")
-    handle = type("FakeHandle", (), {})()
-    for name in names:
-        setattr(handle, name, _Fn(results.get(name, 1)))
-    # Sensible non-zero pointers by default.
-    handle.EVP_CIPHER_CTX_new = _Fn(results.get("EVP_CIPHER_CTX_new", 0x1000))
-    for cipher in ("EVP_aes_128_ctr", "EVP_aes_192_ctr", "EVP_aes_256_ctr", "EVP_chacha20"):
-        handle.__dict__[cipher] = _Fn(0x2000)
-    if version:
-        handle.OpenSSL_version = _Fn(b"FakeSSL 1.0")
-    if with_mac:
-        handle.EVP_MAC_fetch = _Fn(results.get("EVP_MAC_fetch", 0x3000))
-    return handle
-
-
-def test_libcrypto_version_without_symbol() -> None:
-    lib = libcrypto.LibCrypto(_fake_handle(version=False), "fake")
-    assert lib.version == "libcrypto"
-
-
-def test_libcrypto_rejects_a_bad_aes_ctr_known_answer(monkeypatch: pytest.MonkeyPatch) -> None:
-    class BadCipher:
-        @staticmethod
-        def update(_payload: bytes) -> bytes:
-            return bytes(16)
-
-    lib = libcrypto.LibCrypto.__new__(libcrypto.LibCrypto)
-    monkeypatch.setattr(lib, "aes_ctr", lambda _key, _iv: BadCipher())
-    with pytest.raises(RuntimeError, match="AES-CTR known answer failed"):
-        lib._ctr_known_answer()
-
-
-@pytest.mark.parametrize(
-    ("failure", "message"),
-    [
-        ("seal", "AES-GCM seal failed"),
-        ("ciphertext", "AES-GCM known answer failed"),
-        ("open", "AES-GCM open failed"),
-        ("roundtrip", "AES-GCM round trip failed"),
-    ],
-)
-def test_libcrypto_rejects_bad_gcm_known_answers(
-    monkeypatch: pytest.MonkeyPatch, failure: str, message: str
-) -> None:
-    sealed = bytes.fromhex("0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")
-
-    class FakeGCM:
-        def __init__(self, encrypt: bool) -> None:
-            self.encrypt = encrypt
-
-        def apply(
-            self,
-            _iv: bytes,
-            _aad: bytes,
-            buffer: bytearray,
-            _offset: int,
-            _length: int,
-        ) -> bool:
-            if self.encrypt:
-                if failure == "seal":
-                    return False
-                buffer[:] = bytes(32) if failure == "ciphertext" else sealed
-                return True
-            if failure == "open":
-                return False
-            buffer[:16] = b"x" * 16 if failure == "roundtrip" else bytes(16)
-            return True
-
-    lib = libcrypto.LibCrypto.__new__(libcrypto.LibCrypto)
-    monkeypatch.setattr(lib, "aes_gcm", lambda _key, encrypt: FakeGCM(encrypt))
-    with pytest.raises(RuntimeError, match=message):
-        lib._gcm_known_answer()
-
-
-def test_libcrypto_without_mac_symbols() -> None:
-    lib = libcrypto.LibCrypto(_fake_handle(with_mac=False), "fake")
-    assert not lib.has_poly1305
-    with pytest.raises(RuntimeError, match="no EVP_MAC"):
-        lib.poly1305(b"\x00" * 32, b"data")
-
-
-def test_libcrypto_cipher_init_failures() -> None:
-    lib = libcrypto.LibCrypto(_fake_handle(EVP_CIPHER_CTX_new=0), "fake")
-    with pytest.raises(RuntimeError, match="EVP_CipherInit_ex failed"):
-        lib.aes_ctr(b"\x00" * 32, b"\x00" * 16)
-    lib2 = libcrypto.LibCrypto(_fake_handle(EVP_CipherInit_ex=0), "fake")
-    with pytest.raises(RuntimeError, match="EVP_CipherInit_ex failed"):
-        lib2.aes_ctr(b"\x00" * 32, b"\x00" * 16)
-
-
-def test_libcrypto_cipher_update_and_reset_failures() -> None:
-    lib = libcrypto.LibCrypto(_fake_handle(EVP_CipherUpdate=0), "fake")
-    cipher = lib.aes_ctr(b"\x00" * 32, b"\x00" * 16)
-    with pytest.raises(RuntimeError, match="EVP_CipherUpdate failed"):
-        cipher.update(b"data")
-    assert cipher.update(b"") == b""  # nothing to encrypt: no call
-    reset_fail = libcrypto._Cipher.__new__(libcrypto._Cipher)
-    reset_fail._lib = libcrypto.LibCrypto(_fake_handle(EVP_CipherInit_ex=0), "fake")
-    reset_fail._ctx = 0x1  # nonzero so reset attempts the call
-    with pytest.raises(RuntimeError, match="EVP_CipherInit_ex failed"):
-        reset_fail.reset(b"\x00" * 16)
-
-
-def test_libcrypto_poly1305_evp_failure() -> None:
-    lib = libcrypto.LibCrypto(_fake_handle(EVP_MAC_init=0), "fake")
-    assert lib.has_poly1305
-    with pytest.raises(RuntimeError, match="EVP_MAC Poly1305 failed"):
-        lib.poly1305(b"\x00" * 32, b"data")
-
-
-def test_libcrypto_poly1305_reuses_thread_context() -> None:
-    # A second call on the same thread reuses the cached EVP_MAC context.
-    lib = libcrypto.LibCrypto(_fake_handle(), "fake")
-    assert lib.poly1305(b"\x00" * 32, b"a") == b"\x00" * 16
-    assert lib.poly1305(b"\x00" * 32, b"b") == b"\x00" * 16
 
 
 # ---------------------------------------------------------------------------
@@ -651,15 +358,11 @@ GCM_VECTORS = [
     ),
 ]
 
-_needs_gcm = pytest.mark.skipif(
-    libcrypto.load() is None or not libcrypto.load().has_gcm,  # type: ignore[union-attr]
-    reason="no libcrypto AES-GCM on this platform",
-)
 
-
-@_needs_gcm
 @pytest.mark.parametrize(("key", "iv", "plain", "aad", "cipher", "tag"), GCM_VECTORS)
-def test_libcrypto_gcm_nist(key: str, iv: str, plain: str, aad: str, cipher: str, tag: str) -> None:
+def test_cryptography_gcm_nist(
+    key: str, iv: str, plain: str, aad: str, cipher: str, tag: str
+) -> None:
     backend = ciphers.get("libcrypto")
     assert backend.has_gcm
     # Sealed in place, the tag written straight after the ciphertext.
@@ -682,51 +385,20 @@ def test_libcrypto_gcm_nist(key: str, iv: str, plain: str, aad: str, cipher: str
     assert opener.apply(U(iv), U(aad), bytearray(wire), 3, len(U(plain)))
 
 
-@_needs_gcm
-def test_libcrypto_gcm_rejects_bad_keys() -> None:
-    lib = libcrypto.load()
-    assert lib is not None
-    with pytest.raises(ValueError, match="16 or 32-byte key"):
-        lib.aes_gcm(bytes(24), True)
+@pytest.mark.parametrize("key", [b"", bytes(15), bytes(33)])
+def test_gcm_rejects_bad_keys(key: bytes) -> None:
+    with pytest.raises(ValueError):
+        ciphers.get().aes_gcm(key, True)
 
 
-def test_pure_backend_has_no_gcm() -> None:
-    assert not ciphers.PURE.has_gcm
-    with pytest.raises(ValueError, match="needs the libcrypto backend"):
-        ciphers.PURE.aes_gcm(bytes(16), True)
+@pytest.mark.parametrize(("start", "length"), [(-1, 1), (0, -1), (0, 2)])
+def test_gcm_rejects_bad_buffer_bounds(start: int, length: int) -> None:
+    with pytest.raises(ValueError, match="fit in the packet"):
+        ciphers.get().aes_gcm(bytes(16), True).apply(bytes(12), b"", bytearray(17), start, length)
 
 
-def test_libcrypto_without_gcm_symbols() -> None:
-    lib = libcrypto.LibCrypto(_fake_handle(with_gcm=False), "fake")
-    assert not lib.has_gcm and not ciphers._LibBackend(lib).has_gcm
-    with pytest.raises(RuntimeError, match="no AES-GCM"):
-        lib.aes_gcm(bytes(16), True)
-
-
-def test_libcrypto_gcm_failures(monkeypatch) -> None:
-    # The fakes fail on purpose; keep the known-answer gate from hiding them.
-    monkeypatch.setattr(libcrypto.LibCrypto, "_gcm_known_answer", lambda self: None)
-    buffer = bytearray(48)
-    # The context cannot be made.
-    with pytest.raises(RuntimeError, match="EVP_CipherInit_ex failed"):
-        libcrypto.LibCrypto(_fake_handle(EVP_CIPHER_CTX_new=0), "fake").aes_gcm(bytes(16), True)
-    # A step before the tag fails.
-    lib = libcrypto.LibCrypto(_fake_handle(EVP_CipherUpdate=0), "fake")
-    with pytest.raises(RuntimeError, match="AES-GCM failed"):
-        lib.aes_gcm(bytes(16), True).apply(bytes(12), b"aad", buffer, 0, 32)
-    # Opening: a failed final is a bad tag.
-    lib = libcrypto.LibCrypto(_fake_handle(EVP_CipherFinal_ex=0), "fake")
-    assert (
-        not ciphers._LibBackend(lib)
-        .aes_gcm(bytes(32), False)
-        .apply(bytes(12), b"aad", buffer, 0, 32)
-    )
-    # Sealing: the tag cannot be read back.
-    lib = libcrypto.LibCrypto(_fake_handle(EVP_CIPHER_CTX_ctrl=0), "fake")
-    with pytest.raises(RuntimeError, match="get tag failed"):
-        lib.aes_gcm(bytes(16), True).apply(bytes(12), b"aad", buffer, 0, 0)
-    # Everything succeeding (as far as the fake can tell).
-    lib = libcrypto.LibCrypto(_fake_handle(), "fake")
-    assert lib.aes_gcm(bytes(16), True).apply(bytes(12), b"aad", buffer, 0, 32)
-    # A context whose construction never finished frees nothing.
-    libcrypto._Gcm.__new__(libcrypto._Gcm).__del__()
+def test_gcm_invalid_tag_does_not_modify_buffer() -> None:
+    wire = bytearray(bytes(32))
+    before = bytes(wire)
+    assert not ciphers.get().aes_gcm(bytes(16), False).apply(bytes(12), b"", wire, 0, 16)
+    assert bytes(wire) == before

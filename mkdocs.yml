@@ -29,6 +29,9 @@ theme:
 nav:
   - Home: index.md
   - Quickstart: quickstart.md
+  - JSON and XML output: output.md
+  - VOMS proxies: voms.md
+  - Platforms and packages: platforms.md
   - gfal2 compatibility: compatibility.md
   - Reliability and recovery: reliability.md
   - Performance: performance.md

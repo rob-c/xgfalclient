@@ -25,6 +25,7 @@ from typing import Any
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
+from ..._xml import UnsafeXML, fromstring
 from ...errors import ECOMM
 
 __all__ = [
@@ -248,11 +249,10 @@ def parse(data: bytes) -> tuple[str, Node]:
     Raises :class:`SOAPFault` for a fault and :class:`SOAPError` for anything
     that is not a well-formed SOAP envelope.
     """
-    head = data[:4096].upper()
-    if b"<!DOCTYPE" in head or b"<!ENTITY" in data.upper():
-        raise SOAPError("the reply carries a DTD, which SOAP forbids")
     try:
-        root = ElementTree.fromstring(data)
+        root = fromstring(data)
+    except UnsafeXML as exc:
+        raise SOAPError("the reply carries a DTD, which SOAP forbids") from exc
     except ElementTree.ParseError as exc:
         raise SOAPError(f"the reply is not XML: {exc}") from None
     if _local(root.tag) != "Envelope":

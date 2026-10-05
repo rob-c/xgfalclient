@@ -36,10 +36,14 @@ from __future__ import annotations
 
 import errno
 import os
+import sys
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+import jwt
 
 from . import _log
 from ._compat import SLOTS
@@ -60,6 +64,8 @@ __all__ = [
     "PASSWD",
     "find_x509",
     "find_bearer_token",
+    "token_claims",
+    "check_bearer_token",
     "find_ca_path",
     "seed_options",
     "TLSContexts",
@@ -313,14 +319,43 @@ def find_bearer_token(
     return _read_token(f"/tmp/bt_u{_uid()}")
 
 
+def token_claims(token: str) -> dict[str, object]:
+    """Unverified JWT claims for diagnostics only; never an authorization decision."""
+    try:
+        header, payload, _signature = token.split(".")
+        return dict(jwt.decode(f"{header}.{payload}.", options={"verify_signature": False}))
+    except (jwt.PyJWTError, ValueError):
+        return {}
+
+
+def check_bearer_token(token: str) -> None:
+    """Fail early for an expired JWT; opaque tokens and macaroons remain usable."""
+    expiry = token_claims(token).get("exp")
+    if not isinstance(expiry, (int, float, str)):
+        return
+    try:
+        expired = float(expiry) <= time.time()
+    except (ValueError, TypeError):
+        return
+    if expired:
+        raise GError("Your bearer token has expired. Get a new token and try again.", errno.EACCES)
+
+
 def find_ca_path(environ: Mapping[str, str] | None = None) -> str | None:
-    """The trust-anchor directory: ``$X509_CERT_DIR`` or the grid default."""
+    """The trust-anchor directory from the environment or grid installation."""
     env = os.environ if environ is None else environ
     configured = env.get("X509_CERT_DIR")
     if configured:
         return configured
-    default = "/etc/grid-security/certificates"
-    return default if os.path.isdir(default) else None
+    candidates = ["/etc/grid-security/certificates"]
+    if sys.platform == "darwin":
+        candidates.extend(
+            (
+                "/opt/homebrew/etc/grid-security/certificates",
+                "/usr/local/etc/grid-security/certificates",
+            )
+        )
+    return next((path for path in candidates if os.path.isdir(path)), None)
 
 
 class TLSContexts:

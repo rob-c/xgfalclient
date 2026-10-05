@@ -1,7 +1,7 @@
 """Kerberos: status mapping, backend selection, and the ``gssapi``-package backend.
 
-The ctypes binding has its own module (``test_krb5_ctypes.py``); the real
-KDC runs in ``test_krb5_interop.py``.
+The real KDC runs in ``test_krb5_interop.py``. Native handle management and
+ABI behavior belong to the optional python-gssapi dependency.
 """
 
 from __future__ import annotations
@@ -15,16 +15,16 @@ from typing import Any
 
 import pytest
 
-from krb5_fakes import USER, FakeGSS, fake_gssapi_module
+from krb5_fakes import USER, fake_gssapi_module
 from xgfalclient.crypto import krb5
-from xgfalclient.crypto.krb5 import _ctypes, _status
+from xgfalclient.crypto.krb5 import _status
 from xgfalclient.crypto.krb5._base import Backend, Mechanism, Target
 from xgfalclient.errors import GError
 
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    for name in ("KRB5CCNAME", "KRB5_KTNAME", krb5.BACKEND_ENV, _ctypes.LIBRARY_ENV):
+    for name in ("KRB5CCNAME", "KRB5_KTNAME", krb5.BACKEND_ENV, "XGFAL_GSSAPI_LIBRARY"):
         monkeypatch.delenv(name, raising=False)
     krb5.reset()
     yield
@@ -40,16 +40,6 @@ def gssapi(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 def no_gssapi(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "gssapi", None)  # import raises ImportError
-
-
-def no_library(monkeypatch: pytest.MonkeyPatch) -> None:
-    def load() -> Any:
-        raise OSError("no GSS-API library found (x: missing)")
-
-    monkeypatch.setattr(_ctypes, "load", load)
-
-
-# -- statuses -------------------------------------------------------------------------------------
 
 
 def test_signed_and_is_error() -> None:
@@ -118,20 +108,29 @@ def test_gssapi_is_preferred(gssapi: Any) -> None:
     assert krb5.load_backend() is krb5.load_backend()  # cached
 
 
-def test_ctypes_when_gssapi_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    no_gssapi(monkeypatch)
-    found = _ctypes.CtypesBackend(_ctypes.Library(FakeGSS("heimdal"), "fake"))
-    monkeypatch.setattr(_ctypes, "load", lambda: found)
-    assert krb5.backend() == "ctypes-heimdal"
+def test_context_lifecycle_and_protection_policy(gssapi: Any) -> None:
+    with krb5.ClientContext("host", "door") as client, krb5.AcceptorContext() as server:
+        with pytest.raises(krb5.KerberosError, match="not yet established"):
+            client.wrap(b"not ready")
+        with pytest.raises(krb5.KerberosError, match="needs the client's token"):
+            server.step(b"")
+        client.step(server.step(client.step()))
+        with pytest.raises(krb5.KerberosError, match="already established"):
+            client.step(b"again")
+        token = client.wrap(b"message", confidential=False)
+        with pytest.raises(krb5.KerberosError, match="unencrypted"):
+            server.unwrap(token, require_confidential=True)
+    with pytest.raises(krb5.KerberosError, match="closed"):
+        client.step(b"again")
+    with pytest.raises(krb5.KerberosError, match="closed"):
+        client.get_mic(b"message")
 
 
 def test_neither_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     no_gssapi(monkeypatch)
-    no_library(monkeypatch)
     reason = krb5.available()
     assert reason is not None
-    assert "gssapi package cannot be imported" in reason
-    assert "no GSS-API library found" in reason
+    assert "gssapi" in reason
     assert krb5.HINT in reason
     assert krb5.backend() is None
     with pytest.raises(krb5.KerberosError) as info:
@@ -140,29 +139,17 @@ def test_neither_backend(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_forced_backends(monkeypatch: pytest.MonkeyPatch, gssapi: Any) -> None:
-    no_library(monkeypatch)
     assert krb5.backend("gssapi") == "gssapi"
-    reason = krb5.available("ctypes")
-    assert reason is not None and "no GSS-API library" in reason
-    assert "cannot be imported" not in reason
+    assert krb5.available("ctypes") is None
     monkeypatch.setenv(krb5.BACKEND_ENV, "ctypes")
-    assert krb5.backend() is None
+    assert krb5.backend() == "gssapi"
     monkeypatch.setitem(sys.modules, "gssapi", None)
     krb5.reset()
     monkeypatch.setenv(krb5.BACKEND_ENV, "gssapi")
-    assert "cannot be imported" in str(krb5.available())
+    assert "gssapi" in str(krb5.available())
     with pytest.raises(krb5.KerberosError, match="unknown Kerberos backend") as info:
         krb5.load_backend("heimdal")
     assert info.value.code == errno.EINVAL
-
-
-def test_real_ctypes_loader_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
-    no_gssapi(monkeypatch)
-    monkeypatch.setattr(_ctypes, "candidates", lambda system: iter(["/nonexistent/libgss.so"]))
-    assert "/nonexistent/libgss.so" in str(krb5.available())
-
-
-# -- the gssapi backend -----------------------------------------------------------------------
 
 
 def test_gssapi_handshake_and_protection(gssapi: Any) -> None:
@@ -207,6 +194,30 @@ def test_gssapi_one_step_and_names(gssapi: Any) -> None:
     assert gssapi.last_credentials["store"] is None
     krb5.ClientContext("host", "door", ccache="FILE:/tmp/cc")
     assert gssapi.last_credentials["store"] == {"ccache": "FILE:/tmp/cc"}
+
+
+def test_unestablished_names_and_optional_requested_flags(gssapi: Any) -> None:
+    with krb5.ClientContext(
+        "host",
+        "",
+        mutual=False,
+        replay=False,
+        sequence=False,
+        confidentiality=False,
+        integrity=False,
+    ) as client:
+        assert client.initiator_name is None
+        assert client.target_name is None
+        assert client.flags == 0 and client.requested == 0
+        assert client.target.name == "host"
+    with krb5.AcceptorContext("host", ""):
+        assert gssapi.last_credentials["name"].text == "host/localhost@XGFAL.TEST"
+
+
+def test_supplementary_status_does_not_display_success_as_a_failure() -> None:
+    error = _status.describe("checking token", 2, 1, ["duplicate"], ["Success"])
+    assert "duplicate" in error.message
+    assert "Success" not in error.message
 
 
 def test_gssapi_errors(gssapi: Any) -> None:
@@ -306,7 +317,6 @@ def test_contexts_are_locked(gssapi: Any) -> None:
 
 def test_failed_constructor_is_safe_to_collect(monkeypatch: pytest.MonkeyPatch) -> None:
     no_gssapi(monkeypatch)
-    no_library(monkeypatch)
     with pytest.raises(krb5.KerberosError):
         krb5.AcceptorContext()
     # __del__ ran on a half-built object; closing one by hand is also harmless.

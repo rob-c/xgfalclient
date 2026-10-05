@@ -1,5 +1,8 @@
 # Quickstart
 
+All commands support [JSON/XML output](output.md), including errors and
+help/version: append `--json`, `--xml` or `--output-format json|xml`.
+
 ## Install safely
 
 The distribution provides top-level `gfal2` and `gfal2_util` packages. Use a
@@ -8,8 +11,8 @@ installation.
 
 ```console
 $ python3 -m venv .venv
-$ .venv/bin/python -m pip install xgfalclient
-$ .venv/bin/python -m pip install 'xgfalclient[xrootd]'  # add root://
+$ .venv/bin/python -m pip install xgfalclient          # includes root://
+$ .venv/bin/python -m pip install 'xgfalclient[krb5]'    # optional native Kerberos
 ```
 
 ## Create and close a context

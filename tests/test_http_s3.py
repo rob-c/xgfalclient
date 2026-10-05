@@ -148,6 +148,7 @@ def test_s3_rename(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
     write(s3, "/bucket/dir/a", b"1")
     hctx.rename(s3url(s3, "/bucket/dir/a"), s3url(s3, "/bucket/dir/b"))
     assert s3.local("/bucket/dir/b").read_bytes() == b"1"
+
     assert not s3.local("/bucket/dir/a").exists()
     copy, delete = s3.requests[-2:]
     assert (copy.method, copy.header("x-amz-copy-source")) == ("PUT", "/bucket/dir/a")
@@ -167,6 +168,26 @@ def test_s3_rename(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
     assert caught.value.code == errno.EPERM
     hctx.set_opt_boolean("S3", "ALTERNATE", False)  # virtual-host style: the bucket is the host
     assert _s3_copy_source(hctx, "s3://bkt.127.0.0.1:1/k") == "/bkt/k"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'<Error xmlns="urn:s3"><Code>SlowDown</Code></Error>',
+        b"not XML",
+        b'<!DOCTYPE x [<!ENTITY a "value">]><x/>',
+    ],
+)
+def test_s3_copy_body_failure_never_deletes_the_original(
+    hctx: xgfalclient.Gfal2Context, s3: WebDAVServer, payload: bytes
+) -> None:
+    write(s3, "/bucket/original", b"keep me")
+    s3.fault("PUT", status=200, body=payload)
+    with pytest.raises(GError) as caught:
+        hctx.rename(s3url(s3, "/bucket/original"), s3url(s3, "/bucket/new"))
+    assert caught.value.code == errno.EIO
+    assert s3.local("/bucket/original").read_bytes() == b"keep me"
+    assert not any(request.method == "DELETE" for request in s3.requests)
 
 
 def _s3_copy_source(context: xgfalclient.Gfal2Context, url: str) -> str:

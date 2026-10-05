@@ -90,7 +90,9 @@ def test_shell_runs_the_commands(tmp_path: Path, capsys: pytest.CaptureFixture[s
     assert shell.Gfal2Shell().main(["gfal-cat", url(tmp_path / "a")]) is None
     assert capsys.readouterr().out == "a\nhello\n"
     assert shell.Gfal2Shell().main(["gfal-STAT", url(tmp_path / "nope")]) == errno.ENOENT
-    assert capsys.readouterr().err.startswith("gfal-STAT error: 2 (No such file or directory)")
+    assert capsys.readouterr().err == (
+        "gfal-STAT: File or folder not found. Check the path and try again. (error 2)\n"
+    )
     assert shell.Gfal2Shell().main(["gfal-rm", url(tmp_path / "nope")]) == errno.ENOENT
     assert shell.Gfal2Shell().main(["gfal-legacy-bringonline", "mock://h/f"]) is None
     assert "Bringonline token: " in capsys.readouterr().out
@@ -141,7 +143,7 @@ def test_user_commands(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
         shell.Gfal2Shell().main(["gfal-bare", "--help"])
     assert "\nGfal util BARE command. .\n" in capsys.readouterr().out
     assert shell.Gfal2Shell().main(["gfal-bare"]) == errno.EIO
-    assert capsys.readouterr().err == "gfal-bare error: 5 (Input/output error) - bare failure\n"
+    assert capsys.readouterr().err == "gfal-bare: bare failure (error 5)\n"
 
 
 def test_parameters() -> None:

@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from ..._compat import SLOTS
+from ..._xml import UnsafeXML, fromstring
 from ...errors import GError
 from ...url import parse, scheme_of
 from ._client import Response, wire_scheme
@@ -26,7 +27,6 @@ ACCEPT = "application/metalink4+xml"
 MAX_DESCRIPTOR_SIZE = 8 << 20
 MAX_URL_SIZE = 4096
 MAX_REPLICAS = 10_000
-_FORBIDDEN_XML = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 _TYPE = re.compile(r"(?:^|;)\s*type\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^;\s]+))", re.I)
 _REL = re.compile(r"(?:^|;)\s*rel\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^;\s]+))", re.I)
 
@@ -68,10 +68,10 @@ def _parse_root(document: bytes) -> ET.Element:
         raise GError(
             f"Metalink descriptor is {len(document)} bytes; limit is {MAX_DESCRIPTOR_SIZE}"
         )
-    if _FORBIDDEN_XML.search(document):
-        raise GError("Metalink descriptors may not declare a DOCTYPE or XML entities")
     try:
-        root = ET.fromstring(document)
+        root = fromstring(document)
+    except UnsafeXML as exc:
+        raise GError("Metalink descriptors may not declare a DOCTYPE or XML entities") from exc
     except ET.ParseError as exc:
         raise GError(f"Malformed Metalink descriptor: {exc}") from None
     if _local_name(root.tag) != "metalink":

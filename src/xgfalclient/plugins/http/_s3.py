@@ -12,7 +12,7 @@ listings and renames, which must know where the bucket ends and the key
 begins. Keys never make an ``https://`` URL an S3 one: gfal2 sends those
 unsigned, as WebDAV.
 
-Every request is signed with SigV4 (``hmac`` and ``hashlib``, nothing else).
+Every request is signed with SigV4 through botocore.
 davix falls back to the older SigV2 when no region is configured; this does
 not - SigV2 is retired at AWS and every S3 implementation that matters takes
 V4 - and signs for ``us-east-1`` instead, which is what they all accept.
@@ -32,14 +32,20 @@ import base64
 import binascii
 import errno
 import hashlib
-import hmac
 import sys
 import urllib.parse
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
+
+from botocore.auth import S3SigV4QueryAuth  # type: ignore[import-untyped]
+from botocore.awsrequest import AWSRequest  # type: ignore[import-untyped]
+from botocore.credentials import Credentials as AWSCredentials  # type: ignore[import-untyped]
+from xrdclient._xml import UnsafeXML
+from xrdclient.s3._codec import decode, listing_items, manifest, modified
+from xrdclient.s3.sigv4 import _authorize, _signed_request
 
 from ...errors import GError
 from ...plugin import PluginFile
@@ -47,7 +53,7 @@ from ...types import Stat
 from ...url import URL, parse
 from . import _swift
 from ._client import Body, FileBody, Target, status_error
-from ._dav import epoch, parse_xml
+from ._dav import epoch
 from ._gcloud import is_gcloud
 
 if TYPE_CHECKING:
@@ -138,39 +144,17 @@ def path_style(options: Options, url: URL) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _stamp(when: datetime | None) -> str:
-    return (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
-
-
-def _canonical_query(query: str) -> str:
-    pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
-    return "&".join(
-        f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(value, safe='')}"
-        for name, value in sorted(pairs)
-    )
-
-
 class S3Signer:
-    """Signs requests (and pre-signs URLs) with one set of keys."""
+    """Thin botocore adapter retaining GFAL's credential and target policy."""
 
     def __init__(self, keys: S3Keys) -> None:
         self.keys = keys
 
-    def _signing_key(self, date: str) -> bytes:
-        key = f"AWS4{self.keys.secret_key}".encode()
-        for step in (date, self.keys.region, "s3", "aws4_request"):
-            key = hmac.new(key, step.encode(), hashlib.sha256).digest()
-        return key
-
-    def _signature(self, stamp: str, canonical: str) -> str:
-        scope = f"{stamp[:8]}/{self.keys.region}/s3/aws4_request"
-        to_sign = "\n".join(
-            [ALGORITHM, stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()]
-        )
-        return hmac.new(self._signing_key(stamp[:8]), to_sign.encode(), hashlib.sha256).hexdigest()
+    def _credentials(self) -> AWSCredentials:
+        return AWSCredentials(self.keys.access_key, self.keys.secret_key, self.keys.token or None)
 
     def target(self, method: str, target: Target) -> Target:
-        return target  # SigV4 here goes in headers, not in the URL
+        return target
 
     def sign(
         self,
@@ -180,70 +164,34 @@ class S3Signer:
         body: Body | None,
         when: datetime | None = None,
     ) -> dict[str, str]:
-        """The headers that authorise this request."""
-        stamp = _stamp(when)
-        if body is None or isinstance(body, FileBody):
-            payload = UNSIGNED if isinstance(body, FileBody) else hashlib.sha256(b"").hexdigest()
+        if isinstance(body, FileBody):
+            payload = UNSIGNED
         else:
-            payload = hashlib.sha256(body).hexdigest()
-        signed = {k: v for k, v in headers.items() if k.lower().startswith("x-amz-")}
-        signed["host"] = target.host_header
-        signed["x-amz-date"] = stamp
-        signed["x-amz-content-sha256"] = payload
-        if self.keys.token:
-            signed["x-amz-security-token"] = self.keys.token
-        lowered = sorted((k.lower(), " ".join(v.split())) for k, v in signed.items())
-        names = ";".join(name for name, _ in lowered)
-        path, _, query = target.path.partition("?")
-        canonical = "\n".join(
-            [
-                method.upper(),
-                path,
-                _canonical_query(query),
-                "".join(f"{name}:{value}\n" for name, value in lowered),
-                names,
-                payload,
-            ]
+            payload = hashlib.sha256(body or b"").hexdigest()
+        signed = _signed_request(
+            method,
+            f"{target.base}{target.path}",
+            target.host_header,
+            headers,
+            payload,
+            credentials=self._credentials(),
+            region=self.keys.region,
+            when=when,
         )
-        out = {k: v for k, v in signed.items() if k != "host"}
-        scope = f"{stamp[:8]}/{self.keys.region}/s3/aws4_request"
-        out["Authorization"] = (
-            f"{ALGORITHM} Credential={self.keys.access_key}/{scope}, "
-            f"SignedHeaders={names}, Signature={self._signature(stamp, canonical)}"
-        )
-        return out
+        return {k: v for k, v in signed.items() if k.lower() != "host"}
 
     def presign(
         self, method: str, url: str, expires: int = 3600, when: datetime | None = None
     ) -> str:
-        """A URL anyone can use for ``method`` until it expires - how S3 joins a TPC."""
         target = Target.of(url, s3=True)
-        stamp = _stamp(when)
-        scope = f"{stamp[:8]}/{self.keys.region}/s3/aws4_request"
-        path, _, query = target.path.partition("?")
-        params = urllib.parse.parse_qsl(query, keep_blank_values=True)
-        params += [
-            ("X-Amz-Algorithm", ALGORITHM),
-            ("X-Amz-Credential", f"{self.keys.access_key}/{scope}"),
-            ("X-Amz-Date", stamp),
-            ("X-Amz-Expires", str(expires)),
-            ("X-Amz-SignedHeaders", "host"),
-        ]
-        if self.keys.token:
-            params.append(("X-Amz-Security-Token", self.keys.token))
-        canonical_query = _canonical_query(urllib.parse.urlencode(params))
-        canonical = "\n".join(
-            [
-                method.upper(),
-                path,
-                canonical_query,
-                f"host:{target.host_header}\n",
-                "host",
-                UNSIGNED,
-            ]
+        request = AWSRequest(
+            method=method.upper(),
+            url=f"{target.base}{target.path}",
+            headers={"host": target.host_header},
         )
-        signature = self._signature(stamp, canonical)
-        return f"{target.base}{path}?{canonical_query}&X-Amz-Signature={signature}"
+        auth = S3SigV4QueryAuth(self._credentials(), "s3", self.keys.region, expires=expires)
+        _authorize(auth, request, when)
+        return str(request.url)
 
 
 # ---------------------------------------------------------------------------
@@ -251,19 +199,28 @@ class S3Signer:
 # ---------------------------------------------------------------------------
 
 
-def _local(tag: str) -> str:
-    return tag.rpartition("}")[2]
+def _answer(payload: bytes, operation: str, what: str = "S3 response") -> dict[str, Any]:
+    try:
+        return decode(operation, payload, lenient=True)
+    except UnsafeXML as exc:
+        raise GError(f"Refusing a {what} with a document type declaration", errno.EIO) from exc
+    except ET.ParseError as exc:
+        raise GError(f"XML Parsing Error: {what}: {exc}", errno.EIO) from exc
 
 
-def _children(element: ET.Element, name: str) -> list[ET.Element]:
-    return [child for child in element if _local(child.tag) == name]
-
-
-def _child_text(element: ET.Element, name: str) -> str:
-    for child in element:
-        if _local(child.tag) == name:
-            return (child.text or "").strip()
-    return ""
+def _entries(page: dict[str, Any], prefix: str) -> Iterator[tuple[str, Stat]]:
+    for name, item in listing_items(page, prefix):
+        if item is None:
+            name = name.strip("/")
+            if name:
+                yield name, Stat(st_mode=OBJECT_DIR_MODE)
+        else:
+            yield (
+                name,
+                Stat(
+                    st_mode=OBJECT_FILE_MODE, st_size=item.get("Size", 0), st_mtime=modified(item)
+                ),
+            )
 
 
 def split(plugin: HTTPPlugin, url: str) -> tuple[str, str]:
@@ -312,28 +269,11 @@ def _listing(plugin: HTTPPlugin, url: str, *, limit: int = 0) -> tuple[list[tupl
         payload = response.body()
         if response.status != 200:
             raise status_error(response.status)
-        root = parse_xml(payload, "bucket listing")
-        seen += len(_children(root, "CommonPrefixes")) + len(_children(root, "Contents"))
-        for item in _children(root, "CommonPrefixes"):
-            name = _child_text(item, "Prefix")[len(prefix) :].strip("/")
-            if name:
-                entries.append((name, Stat(st_mode=OBJECT_DIR_MODE)))
-        for item in _children(root, "Contents"):
-            name = _child_text(item, "Key")[len(prefix) :]
-            if name and "/" not in name:
-                size = _child_text(item, "Size")
-                entries.append(
-                    (
-                        name,
-                        Stat(
-                            st_mode=OBJECT_FILE_MODE,
-                            st_size=int(size) if size.isdigit() else 0,
-                            st_mtime=epoch(_child_text(item, "LastModified")),
-                        ),
-                    )
-                )
-        token = _child_text(root, "NextMarker" if v1 else "NextContinuationToken")
-        if limit or _child_text(root, "IsTruncated") != "true" or not token:
+        root = _answer(payload, "ListObjects" if v1 else "ListObjectsV2", "bucket listing")
+        seen += len(root.get("CommonPrefixes", [])) + len(root.get("Contents", []))
+        entries.extend(_entries(root, prefix))
+        token = root.get("NextMarker" if v1 else "NextContinuationToken", "")
+        if limit or not root.get("IsTruncated") or not token:
             return entries, seen
 
 
@@ -367,7 +307,14 @@ def rename(plugin: HTTPPlugin, old: str, new: str) -> None:
         path = parsed.path
     else:
         path = f"/{parsed.host.partition('.')[0]}{parsed.path}"
-    _swift.rename(plugin, old, new, copy_header="x-amz-copy-source", source=path, ok=200)
+    _swift.rename(
+        plugin, old, new, copy_header="x-amz-copy-source", source=path, ok=200, verify=_copied
+    )
+
+
+def _copied(payload: bytes) -> None:
+    if "Error" in _answer(payload, "CopyObject"):
+        raise GError("S3 copy failed; the original file has not been deleted", errno.EIO)
 
 
 def checksum(plugin: HTTPPlugin, url: str, algorithm: str) -> str:
@@ -410,7 +357,7 @@ class Multipart:
         payload = response.body()
         if response.status != 200:
             raise status_error(response.status)
-        self.upload_id = _child_text(parse_xml(payload, "S3 response"), "UploadId")
+        self.upload_id = _answer(payload, "CreateMultipartUpload").get("UploadId", "")
         if not self.upload_id:
             raise GError(f"S3 did not return an upload id for {url}", errno.EPROTO)
 
@@ -433,17 +380,13 @@ class Multipart:
         self.parts.append(response.header("ETag"))
 
     def complete(self) -> None:
-        items = "".join(
-            f"<Part><PartNumber>{index}</PartNumber><ETag>{etag}</ETag></Part>"
-            for index, etag in enumerate(self.parts, start=1)
-        )
-        body = f"<CompleteMultipartUpload>{items}</CompleteMultipartUpload>".encode()
+        body = manifest(self.parts)
         response = self.plugin._request(
             "POST", self._with(f"uploadId={self._id()}"), body=body, cred_url=self.url
         )
         payload = response.body()
         # S3 can answer 200 and still carry an <Error> in the body.
-        if response.status != 200 or b"<Error>" in payload:
+        if response.status != 200 or "Error" in _answer(payload, "CompleteMultipartUpload"):
             raise status_error(response.status if response.status != 200 else 500)
 
     def abort(self) -> None:

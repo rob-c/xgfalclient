@@ -13,6 +13,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Callable
 
+from xgfalclient.cli._base import exit_status, output
+
 from . import base
 from . import commands as commands
 from . import copy as copy
@@ -38,6 +40,11 @@ class CommandFactory:
 class Gfal2Shell:
     def main(self, args: Sequence[str]) -> int | None:
         """Entry point"""
+        if output.requested(args[1:]):
+            return output.run_cli(args[0], args[1:], lambda: exit_status(self._main(args)))
+        return self._main(args)
+
+    def _main(self, args: Sequence[str]) -> int | None:
         cmd = args[0].rsplit("-", 1)[1].lower()
         command_class, command_func = CommandFactory.get_command(cmd)
         inst = command_class()

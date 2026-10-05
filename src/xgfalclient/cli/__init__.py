@@ -27,6 +27,7 @@ import os
 from collections.abc import Sequence
 
 from .._version import GFAL2_VERSION
+from ._base import output
 
 __all__ = [
     "COMMANDS",
@@ -85,6 +86,10 @@ SRM_IFCE_VERSION = "1.24.8"
 
 
 def run(command: str, argv: Sequence[str] | None = None) -> int:
+    return output.run_cli(f"gfal-{command}", argv, lambda: _run(command, argv))
+
+
+def _run(command: str, argv: Sequence[str] | None = None) -> int:
     """Run ``gfal-<command>``; its exit status.
 
     What gfal2-util's scripts do before running the command is done here:
@@ -180,17 +185,25 @@ def xattr(argv: Sequence[str] | None = None) -> int:
 
 def gfal2_version(argv: Sequence[str] | None = None) -> int:
     """``gfal2_version``: gfal2's version tool, which ignores its arguments."""
-    from ._base import out
-
-    out(f"GFAL-client-{GFAL2_VERSION}\n")
-    return 0
+    return output.run_cli(
+        "gfal2_version", argv, lambda: _version(f"GFAL-client-{GFAL2_VERSION}", GFAL2_VERSION)
+    )
 
 
 def gfal_srm_ifce_version(argv: Sequence[str] | None = None) -> int:
     """``gfal_srm_ifce_version``: srm-ifce's, double dash and all."""
+    return output.run_cli(
+        "gfal_srm_ifce_version",
+        argv,
+        lambda: _version(f"gfal-srm-ifce--{SRM_IFCE_VERSION}", SRM_IFCE_VERSION),
+    )
+
+
+def _version(text: str, version: str) -> int:
     from ._base import out
 
-    out(f"gfal-srm-ifce--{SRM_IFCE_VERSION}\n")
+    output.record("version", version=version)
+    out(text + "\n")
     return 0
 
 

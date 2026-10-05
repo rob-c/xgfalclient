@@ -7,9 +7,9 @@ build-backend = "hatchling.build"
 [project]
 name = "xgfalclient"
 dynamic = ["version"]
-description = "A pure-Python, drop-in gfal2 client: WebDAV/HTTP, S3, Google Cloud Storage, XRootD, GridFTP, SRM, SFTP, dCap, LFC and local files, with X.509/GSI, token, Kerberos and SSH auth"
+description = "A Python 3, drop-in gfal2 client: WebDAV/HTTP, S3, Google Cloud Storage, XRootD, GridFTP, SRM, SFTP, dCap, LFC and local files, with X.509/GSI, token, Kerberos and SSH auth"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.9.2"
 license = { text = "LGPL-3.0-or-later" }
 authors = [{ name = "Robert Currie", email = "robert.andrew.currie@gmail.com" }]
 keywords = [
@@ -28,8 +28,16 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Topic :: System :: Filesystems",
 ]
-# The core, and every protocol but root://, is the standard library alone.
-dependencies = []
+# Maintained libraries provide reusable parsing, transport and security primitives.
+dependencies = [
+  # Shared security/parsing APIs and XRootD transport are released together.
+  "xrdclient==0.3.0",
+  "asn1crypto>=1.5.1",
+  "botocore>=1.35",
+  "cryptography>=45",
+  "PyJWT[crypto]>=2.10",
+  "urllib3>=2.2",
+]
 
 [project.urls]
 Homepage = "https://github.com/rob-c/xgfalclient"
@@ -39,11 +47,10 @@ Issues = "https://github.com/rob-c/xgfalclient/issues"
 Changelog = "https://github.com/rob-c/xgfalclient/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# root:// and roots:// are spoken by xrdclient, which is itself pure Python.
-xrootd = ["xrdclient>=0.1.0"]
-# Kerberos works without this, through ctypes into the system libgssapi_krb5;
-# with it installed, python-gssapi is used instead.
-krb5 = ["gssapi>=1.6"]
+# Compatibility alias: XRootD support is now included in the base install.
+xrootd = []
+# Native Kerberos bindings need system headers when no wheel is available.
+krb5 = ["gssapi>=1.12,<2", "krb5>=0.10,<0.11"]
 dev = [
   "build>=1,<2",
   "complexipy>=6,<7",
