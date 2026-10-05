@@ -1,5 +1,5 @@
 site_name: xgfalclient
-site_description: A pure-Python replacement for gfal2 and gfal2-util
+site_description: A Python 3, drop-in replacement for gfal2 and gfal2-util
 site_url: https://rob-c.github.io/xgfalclient/
 repo_url: https://github.com/rob-c/xgfalclient
 copyright: LGPL-3.0-or-later

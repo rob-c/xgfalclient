@@ -91,8 +91,9 @@ the replacement API.
   JSON/XML regression tests. Existing line/branch/condition coverage, API,
   performance, maintainability and real-service interop gates remain required.
 - Added coordinated testing and packaging for AlmaLinux 8/9/10, CentOS Stream
-  9/10, Ubuntu 24.04/26.04, Fedora 44, NixOS 26.05 and Intel/Apple Silicon
-  Homebrew through xrdclient's canonical runner/workflow.
+  9/10, Ubuntu 24.04/26.04, Fedora 44 and Rawhide, NixOS 26.05 and Intel/Apple
+  Silicon Homebrew, on x86-64 and ARM64, through xrdclient's canonical
+  runner/workflow.
 - Added private RPM/DEB packages requiring the exact paired Xrd version and
   package release, plus thin Nix recipes and Homebrew wheel bundles. Jobs check
   binary-only installs, installed JSON/XML commands and byte-identical copies,
@@ -110,10 +111,13 @@ the replacement API.
 - VOMS validates/transports existing assertions, not proxy acquisition. CA-path
   checks do not implement all RFC 5280 constraints or CRLs; pyhanko-certvalidator
   remains deferred to preserve Python 3.9 compatibility.
-- Pre-version-bump candidates passed all eight RPM/DEB targets, Nix builds and
-  Intel Homebrew installation tests. Apple Silicon Homebrew and a booted NixOS
-  VM remain CI verification targets. See [the platform guide](docs/platforms.md)
-  for the exact scope, optional skips and remaining release blockers.
+- The 0.3.0 candidates passed all nine RPM/DEB targets natively on ARM64,
+  including Fedora Rawhide on Python 3.15, plus native-VM installs on
+  AlmaLinux 9 and Ubuntu 24.04, the Nix package builds and a booted aarch64
+  NixOS VM test, and Apple Silicon Homebrew installation, `brew test` and
+  command checks. x86-64 artifacts come from the native hosted runners. See
+  [the platform guide](docs/platforms.md) for the exact scope, optional skips
+  and remaining release blockers.
 
 ## [0.2.0] - 2026-10-01
 

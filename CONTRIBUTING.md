@@ -2,8 +2,8 @@
 
 The project has two compatibility targets: the `gfal2` Python API and the
 observable behaviour of gfal2/gfal2-util 2.23.5/1.9.1. Improvements must keep
-those contracts while preserving a dependency-free core and a faster data
-plane.
+those contracts while preserving a small, vetted dependency set and a faster
+data plane.
 
 ## Development setup
 
@@ -47,9 +47,12 @@ A deliberate safety improvement is welcome, but it needs a focused test and a
 prominent note under “Where it differs from gfal2.” Do not silently change an
 error code, callback order, return shape or command-line spelling.
 
-Keep production imports in `src/xgfalclient` standard-library-only. Optional
-integrations must be lazy and must have a working pure-Python or system-library
-path described in the developer guide.
+Production imports in `src/xgfalclient` are limited to the standard library,
+`xrdclient` and the declared runtime dependencies (`cryptography`,
+`asn1crypto`, `PyJWT`, `urllib3` and `botocore`); adding a dependency is a
+reviewed decision, not a convenience. Optional integrations must be lazy and
+must have a working default or system-library path described in the developer
+guide.
 
 ## Documentation and releases
 
