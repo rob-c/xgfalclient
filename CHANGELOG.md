@@ -4,7 +4,7 @@ Notable user-visible changes are recorded here. The `xgfalclient` version is
 independent of the gfal2 and python3-gfal2 compatibility versions reported by
 the replacement API.
 
-## [0.3.1] - Unreleased
+## [0.3.1] - 2026-10-06
 
 ### Changed
 
