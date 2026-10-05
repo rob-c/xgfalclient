@@ -33,16 +33,15 @@ gfal2-util's `/usr/bin/gfal-*` scripts along with its own.
 
 The goal is to make scientific data access straightforward for physicists,
 administrators and new projects: familiar APIs, one installation workflow,
-clear diagnostics and portable Python 3.9+ support. Existing FTS, Rucio and
+clear diagnostics and portable Python 3.10+ support. Existing FTS, Rucio and
 DIRAC integrations can keep using the interfaces they already know.
 
 ## Install
 
-Requires Python 3.9.2+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
-`urllib3`, `asn1crypto`, `cryptography` and the exact-pinned `xrdclient==0.3.0`.
-The current 0.3.0 candidate is unreleased. Python 3.9 clean installation is
-currently blocked by the botocore/urllib3 dependency conflict; see
-[platform status](docs/platforms.md).
+Requires Python 3.10+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
+`urllib3`, `asn1crypto`, `cryptography` and the exact-pinned `xrdclient==0.3.1`.
+(Python 3.9 cannot install botocore together with `urllib3>=2.2`, which is
+why the floor is 3.10; see [platform status](docs/platforms.md).)
 XRootD support is included in the base install. The two clients share one
 implementation of VOMS validation, DER/RSA/AES/signature helpers and safe XML
 loading; existing `xgfalclient.crypto` import paths remain compatible.
@@ -56,7 +55,7 @@ and pykrb5 (distribution name `krb5`). Both have macOS wheels; Linux source
 installs need a C compiler and Kerberos development headers. Ordinary installs
 and non-Kerberos protocols do not request either binding.
 
-CI checks wheel-only dependency resolution for Python 3.9 and 3.14 on
+CI checks wheel-only dependency resolution for Python 3.10 and 3.14 on
 macOS Intel/Apple Silicon, glibc Linux (2.28+) and musl Linux (1.2+), on x86-64
 and ARM64. Clean installs are exercised on Linux and macOS. These gates check
 current releases; they cannot guarantee future upstream wheel availability.

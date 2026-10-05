@@ -9,11 +9,11 @@ unchanged. Required general-purpose dependencies are `botocore`,
 `PyJWT[crypto]`, `urllib3`, `asn1crypto` and `cryptography`. XML declaration
 checks and binary record readers are local standard-library helpers.
 Native `gssapi` and `krb5` bindings are in the optional `krb5`
-extra; `xrdclient==0.3.0` is required for shared security/parsing and `root://`.
+extra; `xrdclient==0.3.1` is required for shared security/parsing and `root://`.
 Do not add a compiler-dependent package to the default install. CI's
 wheel-only resolution and clean-install jobs cover supported platform families.
-Python 3.9 remains the declared compatibility floor, but a clean 3.9 install
-does not resolve; the floor is to be corrected; see [Platforms](platforms.md).
+The declared floor is Python 3.10: on 3.9 botocore pins `urllib3<1.27` and
+the clients need `urllib3>=2.2`; see [Platforms](platforms.md).
 Current pyhanko-certvalidator requires Python 3.10 and is deferred rather than
 selecting an older validator.
 
@@ -97,7 +97,7 @@ Add Linux/macOS regression cases for the reason, path, code and suggested fix.
    an optional SSH transport. JWT inspection is unverified diagnostics,
    never a trust decision. Do not substitute a WebPKI verifier for RFC 3820
    proxy or VOMS policy without explicitly testing that policy.
-2. **Python 3.9 compatible.** `from __future__ import annotations` in every
+2. **3.9-clean syntax, 3.10 floor.** `from __future__ import annotations` in every
    module; no `match`; no `X | Y` outside annotations; `dataclass(**SLOTS)`
    from `_compat`, never `slots=True`; no `zip(strict=)`. Version-dependent
    code goes in `_compat.py` only.
@@ -142,7 +142,7 @@ Add Linux/macOS regression cases for the reason, path, code and suggested fix.
    match the density of the existing modules.
 9. **Distributions are tested artifacts.** Both wheels and source archives
    must pass `twine check --strict`; typed packages carry their `py.typed`
-   marker. Python 3.9 through 3.14 are exercised in CI.
+   marker. Python 3.10 through 3.14 are exercised in CI.
 
 ## Layout
 

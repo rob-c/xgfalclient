@@ -3,12 +3,11 @@
 A release is made from one reviewed commit. The version tag, source version,
 built metadata and installed runtime must all agree.
 
-The current release is **0.3.0**, requiring `xrdclient==0.3.0`. Keep a
-version's changelog entry `Unreleased` until its release is approved. Python
-3.9.2 is still the declared floor although a clean 3.9 install does not
-resolve (botocore pins `urllib3<1.27` there); 0.3.0 shipped with that as a
-documented limitation and the floor is to be corrected in the next release.
-See [Platforms](platforms.md) for the validation scope.
+The current release is **0.3.1**, requiring `xrdclient==0.3.1`. Keep a
+version's changelog entry `Unreleased` until its release is approved. The
+declared Python floor is 3.10 (0.3.0 still declared 3.9.2, on which the
+dependencies could not be resolved). See [Platforms](platforms.md) for the
+validation scope.
 
 ## Prepare
 
@@ -25,7 +24,7 @@ See [Platforms](platforms.md) for the validation scope.
    security/parsing APIs and must be available on PyPI before xgfalclient is
    tagged. Update the mandatory dependency pin when those APIs change.
 7. Run the [shared platform/package matrix](platforms.md) with matching
-   candidate refs. Build and validate fresh 0.3.0 artifacts, including the exact
+   candidate refs. Build and validate fresh release artifacts, including the exact
    native-package dependency and installed command versions; old 0.2.0
    working-tree packages are not final release artifacts.
 

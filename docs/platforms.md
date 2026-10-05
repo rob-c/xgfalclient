@@ -21,9 +21,8 @@ The [shared guide](https://rob-c.github.io/xrdclient/platforms/) describes the
 native NixOS VM and Homebrew jobs, package rebuild/security-update policy,
 artifact inventories, and limitations of container versus full-OS tests.
 
-Python 3.9 is still declared but its botocore/urllib3 dependency conflict
-means a clean 3.9 install does not resolve; use 3.10 or newer until the floor
-is corrected. AlmaLinux 8/9 and Stream 9 jobs use AppStream Python
+The declared Python floor is 3.10 (on 3.9 botocore pins `urllib3<1.27`, which
+the clients cannot use). AlmaLinux 8/9 and Stream 9 jobs use AppStream Python
 3.12 explicitly. Native Kerberos remains an optional extra and may require
 compilation on Linux. Private RPM/DEB bundles and custom-tap formulae are not
 claims of acceptance into distribution archives or Homebrew Core.
@@ -34,4 +33,4 @@ on AlmaLinux 9 and Ubuntu 24.04, the Nix package builds with a booted aarch64
 NixOS VM test, and Apple Silicon Homebrew installation and tests. x86-64 ran
 under emulation locally; the hosted x86-64 runners are the authority for
 that architecture. See the shared guide for the exact validation scope,
-skipped optional tests and the Python 3.9 limitation.
+skipped optional tests.

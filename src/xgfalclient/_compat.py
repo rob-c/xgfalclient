@@ -1,7 +1,8 @@
 """What the oldest supported Python lacks, in one place.
 
-The floor is 3.9 because that is what RHEL 9 and AlmaLinux 9 ship, and a
-grid login node is where this library is most needed. Nothing else in the
+The code is kept to 3.9 syntax because that is what RHEL 9 and AlmaLinux 9
+ship as ``python3``, although the declared floor is 3.10 (the dependencies
+cannot be resolved on 3.9). Nothing else in the
 package may test ``sys.version_info``; if a module needs something newer, the
 fallback lives here.
 """

@@ -4,6 +4,17 @@ Notable user-visible changes are recorded here. The `xgfalclient` version is
 independent of the gfal2 and python3-gfal2 compatibility versions reported by
 the replacement API.
 
+## [0.3.1] - Unreleased
+
+### Changed
+
+- Raised the declared Python floor from 3.9.2 to 3.10 and required
+  `xrdclient==0.3.1`. On Python 3.9 botocore pins `urllib3<1.27`, which cannot
+  be satisfied together with `urllib3>=2.2`, so a 3.9 install never resolved;
+  the metadata now says so up front. Every supported platform package already
+  uses a distribution-provided Python 3.10 or newer, so no deployment target
+  changes. The code is still kept to 3.9 syntax.
+
 ## [0.3.0] - 2026-10-05
 
 ### Added
@@ -155,5 +166,6 @@ the replacement API.
 - Failed copies consistently preserve the primary error and apply requested
   destination cleanup.
 
+[0.3.1]: https://github.com/rob-c/xgfalclient/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/rob-c/xgfalclient/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rob-c/xgfalclient/compare/v0.1.0...v0.2.0

@@ -9,7 +9,7 @@ name = "xgfalclient"
 dynamic = ["version"]
 description = "A Python 3, drop-in gfal2 client: WebDAV/HTTP, S3, Google Cloud Storage, XRootD, GridFTP, SRM, SFTP, dCap, LFC and local files, with X.509/GSI, token, Kerberos and SSH auth"
 readme = "README.md"
-requires-python = ">=3.9.2"
+requires-python = ">=3.10"
 license = { text = "LGPL-3.0-or-later" }
 authors = [{ name = "Robert Currie", email = "robert.andrew.currie@gmail.com" }]
 keywords = [
@@ -20,7 +20,6 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -31,7 +30,7 @@ classifiers = [
 # Maintained libraries provide reusable parsing, transport and security primitives.
 dependencies = [
   # Shared security/parsing APIs and XRootD transport are released together.
-  "xrdclient==0.3.0",
+  "xrdclient==0.3.1",
   "asn1crypto>=1.5.1",
   "botocore>=1.35",
   "cryptography>=45",
