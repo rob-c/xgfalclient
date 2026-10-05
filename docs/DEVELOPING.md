@@ -12,8 +12,8 @@ Native `gssapi` and `krb5` bindings are in the optional `krb5`
 extra; `xrdclient==0.3.0` is required for shared security/parsing and `root://`.
 Do not add a compiler-dependent package to the default install. CI's
 wheel-only resolution and clean-install jobs cover supported platform families.
-Python 3.9 remains the declared compatibility floor, but its clean-install
-dependency conflict is a release blocker; see [Platforms](platforms.md).
+Python 3.9 remains the declared compatibility floor, but a clean 3.9 install
+does not resolve; the floor is to be corrected; see [Platforms](platforms.md).
 Current pyhanko-certvalidator requires Python 3.10 and is deferred rather than
 selecting an older validator.
 

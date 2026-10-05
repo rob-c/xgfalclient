@@ -4,7 +4,7 @@ Notable user-visible changes are recorded here. The `xgfalclient` version is
 independent of the gfal2 and python3-gfal2 compatibility versions reported by
 the replacement API.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-10-05
 
 ### Added
 
@@ -116,8 +116,8 @@ the replacement API.
   AlmaLinux 9 and Ubuntu 24.04, the Nix package builds and a booted aarch64
   NixOS VM test, and Apple Silicon Homebrew installation, `brew test` and
   command checks. x86-64 artifacts come from the native hosted runners. See
-  [the platform guide](docs/platforms.md) for the exact scope, optional skips
-  and remaining release blockers.
+  [the platform guide](docs/platforms.md) for the exact scope and optional
+  skips.
 
 ## [0.2.0] - 2026-10-01
 

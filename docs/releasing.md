@@ -3,11 +3,12 @@
 A release is made from one reviewed commit. The version tag, source version,
 built metadata and installed runtime must all agree.
 
-The current candidate is **0.3.0**, requiring `xrdclient==0.3.0`. Keep its
-changelog entry `Unreleased` until the release is approved. Python 3.9.2 remains
-the declared floor, but the botocore/urllib3 clean-install conflict is a release
-blocker, not a permitted skip. See [Platforms](platforms.md) for outstanding
-native-platform checks and the scope of pre-version-bump validation.
+The current release is **0.3.0**, requiring `xrdclient==0.3.0`. Keep a
+version's changelog entry `Unreleased` until its release is approved. Python
+3.9.2 is still the declared floor although a clean 3.9 install does not
+resolve (botocore pins `urllib3<1.27` there); 0.3.0 shipped with that as a
+documented limitation and the floor is to be corrected in the next release.
+See [Platforms](platforms.md) for the validation scope.
 
 ## Prepare
 
