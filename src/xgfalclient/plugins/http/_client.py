@@ -151,6 +151,20 @@ _ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 _PATH_SAFE = "/:@!$&'()*+,;=~"
 
 
+def _collapse_slashes(path: str) -> str:
+    """Fold runs of ``/`` into one, as a POSIX-backed WebDAV server does.
+
+    A doubled slash in a path (``/store//file``) is a join artifact, not
+    meaning: most servers normalise it, but some (StoRM) answer ``400`` where
+    others succeed, so the request is sent with it folded. Only literal
+    separators are folded - a ``%2F`` that stands for a slash in a name is an
+    escape, not a separator, and is left alone. S3 keeps its slashes (an S3 key
+    is literal), which is why this runs only on the non-S3 path in
+    :meth:`Target.of`.
+    """
+    return re.sub(r"/{2,}", "/", path)
+
+
 def _quote_path(path: str) -> str:
     """Percent-encode a path, leaving escapes that are already there alone."""
     parts: list[str] = []
@@ -186,8 +200,11 @@ class Target:
         port = explicit or (443 if scheme == "https" else 80)
         raw = parsed.path or "/"
         # S3 signs the path exactly as its canonical form spells it, so the
-        # wire must use that spelling too.
-        quoted = urllib.parse.quote(urllib.parse.unquote(raw), safe="/") if s3 else _quote_path(raw)
+        # wire must use that spelling too - and an S3 key's slashes are literal.
+        # Elsewhere a doubled slash is a join artifact a WebDAV server folds, so
+        # it is folded here too rather than left for a strict one to refuse.
+        quoted = (urllib.parse.quote(urllib.parse.unquote(raw), safe="/") if s3
+                  else _quote_path(_collapse_slashes(raw)))
         query = parsed.query
         return cls(scheme, parsed.host, port, f"{quoted}?{query}" if query else quoted, parsed)
 

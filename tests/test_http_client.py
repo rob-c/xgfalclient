@@ -430,6 +430,14 @@ def test_targets() -> None:
     assert Target.of("davs+3rd://h").path == "/"
     assert Target.of("https://h:/").port == 443
     assert Target.of("http://u:p@h:81/").base == "http://h:81"
+    # A doubled slash is a join artifact a WebDAV server folds; send it folded,
+    # so a strict one (StoRM) does not 400 where others succeed.
+    assert Target.of("davs://h/store//sub///f.bin").path == "/store/sub/f.bin"
+    assert Target.of("https://h//a/b").path == "/a/b"
+    # ... but an escaped slash inside a name is a character, not a separator.
+    assert Target.of("davs://h/store/a%2F%2Fb").path == "/store/a%2F%2Fb"
+    # S3 keys are literal: their slashes, doubled or not, are left exactly.
+    assert Target.of("s3://h/bucket/a//b", s3=True).path == "/bucket/a//b"
     # What neon's URI parser refuses, davix calls "not a valid HTTP or Webdav URL" (EIO)
     for bad in ("root://h/p", "https://h:x/", "https://[::1/x", "https://[::1]:bad/x"):
         with pytest.raises(GError) as caught:
