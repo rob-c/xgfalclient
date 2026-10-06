@@ -1131,6 +1131,25 @@ def test_macaroon_for_the_far_side(
     assert copy_request.header("X-No-Delegate") is None
 
 
+def test_an_ambient_token_is_replaced_by_a_minted_macaroon(
+    hctx: xgfalclient.Gfal2Context, davs: WebDAVServer, dav2: WebDAVServer, grid_env: PKI
+) -> None:
+    """An identity-mapped token (a DiracX token) is taken for a direct read or
+    write, and to mint a macaroon, but refused on the delegated TPC leg. So
+    when one is in hand, the far leg carries a macaroon minted with it, not the
+    bare token. (Regression: the ambient token used to short-circuit the mint
+    and be forwarded, which the far SE then refused.)"""
+    write(davs, "/data/src", b"from tls")
+    hctx.set_opt_string("BEARER", "TOKEN", "IDENTITY")  # an ambient, unscoped token
+    hctx.filecopy(params(timeout=1800), davs.url("/data/src"), dav2.url("/data/dst"))
+    assert dav2.local("/data/dst").read_bytes() == b"from tls"
+    issued = davs.macaroons[-1]["macaroon"]
+    copy_request = next(r for r in dav2.requests if r.method == "COPY")
+    assert copy_request.header("TransferHeaderAuthorization") == f"Bearer {issued}"
+    assert copy_request.header("TransferHeaderAuthorization") != "Bearer IDENTITY"
+    assert copy_request.header("Credential") == "none"
+
+
 def test_macaroon_refused_then_no_token(
     hctx: xgfalclient.Gfal2Context, davs: WebDAVServer, dav2: WebDAVServer, grid_env: PKI
 ) -> None:

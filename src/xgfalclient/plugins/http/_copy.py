@@ -809,21 +809,36 @@ def _passive_credential(
 
 
 def _far_token(plugin: HTTPPlugin, far: str, write: bool, transfer: Transfer) -> str | None:
-    """A user-set token for ``far``, or one its SE mints when ``RETRIEVE_BEARER_TOKEN`` says so."""
+    """What goes in ``TransferHeaderAuthorization`` to let the active end reach
+    ``far`` - the credential it is handed for the delegated leg.
+
+    A token written into the far URL (``authz=``) is left in its query, as
+    davix leaves it, and is not repeated here. What is left is the *ambient*
+    token, our own, and that is the catch: an SE takes an identity-mapped token
+    (a DiracX token) for a direct read or write, and to mint a macaroon, but
+    refuses it for the delegated server-to-server leg. So where we would
+    forward such a token to an https far end, a macaroon scoped to this one
+    file is minted with it instead - which is also what ``RETRIEVE_BEARER_TOKEN``
+    asks for, so its default becomes "yes, when there is an ambient token to
+    replace". Only if the far end cannot mint one is the ambient token
+    forwarded after all; with no token at all (a proxy copy), nothing changes -
+    no mint, and the gridsite delegation the caller set stands.
+    """
     parsed = parse(far)
     query = parsed.query_dict()
     if "X-Amz-Signature" in query or "AWSAccessKeyId" in query:
         return None
-    found = plugin.client.bearer(far, parsed)
-    if found:
-        return found
+    ambient = plugin.client.bearer(far, parsed)
     retrieve = _se_boolean(plugin.options, far, "RETRIEVE_BEARER_TOKEN")
     if retrieve is None:
-        retrieve = plugin.options.boolean(plugin.option_group, "RETRIEVE_BEARER_TOKEN", False)
-    if not retrieve or parsed.scheme not in ("https", "davs"):
-        return None
-    minutes = 2 * int(transfer.params.timeout) // 60 + 10
-    return se_token(plugin, far, write, minutes)
+        group = plugin.option_group
+        retrieve = plugin.options.boolean(group, "RETRIEVE_BEARER_TOKEN", bool(ambient))
+    if retrieve and parsed.scheme in ("https", "davs"):
+        minutes = 2 * int(transfer.params.timeout) // 60 + 10
+        minted = se_token(plugin, far, write, minutes)
+        if minted:
+            return minted
+    return ambient
 
 
 def _checksum_header(mode: str, checks: int) -> dict[str, str]:
