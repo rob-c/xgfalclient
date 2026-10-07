@@ -4,6 +4,27 @@ Notable user-visible changes are recorded here. The `xgfalclient` version is
 independent of the gfal2 and python3-gfal2 compatibility versions reported by
 the replacement API.
 
+## Unreleased
+
+<!-- At release, rename this heading to "## [0.3.2] - <date>", bump
+     src/xgfalclient/_version.py to 0.3.2, bump the xrdclient pin to match,
+     and add the compare link below. -->
+
+### Fixed
+
+- A doubled slash in a WebDAV request path (`/store//file`, a path-join
+  artifact) is folded to one on the wire, so a strict server (CNAF's StoRM)
+  does not answer `400` where EOS and dCache succeed. The fold is on the
+  non-S3 path only - an S3 key's slashes are literal and signed - and an
+  escaped `%2F` is left alone; the parsed URL is unchanged.
+- A token-authorised third-party copy mints a short-lived macaroon at the far
+  end for the delegated leg instead of forwarding a bare ambient token. An
+  identity-mapped token (a DiracX token) is taken for a direct read or write,
+  and to mint a macaroon, but refused on the server-to-server leg
+  (`_far_token` used to short-circuit on the token, before the
+  `RETRIEVE_BEARER_TOKEN` mint that is on by default); a token in the far
+  URL's query is still left there, and a proxy copy is unchanged.
+
 ## [0.3.1] - 2026-10-06
 
 ### Changed
