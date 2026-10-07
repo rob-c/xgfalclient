@@ -9,7 +9,7 @@ unchanged. Required general-purpose dependencies are `botocore`,
 `PyJWT[crypto]`, `urllib3`, `asn1crypto` and `cryptography`. XML declaration
 checks and binary record readers are local standard-library helpers.
 Native `gssapi` and `krb5` bindings are in the optional `krb5`
-extra; `xrdclient==0.3.1` is required for shared security/parsing and `root://`.
+extra; `xrdclient==0.3.2` is required for shared security/parsing and `root://`.
 Do not add a compiler-dependent package to the default install. CI's
 wheel-only resolution and clean-install jobs cover supported platform families.
 The declared floor is Python 3.10: on 3.9 botocore pins `urllib3<1.27` and

@@ -39,7 +39,7 @@ DIRAC integrations can keep using the interfaces they already know.
 ## Install
 
 Requires Python 3.10+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
-`urllib3`, `asn1crypto`, `cryptography` and the exact-pinned `xrdclient==0.3.1`.
+`urllib3`, `asn1crypto`, `cryptography` and the exact-pinned `xrdclient==0.3.2`.
 (Python 3.9 cannot install botocore together with `urllib3>=2.2`, which is
 why the floor is 3.10; see [platform status](docs/platforms.md).)
 XRootD support is included in the base install. The two clients share one

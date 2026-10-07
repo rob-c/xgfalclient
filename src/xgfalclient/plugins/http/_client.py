@@ -203,8 +203,11 @@ class Target:
         # wire must use that spelling too - and an S3 key's slashes are literal.
         # Elsewhere a doubled slash is a join artifact a WebDAV server folds, so
         # it is folded here too rather than left for a strict one to refuse.
-        quoted = (urllib.parse.quote(urllib.parse.unquote(raw), safe="/") if s3
-                  else _quote_path(_collapse_slashes(raw)))
+        quoted = (
+            urllib.parse.quote(urllib.parse.unquote(raw), safe="/")
+            if s3
+            else _quote_path(_collapse_slashes(raw))
+        )
         query = parsed.query
         return cls(scheme, parsed.host, port, f"{quoted}?{query}" if query else quoted, parsed)
 

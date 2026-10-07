@@ -30,7 +30,7 @@ classifiers = [
 # Maintained libraries provide reusable parsing, transport and security primitives.
 dependencies = [
   # Shared security/parsing APIs and XRootD transport are released together.
-  "xrdclient==0.3.1",
+  "xrdclient==0.3.2",
   "asn1crypto>=1.5.1",
   "botocore>=1.35",
   "cryptography>=45",

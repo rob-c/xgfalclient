@@ -3,7 +3,7 @@
 A release is made from one reviewed commit. The version tag, source version,
 built metadata and installed runtime must all agree.
 
-The current release is **0.3.1**, requiring `xrdclient==0.3.1`. Keep a
+The current release is **0.3.2**, requiring `xrdclient==0.3.2`. Keep a
 version's changelog entry `Unreleased` until its release is approved. The
 declared Python floor is 3.10 (0.3.0 still declared 3.9.2, on which the
 dependencies could not be resolved). See [Platforms](platforms.md) for the

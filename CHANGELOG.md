@@ -4,11 +4,7 @@ Notable user-visible changes are recorded here. The `xgfalclient` version is
 independent of the gfal2 and python3-gfal2 compatibility versions reported by
 the replacement API.
 
-## Unreleased
-
-<!-- At release, rename this heading to "## [0.3.2] - <date>", bump
-     src/xgfalclient/_version.py to 0.3.2, bump the xrdclient pin to match,
-     and add the compare link below. -->
+## [0.3.2] - 2026-10-07
 
 ### Fixed
 
@@ -187,6 +183,7 @@ the replacement API.
 - Failed copies consistently preserve the primary error and apply requested
   destination cleanup.
 
+[0.3.2]: https://github.com/rob-c/xgfalclient/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/rob-c/xgfalclient/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/rob-c/xgfalclient/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rob-c/xgfalclient/compare/v0.1.0...v0.2.0

@@ -6,7 +6,7 @@ on them: ``get_version()`` and the plugin names give gfal2's, and the
 ``gfal2`` module's ``__version__`` is the Python bindings'.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 #: The gfal2 C library release whose behaviour is reproduced.
 GFAL2_VERSION = "2.23.5"
