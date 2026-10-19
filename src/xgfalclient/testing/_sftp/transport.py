@@ -40,7 +40,9 @@ connection thread and from the channel reader thread (a window adjust, a
 rekey), so the outgoing cipher and sequence number are guarded by
 ``send_lock``; receiving happens on one thread at a time (first the
 connection thread, then only the reader). ``kex_lock`` keeps channel data
-from being sent mid-rekey.
+from being sent mid-rekey; the client's channel data that crosses our rekey
+``KEXINIT`` on the wire is handed to the connection layer, not mistaken for
+the client's ``KEXINIT``.
 """
 
 from __future__ import annotations
@@ -229,6 +231,31 @@ class _SSHTransport:
             )
         self.strict = self.strict_initial = True
 
+    def _recv_client_kexinit(self) -> bytes:
+        """The client's ``KEXINIT``, after whatever it sent before it read ours.
+
+        RFC 4253 section 7.1 lets a side go on sending until it has received
+        the peer's ``KEXINIT``, so in a rekey we started, channel traffic the
+        client had already sent arrives first; each such packet goes to
+        :meth:`_before_client_kexinit`. In the initial exchange the only
+        ones are ``IGNORE``/``DEBUG``, which :meth:`_begin_strict` judges
+        once the mode is known (through the sequence number).
+        """
+        payload = self.recv_packet()
+        while payload[0] != _ssh.MSG_KEXINIT:
+            self._before_client_kexinit(payload)
+            payload = self.recv_packet()
+        return payload
+
+    def _before_client_kexinit(self, payload: bytes) -> None:
+        """A packet the client sent before it read our ``KEXINIT``: skipped here.
+
+        The transport alone has no use for one (``IGNORE``, ``DEBUG``); the
+        connection layer overrides this to keep channel data. Nothing may be
+        sent in answer, as only key-exchange messages may follow our
+        ``KEXINIT`` until ``NEWKEYS``.
+        """
+
     def _kex_recv(self, expected: int) -> bytes:
         """The client's next key-exchange packet, checked only in a strict initial KEX.
 
@@ -268,11 +295,7 @@ class _SSHTransport:
         if self._fault("ignore_before_kexinit"):
             self.send_packet(bytes([_ssh.MSG_IGNORE]) + string(b"noise"))
         self.send_packet(server_kexinit)
-        # Our client sends KEXINIT first; IGNORE/DEBUG ahead of it are skipped
-        # here, for _begin_strict to judge once the mode is known.
-        client_kexinit = self.recv_packet()
-        while client_kexinit[0] in (_ssh.MSG_IGNORE, _ssh.MSG_DEBUG):
-            client_kexinit = self.recv_packet()
+        client_kexinit = self._recv_client_kexinit()
         server_lists = _ssh.SSHTransport._parse_kexinit(server_kexinit)
         client_lists = _ssh.SSHTransport._parse_kexinit(client_kexinit)
         if initial:

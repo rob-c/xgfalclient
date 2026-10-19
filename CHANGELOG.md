@@ -509,6 +509,13 @@ xgfalclient now depends on the three shared libraries directly
   11, as conda's Intel macOS Python is): the local reader falls back to
   `os.pread` (`plugins.gridftp.data.positional_reader`) instead of failing
   every data transfer with `AttributeError`.
+- `xgfalclient.testing.sftp.SSHServer`: a rekey it starts no longer reads the
+  client's in-flight channel data as the client's `KEXINIT` (RFC 4253
+  section 7.1 lets a client keep sending until it reads ours); that data is
+  queued and its window credit sent after `NEWKEYS`. A malformed packet now
+  ends the connection instead of leaving the client waiting for ever. CI's
+  macOS `[krb5]` install check tests python-gssapi through
+  `xgfalclient.crypto.krb5`, and that pykrb5 is absent, not `import krb5`.
 
 ### Packaging
 

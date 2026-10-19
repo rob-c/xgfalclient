@@ -116,10 +116,14 @@ jobs:
           /tmp/xgfalclient-portable/bin/python -c 'import xgfalclient, xrdcore.safexml; from xgfalclient._xml import fromstring; assert fromstring is xrdcore.safexml.fromstring and fromstring(b"<doc/>").tag == "doc"'
       - name: Native macOS Kerberos also installs from wheels
         if: runner.os == 'macOS'
+        # The krb5 extra is xrdsec[krb5]: python-gssapi, used through
+        # xrdsec.krb5.gss. pykrb5 (the "krb5" module) was dropped in 0.4.0,
+        # so it must not come in with the extra.
         run: |
           /tmp/xgfalclient-portable/bin/python -m pip install --only-binary=:all: --find-links .dependencies/wheels "$(ls dist/*.whl)[krb5]"
           /tmp/xgfalclient-portable/bin/python -m pip check
-          /tmp/xgfalclient-portable/bin/python -c 'import gssapi, krb5; assert krb5.init_context() is not None'
+          /tmp/xgfalclient-portable/bin/python -c 'from importlib.util import find_spec; assert find_spec("gssapi") is not None and find_spec("krb5") is None'
+          /tmp/xgfalclient-portable/bin/python -c 'from xgfalclient.crypto import krb5; assert krb5.available() is None, krb5.available(); assert krb5.backend() == "gssapi"'
 
   native-kerberos:
     runs-on: ${{ matrix.os }}

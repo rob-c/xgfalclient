@@ -216,6 +216,50 @@ def test_bulk_transfer_and_rekey(tmp_path: Path, hostkey: PrivateKey, strict: bo
     client.close()
 
 
+@pytest.mark.parametrize("strict", [True, False])
+def test_rekey_amid_upload(tmp_path: Path, hostkey: PrivateKey, strict: bool) -> None:
+    # The client writes a whole window of CHANNEL_DATA in one batch, so the
+    # server's KEXINIT goes out with the client's next packets already on the
+    # wire: RFC 4253 section 7.1 lets a side keep sending until it has read
+    # the peer's KEXINIT, and the server must take that data, not misread it
+    # as the client's KEXINIT.
+    from xgfalclient.plugins.sftp import protocol as fx
+    from xgfalclient.plugins.sftp.client import WriteBehind
+
+    payload = os.urandom(3_000_000)
+    server = SSHServer(
+        SFTPServer(tmp_path),
+        hostkey,
+        username="alice",
+        password="pw",
+        rekey_after=4,
+        strict_kex=strict,
+    )
+    endpoint = _endpoint(tmp_path, password="pw")
+    client = _dial(server, endpoint, ssh.Auth(username="alice", password="pw"))
+    handle = client.open(b"/up.bin", fx.FXF_WRITE | fx.FXF_CREAT | fx.FXF_TRUNC)
+    writer = WriteBehind(client, handle)
+    writer.write(0, payload)
+    writer.flush()
+    client.close_handle(handle)
+    assert (tmp_path / "up.bin").read_bytes() == payload
+    client.close()
+
+
+def test_server_hangs_up_on_a_malformed_packet(sftp_root: Path, hostkey: PrivateKey) -> None:
+    # A CHANNEL_DATA without its data string: the server's reader must end
+    # the connection, so the client fails at once rather than wait for ever.
+    server = SSHServer(SFTPServer(sftp_root), hostkey, username="alice", password="pw")
+    endpoint = _endpoint(sftp_root, password="pw")
+    client = _dial(server, endpoint, ssh.Auth(username="alice", password="pw"))
+    transport = client.stream
+    assert isinstance(transport, ssh.SSHTransport)
+    transport._send_packet(bytes([ssh.MSG_CHANNEL_DATA]) + uint32(0))
+    with pytest.raises(GError):
+        client.stat(b"/hello.txt")
+    client.close()
+
+
 def test_upload_flow(tmp_path: Path, hostkey: PrivateKey) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
     from xgfalclient.plugins.sftp.client import WriteBehind

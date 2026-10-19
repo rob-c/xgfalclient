@@ -19,7 +19,9 @@ channel), and a reader thread receives every packet after the channel is
 open (:meth:`_SSHServerConn._run_reader`). They meet in
 ``_SSHServerConn.cond``: the reader appends incoming data and window
 credit, the session waits for them. A forced rekey runs on the reader
-thread, holding ``kex_lock`` so the session's writes pause until it is done.
+thread, holding ``kex_lock`` so the session's writes pause until it is done;
+channel data the client sent before it read our ``KEXINIT`` is queued as
+usual meanwhile, and the window credit it earns waits for ``NEWKEYS``.
 Both threads are daemons; there is no ``stop``, a connection ends when
 either side hangs up.
 """
@@ -352,14 +354,16 @@ class _SSHServerConn(_SSHTransport):
 
         A failure is recorded as ``error`` with ``eof`` set, waking a session
         blocked in :meth:`_chan_read_exact` or :meth:`_chan_write` so it ends
-        too rather than wait forever.
+        too rather than wait forever; the session's end then closes the
+        socket, so the client sees the failure instead of a silent stall. A
+        malformed packet (``ValueError`` from a reader) is such a failure too.
         """
         try:
             while True:
                 payload = self.recv_packet()
                 if not self._dispatch(payload):
                     return
-        except (EOFError, OSError, GError_) as exc:
+        except (EOFError, OSError, GError_, ValueError) as exc:
             with self.cond:
                 self.error = exc
                 self.eof = True
@@ -368,12 +372,28 @@ class _SSHServerConn(_SSHTransport):
     def _dispatch(self, payload: bytes) -> bool:
         """Handle one packet from the client; ``False`` once the channel is closed.
 
-        ``CHANNEL_DATA`` (``uint32 channel, string data``) is queued for the
-        session, the window credited and, the first time the count reaches
-        :attr:`SSHServer.rekey_after`, a rekey started from our side - the
+        The message itself is taken by :meth:`_take_channel_message`. Then,
+        the first time the count of ``CHANNEL_DATA`` packets reaches
+        :attr:`SSHServer.rekey_after`, a rekey is started from our side - the
         case where the client must handle ``KEXINIT`` arriving amid its own
-        data. ``WINDOW_ADJUST`` adds to what we may send. Channel numbers are
-        not checked: there is only one channel.
+        data, and this server the client's data arriving amid the rekey.
+        Last, our window is topped up if due: after the rekey, as nothing but
+        key-exchange messages may go out between our ``KEXINIT`` and ``NEWKEYS``.
+        """
+        still_open = self._take_channel_message(payload)
+        if self._rekey_due():
+            self._key_exchange(initial=False)
+        self._credit_window()
+        return still_open
+
+    def _take_channel_message(self, payload: bytes) -> bool:
+        """Apply one client message to the channel state; ``False`` for ``CHANNEL_CLOSE``.
+
+        ``CHANNEL_DATA`` (``uint32 channel, string data``) is queued for the
+        session and charged to our window, ``WINDOW_ADJUST`` adds to what we
+        may send, ``EOF``/``CLOSE`` end the stream; ``IGNORE``, ``DEBUG`` and
+        anything else are skipped. Nothing is sent from here, so it is safe
+        mid-rekey too. Channel numbers are not checked: there is only one channel.
         """
         code = payload[0]
         if code == _ssh.MSG_CHANNEL_DATA:
@@ -389,16 +409,7 @@ class _SSHServerConn(_SSHTransport):
                 self.inbuf += data
                 self.local_window -= len(data)
                 self.client_packets += 1
-                trigger = (
-                    self.server.rekey_after
-                    and not self.rekeyed
-                    and self.client_packets >= self.server.rekey_after
-                )
                 self.cond.notify_all()
-            self._credit_window()
-            if trigger:
-                self.rekeyed = True
-                self._key_exchange(initial=False)
             return True
         if code == _ssh.MSG_CHANNEL_WINDOW_ADJUST:
             reader = Reader(payload[1:])
@@ -412,8 +423,30 @@ class _SSHServerConn(_SSHTransport):
                 self.eof = True
                 self.cond.notify_all()
             return code != _ssh.MSG_CHANNEL_CLOSE
-        # IGNORE / DEBUG / anything else: skip.
         return True
+
+    def _before_client_kexinit(self, payload: bytes) -> None:
+        """Channel traffic the client sent before it read our rekey ``KEXINIT``: kept.
+
+        RFC 4253 section 7.1 allows it, and a client streaming an upload
+        always has some in flight. It is applied like any other message, and
+        the window credit it earns is sent once the exchange is over (see
+        :meth:`_dispatch`). A ``CHANNEL_CLOSE`` here marks the end of the
+        stream; the exchange then fails on the client's hang-up.
+        """
+        self._take_channel_message(payload)
+
+    def _rekey_due(self) -> bool:
+        """Whether to start our one rekey now (:attr:`SSHServer.rekey_after`); marks it started."""
+        with self.cond:
+            due = (
+                self.server.rekey_after > 0
+                and not self.rekeyed
+                and self.client_packets >= self.server.rekey_after
+            )
+            if due:
+                self.rekeyed = True
+        return due
 
     def _credit_window(self) -> None:
         """Top our window back up once half of it is used, as sshd does.

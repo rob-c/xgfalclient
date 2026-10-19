@@ -6,6 +6,7 @@ Existing applications can use the package unchanged:
 
 ```python
 import gfal2
+
 ctx = gfal2.creat_context()
 ```
 
