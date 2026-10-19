@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """The control channel: replies, protection, login - including what servers get wrong."""
 
 from __future__ import annotations
@@ -6,28 +5,29 @@ from __future__ import annotations
 import base64
 import errno
 import socket
+import ssl
 import struct
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
+from xrdsec.gsi.gss import SecurityContext
 
 import xgfalclient
-from test_gridftp_helpers import (  # noqa: F401 - fixtures
-    FakeServer,
-    _fast_polls,
-    code_of,
-    ftp,
-    gctx,
-    gsi,
-    lines,
-    write,
-)
+from test_gridftp_helpers import FakeServer, code_of, lines, write
+from test_gridftp_helpers import _fast_polls as _fast_polls
+from test_gridftp_helpers import ftp as ftp
+from test_gridftp_helpers import gctx as gctx
+from test_gridftp_helpers import gsi as gsi
 from xgfalclient.errors import ECOMM
 from xgfalclient.plugins.gridftp import control as control_module
 from xgfalclient.plugins.gridftp.control import Control, connect_error
 from xgfalclient.testing.gridftp import GridFTPServer
 from xgfalclient.testing.pki import PKI
+
+#: Control sessions the tests leave mid-failure are hung up at teardown.
+pytestmark = pytest.mark.usefixtures("hang_up_controls")
 
 Ctx = xgfalclient.Gfal2Context
 
@@ -49,7 +49,7 @@ def gsi_control(server: GridFTPServer, pki: PKI, gctx: Ctx) -> Control:
 
 
 def test_connect_error_mapping() -> None:
-    assert connect_error(socket.timeout("slow"), "h", 1).code == errno.ETIMEDOUT
+    assert connect_error(TimeoutError("slow"), "h", 1).code == errno.ETIMEDOUT
     unknown = connect_error(socket.gaierror(8, "nodename nor servname"), "h", 1)
     assert unknown.code == errno.EHOSTUNREACH
     assert unknown.message == "globus_xio: Unable to connect to h:1 nodename nor servname"
@@ -106,7 +106,7 @@ def test_healthy_only_when_in_step() -> None:
     control = Control("127.0.0.1", fake.port, timeout=5)
     control.connect()
     assert not control.healthy()  # the 631 is still in the buffer
-    control.security = _Cleartext()  # type: ignore[assignment]
+    control.security = cast("SecurityContext", _Cleartext())
     assert control.reply().text == "one"
     assert not control.healthy()  # "200 two" came in the same token
     assert control.reply().text == "two"
@@ -239,7 +239,8 @@ def test_gsi_client_still_talking(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeServer(script)
     control = Control("127.0.0.1", fake.port, timeout=5)
     control.connect()
-    code, message = code_of(lambda: control.authenticate(None, None))  # type: ignore[arg-type]
+    tls = cast("ssl.SSLContext", object())  # never used: Talkative stands in for GSI
+    code, message = code_of(lambda: control.authenticate(tls, None))
     assert code == errno.EACCES and "before the client did" in message
     control.close()
     fake.join()

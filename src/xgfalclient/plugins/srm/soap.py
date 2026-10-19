@@ -12,6 +12,15 @@ pointing at a ``<multiRef id="id0">`` elsewhere in the body) and with
 ``xsi:nil`` for absent values, so the reader follows both. Documents carrying
 a DTD are refused outright: SOAP forbids them, and refusing them rules out
 entity-expansion attacks from a hostile endpoint.
+
+This module is shared by both ends: the client (:mod:`.client`) writes
+requests with :func:`request` and reads replies with :func:`parse`, and the
+test server (:mod:`xgfalclient.testing.srm`) does the reverse with
+:func:`response` and :func:`fault`. It knows nothing of particular
+operations; the element names of each request live with the operation in
+:mod:`.client`. What a maintainer must not break: the envelope head is
+compared byte for byte with gfal2's captures, and the reader must keep
+tolerating both gSOAP's plain trees and Axis's multi-references.
 """
 
 from __future__ import annotations
@@ -25,33 +34,35 @@ from typing import Any
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
-from ..._xml import UnsafeXML, fromstring
+from xrdcore.safexml import UnsafeXML, fromstring
+
 from ...errors import ECOMM
 
 __all__ = [
-    "SRM_NS",
-    "SOAP_ENV_NS",
-    "SOAPError",
-    "SOAPFault",
-    "Node",
-    "Fields",
-    "request",
-    "response",
-    "fault",
-    "parse",
-    "errno_for_status",
-    "SUCCESS",
-    "PENDING",
-    "NIL",
     "EBADR",
     "ETIME",
+    "NIL",
+    "PENDING",
     "PERMISSION_MODES",
+    "SOAP_ENV_NS",
+    "SRM_NS",
+    "SUCCESS",
+    "Fields",
+    "Node",
+    "SOAPError",
+    "SOAPFault",
+    "errno_for_status",
+    "fault",
+    "format_time",
+    "parse",
+    "parse_time",
     "permission",
     "permission_bits",
-    "parse_time",
-    "format_time",
+    "request",
+    "response",
 ]
 
+#: The SRM v2.2 WSDL's target namespace (the operation elements only).
 SRM_NS = "http://srm.lbl.gov/StorageResourceManager"
 SOAP_ENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 SOAP_ENC_NS = "http://schemas.xmlsoap.org/soap/encoding/"
@@ -77,6 +88,7 @@ class _Nil:
     """The value of an element sent as ``xsi:nil``, as gSOAP sends absent structs."""
 
     def __repr__(self) -> str:
+        """``NIL``, so field lists read cleanly in test failures."""
         return "NIL"
 
 
@@ -89,9 +101,15 @@ class SOAPError(Exception):
 
 
 class SOAPFault(Exception):
-    """The server answered with a ``<SOAP-ENV:Fault>``."""
+    """The server answered with a ``<SOAP-ENV:Fault>``.
+
+    Servers fault for what their SRM layer never sees, such as a request
+    they cannot parse or a caller their authorisation layer refuses. The
+    transport turns it into ``ECOMM`` with the fault string.
+    """
 
     def __init__(self, code: str, text: str) -> None:
+        """``code`` is the ``faultcode`` (may be ""), ``text`` the ``faultstring``."""
         super().__init__(f"{code}: {text}" if code else text)
         self.code = code
         self.text = text
@@ -103,6 +121,12 @@ class SOAPFault(Exception):
 
 
 def _render(name: str, value: Any, out: list[str]) -> None:
+    """Append element ``name`` holding ``value`` (see :data:`Fields`) to ``out``.
+
+    ``bool`` is tested before ``int`` because it is one, and must be
+    written ``true``/``false``, not ``True``/``1``. Text is XML-escaped; element names are
+    trusted, as they come from this package.
+    """
     if value is None:
         return
     if value is NIL:
@@ -119,6 +143,12 @@ def _render(name: str, value: Any, out: list[str]) -> None:
 
 
 def _envelope(element: str, part: str, fields: Fields, multiref: bool = False) -> bytes:
+    """The whole envelope: ``<srm2:element><part>fields</part></srm2:element>``.
+
+    With ``multiref`` the part is written as Axis writes it, a reference to
+    a ``multiRef`` sibling in the Body, so the test server can exercise the
+    reader's href following.
+    """
     out = [_HEAD, f"<srm2:{element}>"]
     if multiref:
         # Axis style: the part is a reference to a sibling multiRef.
@@ -145,6 +175,7 @@ def response(operation: str, fields: Fields, *, multiref: bool = False) -> bytes
 
 
 def fault(code: str, text: str) -> bytes:
+    """A ``SOAP-ENV:Fault`` envelope, as the test server answers a bad request."""
     return (
         f"{_HEAD}<SOAP-ENV:Fault><faultcode>{escape(code)}</faultcode>"
         f"<faultstring>{escape(text)}</faultstring></SOAP-ENV:Fault>{_TAIL}"
@@ -157,6 +188,11 @@ def fault(code: str, text: str) -> bytes:
 
 
 def _local(tag: str) -> str:
+    """An ElementTree tag without its ``{namespace}``: replies are read by local name.
+
+    Namespaces are ignored on purpose: servers disagree on which elements
+    are qualified, and the local names are unambiguous within a reply.
+    """
     return tag.rpartition("}")[2]
 
 
@@ -164,19 +200,33 @@ _NIL = f"{{{XSI_NS}}}nil"
 
 
 class Node:
-    """An element of a reply, addressed by local names, with hrefs followed."""
+    """An element of a reply, addressed by local names, with hrefs followed.
+
+    Lookups never raise for a missing element: :meth:`get` gives "",
+    :meth:`child` ``None``, :meth:`array` ``[]``, so callers read optional
+    fields without guards and supply their own defaults. That matches
+    gSOAP, which leaves an absent field zero or NULL. A nil element counts
+    as absent.
+    """
 
     __slots__ = ("_ids", "element")
 
     def __init__(self, element: ElementTree.Element, ids: dict[str, ElementTree.Element]) -> None:
+        """Wrap ``element``; ``ids`` maps the Body's ``id`` attributes to elements."""
         self.element = element
         self._ids = ids
 
     @property
     def text(self) -> str:
+        """The element's own text, stripped; "" when it has none."""
         return (self.element.text or "").strip()
 
     def _resolve(self, element: ElementTree.Element) -> ElementTree.Element | None:
+        """``element``, or what its ``href="#id"`` chain points at; ``None`` if nil.
+
+        A dangling reference, or a chain longer than 32 (a loop, from a
+        broken or hostile server), reads as absent rather than failing.
+        """
         seen = 0
         while True:
             href = element.get("href", "")
@@ -213,10 +263,12 @@ class Node:
         return node
 
     def get(self, *names: str, default: str = "") -> str:
+        """The text at the path ``names``, or ``default`` when it is absent."""
         node = self.child(*names)
         return node.text if node is not None else default
 
     def integer(self, *names: str) -> int | None:
+        """The integer at the path ``names``; ``None`` when absent or not a number."""
         text = self.get(*names)
         try:
             return int(text)
@@ -224,6 +276,7 @@ class Node:
             return None
 
     def boolean(self, *names: str) -> bool | None:
+        """An ``xsd:boolean`` (``true``/``false``/``1``/``0``); ``None`` otherwise."""
         text = self.get(*names).lower()
         if text in ("true", "1"):
             return True
@@ -237,9 +290,11 @@ class Node:
         return holder.children(item) if holder is not None else []
 
     def strings(self, container: str, item: str) -> list[str]:
+        """The texts of an ``ArrayOfString``-shaped :meth:`array`."""
         return [node.text for node in self.array(container, item)]
 
     def __iter__(self) -> Iterator[Node]:
+        """Every non-nil child, in document order."""
         return iter(self.children())
 
 
@@ -248,6 +303,13 @@ def parse(data: bytes) -> tuple[str, Node]:
 
     Raises :class:`SOAPFault` for a fault and :class:`SOAPError` for anything
     that is not a well-formed SOAP envelope.
+
+    The operation element is the Body's first child that is not a
+    ``multiRef``; its first child is the part. A reply whose operation
+    element is empty yields an empty part, whose lookups all come back
+    absent, so the client reports a missing status rather than crashing.
+    ``ids`` is collected over the whole Body because Axis puts the
+    referenced ``multiRef`` elements beside the operation, not in it.
     """
     try:
         root = fromstring(data)
@@ -280,7 +342,8 @@ SUCCESS = frozenset({"SRM_SUCCESS", "SRM_FILE_PINNED", "SRM_SPACE_AVAILABLE", "S
 #: Codes that mean "ask again later"; srm-ifce polls while it sees these.
 PENDING = frozenset({"SRM_REQUEST_QUEUED", "SRM_REQUEST_INPROGRESS"})
 
-#: Linux ``errno`` values srm-ifce uses that other systems lack.
+#: Linux ``errno`` values srm-ifce uses that other systems lack (macOS has
+#: no ``EBADR``; it has ``ETIME``), with the nearest portable stand-in.
 EBADR: int = getattr(errno, "EBADR", errno.EINVAL)
 ETIME: int = getattr(errno, "ETIME", errno.ETIMEDOUT)
 
@@ -321,7 +384,8 @@ def errno_for_status(code: str) -> int:
 # Value formats
 # ---------------------------------------------------------------------------
 
-#: ``TPermissionMode`` indexed by the three ``rwx`` bits.
+#: ``TPermissionMode`` indexed by the three ``rwx`` bits (``r`` = 4, ``w`` = 2,
+#: ``x`` = 1), so ``PERMISSION_MODES[6]`` is ``RW``.
 PERMISSION_MODES = ("NONE", "X", "W", "WX", "R", "RX", "RW", "RWX")
 
 
@@ -345,6 +409,8 @@ def permission_bits(mode: str) -> int:
         return 0
 
 
+#: ``xsd:dateTime``: fractional seconds ignored, the zone optional (absent
+#: is read as UTC).
 _TIME = re.compile(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(Z|[+-]\d\d:?\d\d)?$")
 
 
@@ -364,4 +430,5 @@ def parse_time(text: str) -> int:
 
 
 def format_time(epoch: float) -> str:
+    """Unix seconds as an ``xsd:dateTime`` in UTC, as the test server writes times."""
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(epoch))

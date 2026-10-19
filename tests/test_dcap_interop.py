@@ -117,9 +117,10 @@ def test_io(real: xgfalclient.Gfal2Context, base: str) -> None:
     assert code_of(real.open, f"{base}/missing", "r") == errno.ENOENT
     real.rename(url, f"{base}/renamed.bin")
     assert real.stat(f"{base}/renamed.bin").st_size == len(data)
-    entries = dict(
-        (entry.d_name, info) for entry, info in iter(real.opendir(base).readpp, (None, None))
-    )
+    entries = {}
+    for entry, listed in iter(real.opendir(base).readpp, (None, None)):
+        assert entry is not None and listed is not None
+        entries[entry.d_name] = listed
     assert entries["renamed.bin"].st_size == len(data)
 
 
@@ -183,6 +184,7 @@ def test_errors_match_gfal2(real: xgfalclient.Gfal2Context, base: str, gfal2_ctx
         ("open", f"{base}/file", "w"),
     ]
     for name, *args in cases:
+        assert isinstance(name, str)
         with pytest.raises(gfal2.GError) as theirs:
             getattr(gfal2_ctx, name)(*args)
         with pytest.raises(GError) as ours:

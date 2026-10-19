@@ -5,40 +5,70 @@ HTTP read or stat fails, it sends ``HEAD`` with an
 ``Accept: application/metalink4+xml`` header. A ``Link`` response header can
 point at the descriptor, or the response itself can carry a Metalink content
 type. The listed replicas are then tried in order.
+
+Discovery - reading the ``Link`` field - is davix's alone and lives here. The
+descriptor itself is parsed by xrdhttp (:func:`xrdhttp.metalink.parse_metalink`)
+under davix's :data:`POLICY`: every ``<url>`` of the document counts, not just
+those of a single ``<file>``, and only HTTP-family replicas are kept. The
+bounds, ranking and URL resolution are the ones XrdCl's reading uses; an
+error is xrdhttp's message as a :class:`~xgfalclient.GError`.
+
+The plugin drives it (:meth:`~.plugin.HTTPPlugin._metalink_replicas`) and
+caches the result per URL; this module never makes a request itself, so it
+can be tested on header values and documents alone.
 """
 
 from __future__ import annotations
 
-import posixpath
 import re
-import urllib.parse
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
-from ..._compat import SLOTS
-from ..._xml import UnsafeXML, fromstring
+from xrdhttp.metalink import MAX_DESCRIPTOR_SIZE as MAX_DESCRIPTOR_SIZE
+from xrdhttp.metalink import MAX_REPLICAS as MAX_REPLICAS
+from xrdhttp.metalink import MAX_URL_SIZE as MAX_URL_SIZE
+from xrdhttp.metalink import MetalinkError, MetalinkPolicy, resolve
+from xrdhttp.metalink import parse_metalink as _parse
+
 from ...errors import GError
-from ...url import parse, scheme_of
+from ...url import scheme_of
 from ._client import Response, wire_scheme
 
 __all__ = ["ACCEPT", "MAX_DESCRIPTOR_SIZE", "Metalink", "descriptor_url", "parse_metalink"]
 
+#: The media type RFC 5854 registers for Metalink 4, asked for in ``Accept``.
 ACCEPT = "application/metalink4+xml"
-MAX_DESCRIPTOR_SIZE = 8 << 20
-MAX_URL_SIZE = 4096
-MAX_REPLICAS = 10_000
+# ``type=`` and ``rel=`` parameters of one Link value (RFC 8288), each quoted
+# with ``"`` or ``'`` or bare; the three groups are those three spellings.
 _TYPE = re.compile(r"(?:^|;)\s*type\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^;\s]+))", re.I)
 _REL = re.compile(r"(?:^|;)\s*rel\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^;\s]+))", re.I)
 
 
-@dataclass(frozen=True, **SLOTS)
+def _http_replica(url: str) -> bool:
+    """Whether davix can read ``url``: an ``http(s)``, ``dav(s)`` or object-store URL."""
+    return bool(wire_scheme(scheme_of(url)))
+
+
+#: davix's reading of a descriptor; see the module docstring.
+POLICY = MetalinkPolicy(single_file=False, accepts=_http_replica)
+
+
+@dataclass(frozen=True, slots=True)
 class Metalink:
+    """The replicas a descriptor lists, best first, and the size it declares."""
+
     replicas: tuple[str, ...]
     size: int | None = None
 
 
 def descriptor_url(response: Response, origin: str) -> str | None:
-    """The descriptor advertised by one discovery ``HEAD`` response."""
+    """The descriptor advertised by one discovery ``HEAD`` response, or ``None``.
+
+    RFC 6249's way first: a ``Link`` with a Metalink media type whose
+    ``rel`` is ``describedby`` - or that has no ``rel`` at all, accepted
+    from servers that leave it out. Failing that, a response
+    that *is* a Metalink document (its ``Content-Type`` says so) makes the
+    URL its own descriptor. A relative link is resolved against ``origin``.
+    """
     for value in response.headers.get_all("Link", []):
         for target, parameters in _links(value):
             media = _parameter(_TYPE, parameters).lower()
@@ -46,7 +76,7 @@ def descriptor_url(response: Response, origin: str) -> str | None:
             if media.startswith("application/metalink") and (
                 not relations or "describedby" in relations
             ):
-                return _absolute(origin, target)
+                return resolve(origin, target)
     content_type = response.header("Content-Type").lower().split(";", 1)[0].strip()
     if content_type.startswith("application/metalink"):
         return origin
@@ -54,64 +84,28 @@ def descriptor_url(response: Response, origin: str) -> str | None:
 
 
 def parse_metalink(document: bytes, *, base_url: str) -> Metalink:
-    """Parse Metalink 3 or 4 URLs with strict resource limits."""
-    root = _parse_root(document)
-    replicas = _replicas(root, base_url)
-    if not replicas:
-        raise GError("Metalink descriptor contains no usable HTTP replica")
-    return Metalink(replicas, _size(root))
+    """Parse Metalink 3 or 4 URLs with strict resource limits.
 
-
-def _parse_root(document: bytes) -> ET.Element:
-    """Parse a bounded, entity-free Metalink document."""
-    if len(document) > MAX_DESCRIPTOR_SIZE:
-        raise GError(
-            f"Metalink descriptor is {len(document)} bytes; limit is {MAX_DESCRIPTOR_SIZE}"
-        )
+    xrdhttp bounds the document (:data:`MAX_DESCRIPTOR_SIZE`), the number
+    of replicas (:data:`MAX_REPLICAS`) and each URL's length, and refuses a
+    DTD, so a hostile descriptor costs bounded memory. Its message becomes
+    the ``GError``'s (with no errno: callers fall back to the original error).
+    """
     try:
-        root = fromstring(document)
-    except UnsafeXML as exc:
-        raise GError("Metalink descriptors may not declare a DOCTYPE or XML entities") from exc
-    except ET.ParseError as exc:
-        raise GError(f"Malformed Metalink descriptor: {exc}") from None
-    if _local_name(root.tag) != "metalink":
-        raise GError("Metalink document root must be <metalink>")
-    return root
-
-
-def _replicas(root: ET.Element, base_url: str) -> tuple[str, ...]:
-    """Return usable replica URLs in Metalink preference order."""
-    version = (root.get("version") or "4").strip()
-    v3 = version.startswith("3")
-    ranked: list[tuple[int, int, str]] = []
-    for order, node in enumerate(root.iter()):
-        candidate = _ranked_replica(node, base_url, v3, order)
-        if candidate is not None:
-            ranked.append(candidate)
-        if len(ranked) > MAX_REPLICAS:
-            raise GError(f"Metalink contains more than {MAX_REPLICAS} replica URLs")
-    ranked.sort()
-    return tuple(dict.fromkeys(value for _, _, value in ranked))
-
-
-def _ranked_replica(
-    node: ET.Element, base_url: str, v3: bool, order: int
-) -> tuple[int, int, str] | None:
-    if _local_name(node.tag) != "url":
-        return None
-    value = (node.text or "").strip()
-    if not value or len(value.encode()) > MAX_URL_SIZE:
-        return None
-    value = _absolute(base_url, value)
-    if not wire_scheme(scheme_of(value)):
-        return None
-    attribute, default = ("preference", 0) if v3 else ("priority", 999_999)
-    rank = _integer(node.get(attribute), default)
-    return (-rank if v3 else rank, order, value)
+        parsed = _parse(document, base_url=base_url, policy=POLICY)
+    except MetalinkError as exc:
+        raise GError(str(exc)) from None
+    return Metalink(parsed.replicas, parsed.size)
 
 
 def _links(value: str) -> list[tuple[str, str]]:
-    """Split a Link field without treating commas inside ``<...>`` as separators."""
+    """Split a Link field without treating commas inside ``<...>`` as separators.
+
+    Each link is ``(target, parameters)``. A URI may itself contain commas,
+    so a link's parameters end at the last comma before the next ``<``, not
+    at the first. An unterminated ``<`` ends the field: what follows cannot
+    be read reliably, and the links already found are still good.
+    """
     links: list[tuple[str, str]] = []
     at = 0
     while True:
@@ -131,42 +125,8 @@ def _links(value: str) -> list[tuple[str, str]]:
 
 
 def _parameter(pattern: re.Pattern[str], value: str) -> str:
+    """The first value ``pattern`` finds in a parameter list, unquoted; ``""`` if absent."""
     found = pattern.search(value)
     if found is None:
         return ""
     return next((part for part in found.groups() if part is not None), "")
-
-
-def _local_name(tag: str) -> str:
-    return tag.rpartition("}")[2].lower()
-
-
-def _size(root: ET.Element) -> int | None:
-    for node in root.iter():
-        if _local_name(node.tag) == "size":
-            text = (node.text or "").strip()
-            return int(text) if text.isdigit() else None
-    return None
-
-
-def _integer(value: str | None, default: int) -> int:
-    try:
-        return int(value) if value is not None else default
-    except ValueError:
-        return default
-
-
-def _absolute(base: str, reference: str) -> str:
-    if scheme_of(reference):
-        return reference
-    original = parse(base)
-    if reference.startswith("//"):
-        return f"{original.scheme}:{reference}"
-    path = (
-        reference
-        if reference.startswith("/")
-        else posixpath.join(posixpath.dirname(original.path), reference)
-    )
-    path = posixpath.normpath(path)
-    joined = urllib.parse.urlunsplit((wire_scheme(original.scheme), original.netloc, path, "", ""))
-    return original.scheme + joined[joined.index("://") :]

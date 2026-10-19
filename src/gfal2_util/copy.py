@@ -10,4 +10,6 @@ __all__ = ["CommandCopy"]
 
 
 class CommandCopy(base.CommandBase):
+    """gfal2-util's ``CommandCopy``: ``execute_copy`` is ``gfal-copy``."""
+
     execute_copy = base._method(SPECS["copy"])

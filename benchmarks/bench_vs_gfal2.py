@@ -7,13 +7,16 @@ speedup and a one-sided sign-test win. Data cases are MiB/s, metadata cases
 operations per second; higher is better throughout.
 
 Run it next to the servers - in the same container network - never through
-Docker Desktop's port forwarding, which caps any client near 50 MiB/s::
+Docker Desktop's port forwarding, which caps any client near 50 MiB/s. The
+harness and xgfalclient's children run on this interpreter (3.11+);
+gfal2's children run on ``--gfal2-python``, since python3-gfal2 is often
+built only for an older system Python (3.9 on EL9)::
 
-    python3 benchmarks/bench_vs_gfal2.py --base davs://server:8443/data/bench \\
-        --size 1024 --repeat 5 --json results.json
+    python3.11 benchmarks/bench_vs_gfal2.py --base davs://server:8443/data/bench \\
+        --gfal2-python /usr/bin/python3 --size 1024 --repeat 5 --json results.json
 
-    python3 benchmarks/bench_vs_gfal2.py --base davs://server:8443/data/bench \\
-        --repeat 9 --gate --min-ratio 1.10
+    python3.11 benchmarks/bench_vs_gfal2.py --base davs://server:8443/data/bench \\
+        --gfal2-python /usr/bin/python3 --repeat 9 --gate --min-ratio 1.10
 
 ``--base`` is a writable directory URL on the server under test; the
 harness creates or updates its own ``bench*`` fixtures there.
@@ -35,6 +38,7 @@ CASES = ("download", "upload", "stat", "listdir", "checksum")
 GATED_CASES = ("download", "upload", "stat", "listdir")
 
 #: One case, run inside a child interpreter. ``lib`` is gfal2 or xgfalclient.
+#: gfal2's child may be an older Python (3.9 on EL9): keep its syntax to that.
 CHILD = r"""
 import json, os, sys, time
 lib, case, base, local, size, count = sys.argv[1:7]
@@ -80,11 +84,16 @@ print(json.dumps({"value": value, "first_ms": first_ms}))
 """
 
 
+def interpreter(args: argparse.Namespace, lib: str) -> str:
+    """The Python that runs ``lib``'s children: gfal2's bindings may need another."""
+    return str(args.gfal2_python) if lib == "gfal2" else sys.executable
+
+
 def run_child(
-    lib: str, case: str, base: str, local: str, size_mib: int, count: int
+    python: str, lib: str, case: str, base: str, local: str, size_mib: int, count: int
 ) -> dict[str, float]:
     result = subprocess.run(
-        [sys.executable, "-c", CHILD, lib, case, base, local, str(size_mib), str(count)],
+        [python, "-c", CHILD, lib, case, base, local, str(size_mib), str(count)],
         capture_output=True,
         text=True,
         timeout=3600,
@@ -92,17 +101,18 @@ def run_child(
     )
     if result.returncode != 0:
         raise RuntimeError(f"{lib} {case} failed:\n{result.stderr[-2000:]}")
-    return json.loads(result.stdout.strip().splitlines()[-1])  # type: ignore[no-any-return]
+    timings: dict[str, float] = json.loads(result.stdout.strip().splitlines()[-1])
+    return timings
 
 
-def available(lib: str) -> bool:
+def available(lib: str, python: str) -> bool:
     code = f"import {lib} as candidate"
     if lib == "gfal2":
         code += (
             "; import sys; sys.exit(1 if "
             "candidate.creat_context.__module__.startswith('xgfalclient') else 0)"
         )
-    probe = subprocess.run([sys.executable, "-c", code], capture_output=True, check=False)
+    probe = subprocess.run([python, "-c", code], capture_output=True, check=False)
     return probe.returncode == 0
 
 
@@ -119,7 +129,10 @@ def verdict(
     """Whether xgfalclient beats native gfal2 reliably and by the requested ratio."""
     ours, reference = samples["xgfalclient"], samples["gfal2"]
     ratio = statistics.median(ours) / statistics.median(reference)
-    wins = sum(ours_value > reference_value for ours_value, reference_value in zip(ours, reference))
+    wins = sum(
+        ours_value > reference_value
+        for ours_value, reference_value in zip(ours, reference, strict=False)
+    )
     probability = sign_test(wins, len(ours))
     return {
         "passed": ratio >= minimum_ratio and probability <= alpha,
@@ -172,6 +185,11 @@ def parse_args(argv: list[str] | None) -> tuple[argparse.ArgumentParser, argpars
     )
     parser.add_argument("--alpha", type=float, default=0.05, help="sign-test threshold")
     parser.add_argument("--json", help="write the results here too")
+    parser.add_argument(
+        "--gfal2-python",
+        default=sys.executable,
+        help="interpreter with native python3-gfal2 for gfal2's runs (default: this one)",
+    )
     return parser, parser.parse_args(argv)
 
 
@@ -191,7 +209,7 @@ def selection(
 ) -> tuple[list[str], list[str], set[str]]:
     """Available libraries, requested cases and the subset the gate enforces."""
     validate_args(parser, args)
-    libs = [lib for lib in ("gfal2", "xgfalclient") if available(lib)]
+    libs = [lib for lib in ("gfal2", "xgfalclient") if available(lib, interpreter(args, lib))]
     if args.gate and libs != ["gfal2", "xgfalclient"]:
         parser.error(
             "--gate needs native python3-gfal2 and xgfalclient; the gfal2 shim is rejected"
@@ -230,7 +248,9 @@ def measure(
             for round_index in range(args.repeat):
                 order = libs[round_index % len(libs) :] + libs[: round_index % len(libs)]
                 for lib in order:
-                    answer = run_child(lib, case, args.base, local, args.size, args.count)
+                    answer = run_child(
+                        interpreter(args, lib), lib, case, args.base, local, args.size, args.count
+                    )
                     results[case][lib].append(answer["value"])
                     firsts[lib].append(answer["first_ms"])
                     time.sleep(0.5)

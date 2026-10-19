@@ -1,9 +1,11 @@
 """The ``root://`` plugin against a real ``xrootd``, side by side with real gfal2.
 
 A throwaway container from ``gfal-ref:latest`` (AlmaLinux 9: xrootd 5.9.7,
-gfal2 2.23.5 with its xrootd plugin, Python 3.9) runs an ``xrootd`` and, next
-to it, a driver that performs the same operations through ``gfal2`` and
-through ``xgfalclient`` - bind-mounted, with ``xrdclient`` - and reports both.
+gfal2 2.23.5 with its xrootd plugin, plus AppStream Python 3.11; see
+:mod:`_interop_image`) runs an ``xrootd`` and, next to it, a driver that
+performs the same operations through ``gfal2`` (on the system Python 3.9)
+and through ``xgfalclient`` (on 3.11) - bind-mounted, with ``xrdclient`` -
+and reports both.
 Every answer must be identical except the few in :data:`KNOWN`, where gfal2
 is wrong on purpose-free grounds and this package deliberately is not.
 
@@ -30,6 +32,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from _interop_image import GFAL2_PYTHON, XGFAL_PYTHON, library_mounts, xgfal_image, xrdclient_src
 
 pytestmark = [
     pytest.mark.interop,
@@ -82,12 +86,17 @@ cat > /etc/xrd/x.cfg <<'EOF'
 su xrd -s /bin/bash -c "xrootd -b -l /tmp/xrd.log -c /etc/xrd/x.cfg"
 """
 
-#: Runs inside the container: each case through gfal2 and through xgfalclient.
+#: Runs inside the container: each case through gfal2 (``gfal2``, on the
+#: system python3: keep to 3.9 syntax) or through xgfalclient (``ours``, on
+#: python3.11), into ``/io/report_<side>.json``.
 DRIVER = r"""
 import errno, hashlib, json, os, sys
-sys.path[:0] = ["/src/xgfalclient/src", "/src/xrdclient/src"]
-import gfal2
-import xgfalclient
+side = sys.argv[1]
+if side == "ours":
+    sys.path[:0] = ["/src/xgfalclient/src", "/src/xrdclient/src"]
+    import xgfalclient as module
+else:
+    import gfal2 as module
 
 B = "root://localhost:1094/"
 B2 = "root://127.0.0.1:1094/"
@@ -228,30 +237,30 @@ def run(mod, tag):
     return out
 
 
-report = {"gfal2": run(gfal2, "sbs_gfal2"), "ours": run(xgfalclient, "sbs_ours")}
-json.dump(report, open("/io/report.json", "w"), indent=1)
+json.dump(run(module, "sbs_" + side), open("/io/report_%s.json" % side, "w"), indent=1)
 """
 
+#: One side (``gfal2`` on python3, ``ours`` on python3.11) into ``/io/gsi_<side>.json``.
 GSI_DRIVER = r"""
 import json, sys
-sys.path[:0] = ["/src/xgfalclient/src", "/src/xrdclient/src"]
-import gfal2, xgfalclient
-out = {}
-for name, mod in (("gfal2", gfal2), ("ours", xgfalclient)):
-    ctx = mod.creat_context()
-    try:
-        ctx.mkdir_rec("root://localhost:1095//gsi_" + name, 0o755)
-        out[name] = ["ok", ctx.stat("root://localhost:1095//gsi_" + name).st_mode]
-    except mod.GError as e:
-        out[name] = ["err", e.code, e.message]
-json.dump(out, open("/io/gsi.json", "w"))
+name = sys.argv[1]
+if name == "ours":
+    sys.path[:0] = ["/src/xgfalclient/src", "/src/xrdclient/src"]
+    import xgfalclient as mod
+else:
+    import gfal2 as mod
+ctx = mod.creat_context()
+try:
+    ctx.mkdir_rec("root://localhost:1095//gsi_" + name, 0o755)
+    out = ["ok", ctx.stat("root://localhost:1095//gsi_" + name).st_mode]
+except mod.GError as e:
+    out = ["err", e.code, e.message]
+json.dump(out, open("/io/gsi_%s.json" % name, "w"))
 """
 
-
-def _xrdclient_src() -> Path:
-    import xrdclient
-
-    return Path(xrdclient.__file__).resolve().parent.parent
+#: Each side's interpreter: gfal2's bindings are the system python3's, and
+#: this package needs python3.11.
+PYTHONS = {"gfal2": GFAL2_PYTHON, "ours": XGFAL_PYTHON, "xgfalclient": XGFAL_PYTHON}
 
 
 def _docker(*args: str, check: bool = True, timeout: float = 600) -> str:
@@ -267,16 +276,28 @@ def serving() -> Iterator[tuple[str, Path]]:
     name = f"xgfal-xrootd-interop-{os.getpid()}"
     with tempfile.TemporaryDirectory() as io_dir:
         _docker(
-            "run", "-d", "--rm", "--name", name,
-            "-p", "127.0.0.1::1094",
-            "-e", "PYTHONPYCACHEPREFIX=/tmp/pyc",
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            name,
+            "-p",
+            "127.0.0.1::1094",
+            "-e",
+            "PYTHONPYCACHEPREFIX=/tmp/pyc",
             # The package alone: src/ also holds the gfal2 shim, which would
             # shadow the real gfal2 and compare this package with itself.
-            "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
-            "-v", f"{_xrdclient_src()}:/src/xrdclient/src:ro",
-            "-v", f"{io_dir}:/io",
-            IMAGE, "sleep", "infinity",
-        )  # fmt: skip
+            "-v",
+            f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
+            "-v",
+            f"{xrdclient_src()}:/src/xrdclient/src:ro",
+            *library_mounts(),
+            "-v",
+            f"{io_dir}:/io",
+            xgfal_image(IMAGE),
+            "sleep",
+            "infinity",
+        )
         try:
             _docker("exec", name, "bash", "-c", START.format(config=SERVER_CONFIG))
             time.sleep(1)
@@ -294,8 +315,11 @@ def container() -> Iterator[tuple[str, Path]]:
 def run_driver(container: tuple[str, Path]) -> dict[str, dict[str, Any]]:
     name, io_dir = container
     (io_dir / "driver.py").write_text(DRIVER)
-    _docker("exec", name, "python3", "/io/driver.py", timeout=900)
-    return json.loads((io_dir / "report.json").read_text())  # type: ignore[no-any-return]
+    report: dict[str, dict[str, Any]] = {}
+    for side in ("gfal2", "ours"):
+        _docker("exec", name, PYTHONS[side], "/io/driver.py", side, timeout=900)
+        report[side] = json.loads((io_dir / f"report_{side}.json").read_text())
+    return report
 
 
 def differences(report: dict[str, dict[str, Any]]) -> dict[str, tuple[Any, Any]]:
@@ -351,17 +375,31 @@ def test_gsi_with_a_proxy_found_as_gfal2_finds_it(tmp_path: Path) -> None:
     io_dir.mkdir()
     (io_dir / "gsi.py").write_text(GSI_DRIVER)
     _docker(
-        "run", "-d", "--rm", "--name", name,
-        "-e", "PYTHONPYCACHEPREFIX=/tmp/pyc",
-        "-e", "X509_USER_PROXY=/pki/x509up_rfc",
-        "-e", "X509_CERT_DIR=/pki/certificates",
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        name,
+        "-e",
+        "PYTHONPYCACHEPREFIX=/tmp/pyc",
+        "-e",
+        "X509_USER_PROXY=/pki/x509up_rfc",
+        "-e",
+        "X509_CERT_DIR=/pki/certificates",
         # The package alone, so that ``import gfal2`` is the real one.
-        "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
-        "-v", f"{_xrdclient_src()}:/src/xrdclient/src:ro",
-        "-v", f"{tmp_path / 'pki'}:/pki-ro:ro",
-        "-v", f"{io_dir}:/io",
-        IMAGE, "sleep", "infinity",
-    )  # fmt: skip
+        "-v",
+        f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
+        "-v",
+        f"{xrdclient_src()}:/src/xrdclient/src:ro",
+        *library_mounts(),
+        "-v",
+        f"{tmp_path / 'pki'}:/pki-ro:ro",
+        "-v",
+        f"{io_dir}:/io",
+        xgfal_image(IMAGE),
+        "sleep",
+        "infinity",
+    )
     try:
         # xrootd insists the host key belongs to its own user and nobody else.
         prepare = (
@@ -371,8 +409,10 @@ def test_gsi_with_a_proxy_found_as_gfal2_finds_it(tmp_path: Path) -> None:
         )
         _docker("exec", name, "bash", "-c", prepare)
         time.sleep(1)
-        _docker("exec", "-u", "xrd", name, "python3", "/io/gsi.py", timeout=300)
-        result = json.loads((io_dir / "gsi.json").read_text())
+        result: dict[str, Any] = {}
+        for side in ("gfal2", "ours"):
+            _docker("exec", "-u", "xrd", name, PYTHONS[side], "/io/gsi.py", side, timeout=300)
+            result[side] = json.loads((io_dir / f"gsi_{side}.json").read_text())
     finally:
         _docker("rm", "-f", name, check=False)
     assert result["ours"] == result["gfal2"]
@@ -493,16 +533,30 @@ def test_a_delegated_pull_is_tpc_lite_as_in_gfal2(tmp_path: Path) -> None:
     io_dir.mkdir()
     (io_dir / "lite.py").write_text(LITE_DRIVER)
     _docker(
-        "run", "-d", "--rm", "--name", name,
-        "-e", "PYTHONPYCACHEPREFIX=/tmp/pyc",
-        "-e", "X509_USER_PROXY=/pki/x509up_rfc",
-        "-e", "X509_CERT_DIR=/pki/certificates",
-        "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
-        "-v", f"{_xrdclient_src()}:/src/xrdclient/src:ro",
-        "-v", f"{tmp_path / 'pki'}:/pki-ro:ro",
-        "-v", f"{io_dir}:/io",
-        IMAGE, "sleep", "infinity",
-    )  # fmt: skip
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        name,
+        "-e",
+        "PYTHONPYCACHEPREFIX=/tmp/pyc",
+        "-e",
+        "X509_USER_PROXY=/pki/x509up_rfc",
+        "-e",
+        "X509_CERT_DIR=/pki/certificates",
+        "-v",
+        f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
+        "-v",
+        f"{xrdclient_src()}:/src/xrdclient/src:ro",
+        *library_mounts(),
+        "-v",
+        f"{tmp_path / 'pki'}:/pki-ro:ro",
+        "-v",
+        f"{io_dir}:/io",
+        xgfal_image(IMAGE),
+        "sleep",
+        "infinity",
+    )
     runs = {
         "theirs": ("gfal2", "1"),
         "ours": ("xgfalclient", "1"),
@@ -517,9 +571,8 @@ def test_a_delegated_pull_is_tpc_lite_as_in_gfal2(tmp_path: Path) -> None:
         time.sleep(2)
         for tag, (client, delegate) in runs.items():
             env = ["-e", f"XrdSecGSIDELEGPROXY={delegate}"] if delegate else []
-            _docker(
-                "exec", "-u", "xrd", *env, name, "python3", "/io/lite.py", client, tag, timeout=600
-            )
+            script = [PYTHONS[client], "/io/lite.py", client, tag]
+            _docker("exec", "-u", "xrd", *env, name, *script, timeout=600)
         found = {tag: json.loads((io_dir / f"lite_{tag}.json").read_text()) for tag in runs}
         log = _docker("exec", name, "bash", "-c", "cat /tmp/*.log /tmp/*/*.log", check=False)
     finally:
@@ -597,13 +650,24 @@ def test_a_stopped_pull_stops_at_the_destination_as_in_gfal2(tmp_path: Path) -> 
     io_dir.mkdir()
     (io_dir / "slow.py").write_text(SLOW_DRIVER)
     _docker(
-        "run", "-d", "--rm", "--name", name,
-        "-e", "PYTHONPYCACHEPREFIX=/tmp/pyc",
-        "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
-        "-v", f"{_xrdclient_src()}:/src/xrdclient/src:ro",
-        "-v", f"{io_dir}:/io",
-        IMAGE, "sleep", "infinity",
-    )  # fmt: skip
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        name,
+        "-e",
+        "PYTHONPYCACHEPREFIX=/tmp/pyc",
+        "-v",
+        f"{ROOT / 'src' / 'xgfalclient'}:/src/xgfalclient/src/xgfalclient:ro",
+        "-v",
+        f"{xrdclient_src()}:/src/xrdclient/src:ro",
+        *library_mounts(),
+        "-v",
+        f"{io_dir}:/io",
+        xgfal_image(IMAGE),
+        "sleep",
+        "infinity",
+    )
     try:
         start = START.format(config=SLOW_CONFIG).replace(
             "chown xrd /data", "head -c 20000000 /dev/urandom > /data/big.bin\nchown -R xrd /data"
@@ -613,7 +677,7 @@ def test_a_stopped_pull_stops_at_the_destination_as_in_gfal2(tmp_path: Path) -> 
         found = {}
         logs = {}
         for tag, client in (("theirs", "gfal2"), ("ours", "xgfalclient")):
-            _docker("exec", name, "python3", "/io/slow.py", client, tag, timeout=300)
+            _docker("exec", name, PYTHONS[client], "/io/slow.py", client, tag, timeout=300)
             found[tag] = json.loads((io_dir / f"slow_{tag}.json").read_text())
             logs[tag] = _docker("exec", name, "cat", "/tmp/xrd.log")
     finally:

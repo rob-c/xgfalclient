@@ -9,8 +9,10 @@ import os
 import signal
 import sys
 import threading
+import time
 import types
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -138,7 +140,7 @@ def test_file_listing_falls_back_to_scandir(
     ctx: Gfal2Context, data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (data_dir / "sub").mkdir()
-    monkeypatch.setattr(file_plugin._libc, "READER", None)
+    monkeypatch.setattr(_libc, "READER", None)
     base = file_url(data_dir)
     assert ctx.listdir(base) == [".", "..", *os.listdir(data_dir)]
     entries = {e.d_name: e.d_type for e in ctx.opendir(base)}
@@ -150,7 +152,7 @@ def test_file_listing_falls_back_to_scandir(
         def stat(self, follow_symlinks: bool = True) -> os.stat_result:
             raise FileNotFoundError(errno.ENOENT, "gone")
 
-    monkeypatch.setattr(file_plugin.os, "scandir", lambda path: iter([Gone()]))
+    monkeypatch.setattr(os, "scandir", lambda path: iter([Gone()]))
     assert file_plugin._scandir(str(data_dir))[-1] == ("gone", 0)
 
 
@@ -236,7 +238,7 @@ def test_libc_load(monkeypatch: pytest.MonkeyPatch) -> None:
     def refuse(*args: Any, **kwargs: Any) -> Any:
         raise OSError("no libc")
 
-    monkeypatch.setattr(_libc.ctypes, "CDLL", refuse)
+    monkeypatch.setattr(ctypes, "CDLL", refuse)
     assert _libc._open() is None
 
 
@@ -253,7 +255,8 @@ def test_file_listing_reports_each_entrys_own_type(ctx: Gfal2Context, data_dir: 
     for _ in range(6):  # ., .., hello.txt, link, fifo, then the end
         entry, info = directory.readpp()
         if entry is not None:
-            found[entry.d_name] = (entry.d_type, info.st_size)  # type: ignore[union-attr]
+            assert info is not None
+            found[entry.d_name] = (entry.d_type, info.st_size)
     assert found["link"] == (10, 12)  # its stat is the target's
 
 
@@ -298,9 +301,7 @@ def test_file_io_errors_are_worded_as_gfal2(ctx: Gfal2Context, data_dir: Path) -
 
 def test_file_pwrite_retries_short_writes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     real = os.pwrite
-    monkeypatch.setattr(
-        file_plugin.os, "pwrite", lambda fd, data, offset: real(fd, bytes(data[:2]), offset)
-    )
+    monkeypatch.setattr(os, "pwrite", lambda fd, data, offset: real(fd, bytes(data[:2]), offset))
     handle = LocalFile("file://x", str(tmp_path / "f"), O_WRONLY | O_CREAT, 0o644)
     assert handle.pwrite(b"abcdefg", 0) == 7
     handle.close()
@@ -312,7 +313,7 @@ def test_file_pwrite_retries_short_writes(monkeypatch: pytest.MonkeyPatch, tmp_p
 
 
 def test_file_pwrite_refuses_zero_progress(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(file_plugin.os, "pwrite", lambda *_: 0)
+    monkeypatch.setattr(os, "pwrite", lambda *_: 0)
     handle = LocalFile("file://x", str(tmp_path / "f"), O_WRONLY | O_CREAT, 0o644)
     try:
         with pytest.raises(GError) as caught:
@@ -377,16 +378,14 @@ def test_file_checksum_of_large_files(ctx: Gfal2Context, tmp_path: Path) -> None
 def test_file_xattrs(ctx: Gfal2Context, data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     url = file_url(data_dir / "hello.txt")
     store: dict[str, bytes] = {}
+    monkeypatch.setattr(os, "setxattr", lambda p, n, v, f: store.__setitem__(n, v), raising=False)
     monkeypatch.setattr(
-        file_plugin.os, "setxattr", lambda p, n, v, f: store.__setitem__(n, v), raising=False
-    )
-    monkeypatch.setattr(
-        file_plugin.os,
+        os,
         "getxattr",
         lambda p, n: store[n] if n in store else _enodata(),
         raising=False,
     )
-    monkeypatch.setattr(file_plugin.os, "listxattr", lambda p: list(store), raising=False)
+    monkeypatch.setattr(os, "listxattr", lambda p: list(store), raising=False)
     assert ctx.setxattr(url, "user.k", "v", 0) == 0
     assert ctx.getxattr(url, "user.k") == "v"
     assert ctx.listxattr(url) == ["user.k"]
@@ -403,7 +402,7 @@ def test_file_xattrs_without_os_support(
     ctx: Gfal2Context, data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for name in ("getxattr", "setxattr", "listxattr"):
-        monkeypatch.delattr(file_plugin.os, name, raising=False)
+        monkeypatch.delattr(os, name, raising=False)
     url = file_url(data_dir / "hello.txt")
     assert ctx.listxattr(url) == []
     with pytest.raises(GError) as caught:
@@ -436,14 +435,12 @@ def test_file_access_reports_the_real_errno(
         with pytest.raises(GError) as caught:
             ctx.access(base + path, mode)
         assert (caught.value.code, caught.value.message) == (code, _local(code))
-    monkeypatch.setattr(file_plugin.os, "access", lambda path, mode: False)
-    monkeypatch.setattr(
-        file_plugin.os, "statvfs", lambda path: types.SimpleNamespace(f_flag=os.ST_RDONLY)
-    )
+    monkeypatch.setattr(os, "access", lambda path, mode: False)
+    monkeypatch.setattr(os, "statvfs", lambda path: types.SimpleNamespace(f_flag=os.ST_RDONLY))
     with pytest.raises(GError) as caught:
         ctx.access(base + "/afile", os.W_OK)
     assert caught.value.code == errno.EROFS
-    monkeypatch.setattr(file_plugin.os, "statvfs", lambda path: types.SimpleNamespace(f_flag=0))
+    monkeypatch.setattr(os, "statvfs", lambda path: types.SimpleNamespace(f_flag=0))
     with pytest.raises(GError) as caught:
         ctx.access(base + "/afile", os.W_OK)
     assert caught.value.code == errno.EACCES
@@ -461,7 +458,8 @@ def test_file_listing_follows_links(ctx: Gfal2Context, tmp_path: Path) -> None:
         if dirent is None:
             break
         found[dirent.d_name] = info
-    assert found["lnk"].st_size == 6 and found["lnk"].is_file()  # the target, as gfal2 shows it
+    lnk = found["lnk"]
+    assert lnk is not None and lnk.st_size == 6 and lnk.is_file()  # the target, as gfal2 shows it
     (tmp_path / "gone").symlink_to(tmp_path / "nothere")
     directory = ctx.opendir(base)
     with pytest.raises(GError) as caught:  # gfal2 aborts the long listing here too
@@ -543,7 +541,7 @@ def entries(ctx: Gfal2Context, url: str) -> list[tuple[str, str, int]]:
 def slept(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """Record, rather than sleep, the mock plugin's waits."""
     calls: list[float] = []
-    monkeypatch.setattr(mock_module.time, "sleep", calls.append)
+    monkeypatch.setattr(time, "sleep", calls.append)
     return calls
 
 
@@ -678,17 +676,19 @@ def test_mock_namespace(ctx: Gfal2Context, slept: list[float]) -> None:
         ctx.unlink(M + "?errno=13")
     assert caught.value.code == errno.EACCES
     results = ctx.unlink([M + "?errno=2", M])
-    assert isinstance(results, list) and results[0].code == errno.ENOENT and results[1] is None
-    for call in (
+    assert isinstance(results, list) and isinstance(results[0], GError)
+    assert results[0].code == errno.ENOENT and results[1] is None
+    unsupported: tuple[Callable[[], object], ...] = (
         lambda: ctx.rmdir(M + "/d?list=a"),
         lambda: ctx.rename(M + "/a", M + "/b"),
         lambda: ctx.chmod(M + "/a", 0o700),
         lambda: ctx.listxattr(M),
         lambda: ctx.setxattr(M, "user.x", "1", 0),
         lambda: ctx.token_retrieve(M, "", 60, False),
-    ):
+    )
+    for refused in unsupported:
         with pytest.raises(GError) as caught:
-            call()
+            refused()
         assert caught.value.code == errno.EPROTONOSUPPORT
 
 
@@ -908,14 +908,14 @@ def test_mock_copy_checksums(ctx: Gfal2Context) -> None:
         (target, "aa", "", "bb", "User and destination checksums do not match"),
         (target, "aa", "", "aa", None),
     ):
-        settings = {"checksum": (mode, "ADLER32", user)}
+        checksum = (mode, "ADLER32", user)
         pair = (src.replace("aa", src_sum), dst + dst_sum)
         events: list[tuple[str, str]] = []
         if message is None:
-            copy_events(ctx, *pair, events, **settings)
+            copy_events(ctx, *pair, events, checksum=checksum)
             continue
         with pytest.raises(GError) as caught:
-            copy_events(ctx, *pair, events, **settings)
+            copy_events(ctx, *pair, events, checksum=checksum)
         assert (caught.value.code, caught.value.message) == (errno.EIO, message)
         # a source mismatch fails before the copy starts
         started = any(stage == "TRANSFER:ENTER" for stage, _ in events)
@@ -973,15 +973,28 @@ class Unavailable(Plugin):
         return "needs the missing package"
 
 
+class _FakePlugins(types.ModuleType):
+    """A module the registry is pointed at: plugin classes, and things that are not."""
+
+    ThirdParty: type
+    Unavailable: type
+    NotAPlugin: type
+    NotAClass: str
+
+
 def test_registry_loads_what_it_can(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    fake = types.ModuleType("fake_plugins")
-    fake.ThirdParty = ThirdParty  # type: ignore[attr-defined]
-    fake.Unavailable = Unavailable  # type: ignore[attr-defined]
-    fake.NotAPlugin = object  # type: ignore[attr-defined]
-    fake.NotAClass = "not even a class"  # type: ignore[attr-defined]
-    fake.__getattr__ = lambda name: (_ for _ in ()).throw(RuntimeError("broken module"))  # type: ignore[attr-defined]
+    fake = _FakePlugins("fake_plugins")
+    fake.ThirdParty = ThirdParty
+    fake.Unavailable = Unavailable
+    fake.NotAPlugin = object
+    fake.NotAClass = "not even a class"
+
+    def broken(name: str) -> object:
+        raise RuntimeError("broken module")
+
+    monkeypatch.setattr(fake, "__getattr__", broken, raising=False)
     monkeypatch.setitem(sys.modules, "fake_plugins", fake)
     monkeypatch.setattr(
         plugins,
@@ -1017,8 +1030,8 @@ def test_builtin_entries_describe_their_classes() -> None:
 
 
 def test_plugins_load_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = types.ModuleType("fake_lazy")
-    fake.ThirdParty = ThirdParty  # type: ignore[attr-defined]
+    fake = _FakePlugins("fake_lazy")
+    fake.ThirdParty = ThirdParty
     monkeypatch.setitem(sys.modules, "fake_lazy", fake)
     monkeypatch.setattr(
         plugins, "BUILTIN", [plugins.Entry("fake_lazy", "ThirdParty", "third", ("third",), 1)]
@@ -1042,8 +1055,8 @@ def test_plugins_load_lazily(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_duplicate_entry_points_load_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = types.ModuleType("fake_dup")
-    fake.ThirdParty = ThirdParty  # type: ignore[attr-defined]
+    fake = _FakePlugins("fake_dup")
+    fake.ThirdParty = ThirdParty
     monkeypatch.setitem(sys.modules, "fake_dup", fake)
     monkeypatch.setattr(
         plugins, "BUILTIN", [plugins.Entry("fake_dup", "ThirdParty", "third", ("third",), 1)]
@@ -1067,8 +1080,8 @@ class _Selectable:
 
 
 def test_registry_entry_points_in_both_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = types.ModuleType("fake_ep")
-    fake.ThirdParty = ThirdParty  # type: ignore[attr-defined]
+    fake = _FakePlugins("fake_ep")
+    fake.ThirdParty = ThirdParty
     monkeypatch.setitem(sys.modules, "fake_ep", fake)
     entry = _Entry("fake_ep:ThirdParty")
     unloadable = _Entry("no.such.module:X")
@@ -1097,32 +1110,42 @@ def test_registry_entry_points_in_both_shapes(monkeypatch: pytest.MonkeyPatch) -
     assert later.get_plugin_names() == later.get_plugin_names()
 
 
+class _Recording(logging.Handler):
+    """A handler that keeps every record it is given."""
+
+    def __init__(self, records: list[logging.LogRecord]) -> None:
+        super().__init__()
+        self.records = records
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
 # -- package level ---------------------------------------------------------------------------
 
 
 def test_package_functions(monkeypatch: pytest.MonkeyPatch) -> None:
     assert xgfalclient.get_version() == "2.23.5"  # gfal2's, which callers gate on
-    gfal2 = logging.getLogger("gfal2")
-    assert any(isinstance(h, logging.NullHandler) for h in gfal2.handlers)
-    level = gfal2.level
+    logger = logging.getLogger("gfal2")
+    assert any(isinstance(h, logging.NullHandler) for h in logger.handlers)
+    level = logger.level
     records: list[logging.LogRecord] = []
-    handler = logging.Handler()
-    handler.emit = records.append  # type: ignore[method-assign]
-    gfal2.addHandler(handler)
-    gfal2.setLevel(logging.DEBUG)  # the application's choice; gfal2's threshold still applies
+    handler = _Recording(records)
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)  # the application's choice; gfal2's threshold still applies
     try:
-        gfal2.debug("hidden")
+        logger.debug("hidden")
         assert xgfalclient.set_verbose(xgfalclient.verbose_level.debug) == 0
-        gfal2.debug("shown")
+        logger.debug("shown")
         xgfalclient.set_verbose(xgfalclient.verbose_level.normal)
-        gfal2.warning("hidden")
-        gfal2.error("shown")
+        logger.warning("hidden")
+        logger.error("shown")
         xgfalclient.set_verbose(12345)
-        gfal2.debug("shown")
-        assert gfal2.level == logging.DEBUG  # set_verbose never touches the logger's level
+        logger.debug("shown")
+        assert logger.level == logging.DEBUG  # set_verbose never touches the logger's level
     finally:
-        gfal2.setLevel(level)
-        gfal2.removeHandler(handler)
+        logger.setLevel(level)
+        logger.removeHandler(handler)
         xgfalclient.set_verbose(xgfalclient.verbose_level.verbose)
     assert [r.getMessage() for r in records] == ["shown"] * 3
     credential = xgfalclient.cred_new("BEARER", "t")
@@ -1133,7 +1156,7 @@ def test_package_functions(monkeypatch: pytest.MonkeyPatch) -> None:
     assert xgfalclient.NullHandler is logging.NullHandler
     monkeypatch.delitem(sys.modules, "gfal2", raising=False)
     xgfalclient.install_as_gfal2()
-    import gfal2  # type: ignore[import-not-found]
+    import gfal2
 
     assert gfal2.Gfal2Context is xgfalclient.Gfal2Context and gfal2.__version__ == "1.13.1"
     assert gfal2.creat_context().get_plugin_names()

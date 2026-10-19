@@ -48,17 +48,26 @@ from ...errors import GError
 from ...plugin import O_ACCMODE_MASK, O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Plugin, PluginFile
 from ...types import Stat
 from .control import UID, ControlConnection, Door
-from .file import DataChannel, DcapFile, await_data, callback_listener, read_listing
+from .file import (
+    DataChannel,
+    DcapFile,
+    DoorSession,
+    await_data,
+    callback_listener,
+    read_listing,
+)
 from .protocol import DcapURL, Reply, error_code, parse_stat, parse_url, quote
 from .tunnel import tunnel_factory, unavailable
 
-__all__ = ["DcapPlugin", "KdcapPlugin", "GROUP", "parse_listing"]
+__all__ = ["GROUP", "DcapPlugin", "KdcapPlugin", "parse_listing"]
 
+#: gfal2's configuration group for this plugin (``[DCAP PLUGIN]``).
 GROUP = "DCAP PLUGIN"
 
 #: libdcap's ``dc_errno`` for "the server sent an error message" (``DESRVMSG``).
 _DESRVMSG = 30
 
+# The process umask, cached by process_umask(); a list so the first reader fills it.
 _umask_lock = threading.Lock()
 _umask: list[int] = []
 
@@ -88,7 +97,14 @@ def parse_listing(data: bytes) -> list[str]:
 
 
 class DcapPlugin(Plugin):
-    """dCache's dcap protocol, plain and GSI."""
+    """dCache's dcap protocol, plain and GSI.
+
+    One plugin instance per context keeps a :class:`~.control.Door` (a pool
+    of control connections) per door and credential; :meth:`close` closes
+    them all. Namespace calls borrow a connection for one request; an open
+    file keeps one until it is closed. Thread-safe: the door table has its
+    own lock, and each connection is used by one caller at a time.
+    """
 
     name = "dcap"
     schemes: ClassVar[tuple[str, ...]] = ("dcap", "gsidcap")
@@ -99,13 +115,24 @@ class DcapPlugin(Plugin):
     event_domain = "dcap"
 
     def __init__(self, context: Any) -> None:
+        """No connection is made until the first request for a door."""
         super().__init__(context)
+        #: ``(scheme, host, port, credential) -> Door``.
         self._doors: dict[tuple[object, ...], Door] = {}
         self._lock = threading.Lock()
 
     # -- connections -----------------------------------------------------------------
 
     def _door(self, url: DcapURL) -> Door:
+        """The pool for ``url``'s door, created on first use.
+
+        The credential is part of the key (for tunnelled schemes), so that a
+        connection authenticated with one credential is never reused for a
+        request made with another. ``tunnel_factory`` raises ``EPROTONOSUPPORT`` here
+        for a scheme without a tunnel. A new connection gets a fresh tunnel
+        (each security context belongs to one socket) and the context's
+        timeout.
+        """
         factory = tunnel_factory(url.scheme)
         credential = self.context.x509(url.url(url.path)) if factory is not None else None
         key = (url.scheme, url.host.lower(), url.port, credential)
@@ -114,13 +141,15 @@ class DcapPlugin(Plugin):
             if door is None:
 
                 def connect() -> ControlConnection:
+                    """A new authenticated connection to this door."""
                     tunnel = factory(self, url) if factory is not None else None
                     return ControlConnection.open(url, tunnel, self.option_timeout())
 
-                door = self._doors[key] = Door(url, connect)
+                door = self._doors[key] = Door(url, connect, self.context)
             return door
 
     def close(self) -> None:
+        """Close every idle control connection; files still open keep theirs."""
         with self._lock:
             doors, self._doors = list(self._doors.values()), {}
         for door in doors:
@@ -142,12 +171,14 @@ class DcapPlugin(Plugin):
         target = quote(parsed.wire())
 
         def exchange(conn: ControlConnection, session: int) -> Reply:
+            """``<session> 0 client <verb> "<url>"<extra> -uid=N``, and its answer."""
             conn.send_line(f"{session} 0 client {verb} {target}{extra} -uid={UID}")
             return conn.wait(session)
 
         return self._door(parsed).call(exchange)
 
     def _simple(self, url: str, verb: str, extra: str = "") -> None:
+        """A request answered by ``ok`` or ``failed``; the latter is raised."""
         reply = self._request(url, verb, extra)
         if reply.verb == "failed":
             raise self._failure(reply)
@@ -155,6 +186,10 @@ class DcapPlugin(Plugin):
     # -- namespace -------------------------------------------------------------------
 
     def _stat(self, operation: str, url: str) -> Stat:
+        """``stat`` or ``lstat``: the door's ``-st_*`` options, or ``ENOENT``.
+
+        Any answer other than ``stat`` or ``failed`` is ``EPROTO``.
+        """
         reply = self._request(url, operation)
         if reply.verb == "failed":
             # dc_stat() sets errno to ENOENT whatever the door said.
@@ -164,9 +199,11 @@ class DcapPlugin(Plugin):
         return parse_stat(reply.args)
 
     def stat(self, url: str) -> Stat:
+        """``dc_stat``: the door's view, symbolic links followed."""
         return self._stat("stat", url)
 
     def lstat(self, url: str) -> Stat:
+        """``dc_lstat``: as :meth:`stat`, but a link describes itself."""
         return self._stat("lstat", url)
 
     def access(self, url: str, mode: int) -> None:
@@ -200,16 +237,20 @@ class DcapPlugin(Plugin):
                 )
 
     def mkdir(self, url: str, mode: int) -> None:
+        """``dc_mkdir`` of one level; a failure carries the door's errno."""
         # libdcap applies the process umask and sends the mode in decimal.
         self._simple(url, "mkdir", f" -mode={mode & ~process_umask() & 0o7777}")
 
     def chmod(self, url: str, mode: int) -> None:
+        """``dc_chmod``: the permission bits only (no umask), in decimal as libdcap sends them."""
         self._simple(url, "chmod", f" -mode={mode & 0o7777}")
 
     def rmdir(self, url: str) -> None:
+        """``dc_rmdir``; a non-empty directory is ``ENOTEMPTY`` (see :func:`error_code`)."""
         self._simple(url, "rmdir")
 
     def unlink(self, url: str) -> None:
+        """``dc_unlink`` of a file; a failure carries the door's errno."""
         self._simple(url, "unlink")
 
     def rename(self, old: str, new: str) -> None:
@@ -235,6 +276,7 @@ class DcapPlugin(Plugin):
         timeout = float(self.option_timeout())
 
         def exchange(conn: ControlConnection, session: int) -> DataChannel:
+            """``opendir`` with the callback address; the lister's connection."""
             listener, host, port = callback_listener(conn)
             try:
                 conn.send_line(f"{session} 0 client opendir {target} {host} {port} -uid={UID}")
@@ -253,6 +295,15 @@ class DcapPlugin(Plugin):
     # -- file I/O ----------------------------------------------------------------------
 
     def open(self, url: str, flags: int, mode: int = 0o644, size: int | None = None) -> PluginFile:
+        """``dc_open``: a :class:`~.file.DcapFile` on a pool's data connection.
+
+        ``O_RDONLY``/``O_WRONLY``/``O_RDWR`` map to ``r``/``w``/``rw``; with
+        ``O_CREAT`` the mode is sent in octal (``-mode=0644``, unlike
+        ``mkdir``'s decimal, as libdcap does) and ``O_TRUNC`` adds
+        ``-truncate``. ``size`` is ignored: dcap has no way to announce one.
+        dCache files are write-once: the door refuses to open an existing,
+        non-empty file for writing unless ``-truncate`` is sent and allowed.
+        """
         parsed = parse_url(url)
         target = quote(parsed.wire())
         access = flags & O_ACCMODE_MASK
@@ -266,6 +317,7 @@ class DcapPlugin(Plugin):
         door = self._door(parsed)
 
         def exchange(conn: ControlConnection, session: int) -> DcapFile:
+            """``open`` with the callback address and ``-passive``; the open file."""
             listener, host, port = callback_listener(conn)
             try:
                 conn.send_line(
@@ -276,7 +328,7 @@ class DcapPlugin(Plugin):
             finally:
                 listener.close()
             channel = DataChannel(sock)
-            return DcapFile(url, flags, door, conn, session, channel, self._failure)
+            return DcapFile(url, flags, DoorSession(door, conn, session, self._failure), channel)
 
         return door.call(exchange, keep=True)
 
@@ -290,4 +342,5 @@ class KdcapPlugin(DcapPlugin):
 
     @classmethod
     def available(cls) -> str | None:
+        """``None`` with a Kerberos mechanism (or a registered tunnel) installed, else why not."""
         return unavailable("kdcap")

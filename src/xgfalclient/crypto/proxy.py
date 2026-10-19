@@ -16,125 +16,56 @@ The certificate made here is what ``globus_gsi_proxy_sign_req`` makes:
   can only beget limited proxies;
 * a critical key usage of digitalSignature and keyEncipherment;
 * a lifetime no longer than the issuer's.
+
+Since 0.4.0 that policy is :mod:`xrdsec.proxies`' ``"globus"`` profile -
+it moved there from this module, so every client that delegates to a
+GridFTP, SRM or gridsite peer issues the proxy Globus would have made, and
+not XrdCrypto's (the ``"xrootd"`` profile, which takes the subject and the
+serial from the request and copies the signer's extensions). Reading the
+request is :func:`xrdsec.delegation.parse_proxy_request`; signing one the
+Globus way is :func:`xrdsec.delegation.sign_globus_request` and making one,
+as a delegation *target* does, :func:`xrdsec.delegation.make_proxy_request`
+(here :func:`make_request`) - both moved there from this module in 0.4.0 with
+GSI itself (:mod:`xrdsec.gsi.gss`). What stays here is the interface the
+gridsite code was written against - :class:`~xgfalclient.crypto.x509.Credential`
+in, DER out, :class:`DERError` for every refusal - and what only a gridsite
+client needs (:func:`delegation_payload`).
 """
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
+from xrdsec.delegation import DelegationError, parse_proxy_request, sign_globus_request
+from xrdsec.delegation import ProxyRequest as CertificateRequest
+from xrdsec.delegation import make_proxy_request as make_request
+from xrdsec.der import DERError
+from xrdsec.proxies import NOT_BEFORE_SKEW
 
-from .._compat import SLOTS
-from .der import (
-    TAG_SEQUENCE,
-    DERError,
-    bit_string,
-    explicit,
-    integer,
-    oid,
-    oid_string,
-    parse_one,
-    printable_string,
-    sequence,
-    set_of,
-)
-from .rsa import RSAPrivateKey, RSAPublicKey, public_key_from_bitstring
-from .x509 import (
-    INHERIT_ALL_OID,
-    KEY_USAGE_OID,
-    LIMITED_PROXY_OID,
-    PROXY_CERT_INFO_OID,
-    Credential,
-    Name,
-    _decode_name,
-    build_certificate,
-    encode_name,
-    extension,
-    key_usage,
-    proxy_cert_info,
-    proxy_serial,
-    public_key_info,
-    signature_algorithm,
-)
+from .x509 import Credential
 
 __all__ = [
-    "CertificateRequest",
-    "parse_request",
-    "make_request",
-    "sign_request",
-    "delegation_payload",
     "BACKDATE",
+    "CertificateRequest",
+    "delegation_payload",
+    "make_request",
+    "parse_request",
+    "sign_request",
 ]
 
-#: How far before "now" a delegated proxy is dated, for clock skew.
-BACKDATE = 300
-
-_DIGESTS = {
-    "1.2.840.113549.1.1.5": "sha1",
-    "1.2.840.113549.1.1.11": "sha256",
-    "1.2.840.113549.1.1.12": "sha384",
-    "1.2.840.113549.1.1.13": "sha512",
-}
-
-
-@dataclass(frozen=True, **SLOTS)
-class CertificateRequest:
-    """A decoded PKCS#10 request: who it names and the key to certify."""
-
-    subject: Name
-    public_key: RSAPublicKey
-    spki: bytes
-    info: bytes
-    signature: bytes
-    digest: str
-
-    def verify(self) -> bool:
-        """Proof of possession: the request is signed by the key it carries."""
-        return self.public_key.verify(self.info, self.signature, digest=self.digest)
+#: How far before "now" a delegated proxy is dated, for clock skew: five
+#: minutes, Globus' own allowance, so a peer whose clock runs behind ours
+#: does not reject the proxy as not yet valid (:data:`xrdsec.proxies.NOT_BEFORE_SKEW`).
+BACKDATE = NOT_BEFORE_SKEW
 
 
 def parse_request(der: bytes) -> CertificateRequest:
-    """Decode a DER ``CertificationRequest``; ``DERError`` if it is not one."""
-    top = parse_one(der).children()
-    if len(top) != 3 or top[0].tag != TAG_SEQUENCE:
-        raise DERError("not a PKCS#10 certificate request")
-    info = top[0].children()
-    if len(info) < 3:
-        raise DERError("certificate request info is incomplete")
-    spki = info[2]
-    parts = spki.children()
-    algorithm = oid_string(top[1].children()[0])
-    digest = _DIGESTS.get(algorithm)
-    if digest is None:
-        raise DERError(f"unsupported request signature algorithm {algorithm}")
-    return CertificateRequest(
-        subject=_decode_name(info[1]),
-        public_key=public_key_from_bitstring(parts[1]),
-        spki=spki.encoded,
-        info=top[0].encoded,
-        signature=top[2].value[1:],
-        digest=digest,
-    )
+    """Decode a DER ``CertificationRequest``; ``DERError`` if it is not one.
 
-
-def make_request(
-    key: RSAPrivateKey, rdns: tuple[tuple[str, str], ...] = (("CN", "proxy"),)
-) -> bytes:
-    """A signed PKCS#10 request for ``key`` - what a delegation *target* sends."""
-    info = sequence(
-        integer(0),
-        encode_name(rdns),
-        public_key_info(key.public),
-        explicit(0, b""),
-    )
-    return sequence(
-        info, signature_algorithm("sha256"), bit_string(key.sign(info, digest="sha256"))
-    )
-
-
-def _proxy_subject(issuer: Name, common_name: str) -> bytes:
-    rdns = parse_one(issuer.encoded()).children()
-    extra = set_of(sequence(oid("2.5.4.3"), printable_string(common_name)))
-    return sequence(*(rdn.encoded for rdn in rdns), extra)
+    xrdsec's parser (:func:`~xrdsec.delegation.parse_proxy_request`),
+    so a request for any key type - RSA, EC - is read, and its proof of
+    possession (:meth:`CertificateRequest.verify`) checks whatever algorithm
+    it is signed with.
+    """
+    return parse_proxy_request(der)
 
 
 def sign_request(
@@ -146,35 +77,40 @@ def sign_request(
     digest: str = "sha256",
     now: float | None = None,
 ) -> bytes:
-    """Sign ``request`` as a proxy of ``credential``; returns the DER certificate."""
-    parsed = parse_request(request) if isinstance(request, bytes) else request
-    if not parsed.verify():
-        raise DERError("the certificate request's signature does not verify")
-    issuer = credential.certificate
-    moment = time.time() if now is None else now
-    expires = min(link.not_after for link in credential.chain)
-    if lifetime is not None:
-        expires = min(expires, moment + lifetime)
-    is_limited = issuer.is_limited if limited is None else (limited or issuer.is_limited)
-    serial = proxy_serial(parsed.spki)
-    extensions = [extension(KEY_USAGE_OID, key_usage(0, 2), critical=True)]
-    if issuer.is_legacy_proxy:
-        subject = _proxy_subject(issuer.subject, "limited proxy" if is_limited else "proxy")
-    else:
-        policy = LIMITED_PROXY_OID if is_limited else INHERIT_ALL_OID
-        subject = _proxy_subject(issuer.subject, str(serial))
-        extensions.append(extension(PROXY_CERT_INFO_OID, proxy_cert_info(policy), critical=True))
-    return build_certificate(
-        subject=subject,
-        issuer=issuer.subject.encoded(),
-        public_key=parsed.spki,
-        signer=credential.key,
-        not_before=moment - BACKDATE,
-        not_after=expires,
-        serial=serial,
-        extensions=extensions,
-        digest=digest,
-    )
+    """Sign ``request`` as a proxy of ``credential``; returns the DER certificate.
+
+    The rules are Globus' ``globus_gsi_proxy_sign_req``, as
+    :func:`xrdsec.proxies.issue_proxy` applies them under the ``"globus"``
+    profile:
+
+    * ``lifetime`` (seconds) can only shorten the proxy; it never outlives
+      any link of ``credential``'s chain;
+    * ``limited=None`` inherits the issuer's limitation; ``False`` cannot
+      lift it (a limited proxy only begets limited ones), ``True`` imposes it;
+    * a legacy (GT2) issuer gets a legacy child named ``CN=proxy`` or
+      ``CN=limited proxy`` and no ``proxyCertInfo``, as Globus keeps a
+      chain in one proxy style; anything else gets an RFC 3820 child.
+
+    ``now`` pins the clock, for tests. The request's own signature is
+    checked first (``DERError`` if it fails): signing a key whose holder
+    has not proved possession would hand a credential to whoever forged
+    the request. ``digest`` is the signature's hash; SHA-1 is refused.
+    Every refusal xrdsec makes (an expired chain, a key that is not the
+    credential's, a path length that forbids delegating) is a ``DERError``
+    too, which is what the gridsite caller catches.
+    """
+    try:
+        return sign_globus_request(
+            request,
+            [link.der for link in credential.chain],
+            credential.key,
+            lifetime=lifetime,
+            limited=limited,
+            digest=digest,
+            now=now,
+        )
+    except DelegationError as exc:
+        raise DERError(str(exc)) from exc
 
 
 def delegation_payload(certificate: bytes, credential: Credential) -> bytes:
@@ -184,5 +120,8 @@ def delegation_payload(certificate: bytes, credential: Credential) -> bytes:
     is *not* what GSI delegation sends: Globus acceptors read the new
     certificate alone and take the chain from the TLS handshake.
     """
+    # A self-signed root is left out: the receiver must find it in its own
+    # trust store, and servers refuse to receive one (as for
+    # Credential.chain_pem).
     links = [link.der for link in credential.chain if not link.is_self_signed]
     return certificate + b"".join(links)

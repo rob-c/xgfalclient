@@ -15,4 +15,4 @@ if [ "$1" = kcm ]; then
     while [ ! -S /run/.heim_org.h5l.kcm-socket ]; do sleep 0.1; done
 fi
 echo userpw | kinit user >/dev/null
-PYTHONPATH=/src python3 /k/driver.py
+PYTHONPATH=/src python3.11 /k/driver.py

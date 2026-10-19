@@ -10,7 +10,7 @@ import threading
 import time
 import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -24,6 +24,7 @@ from xgfalclient.transfer import (
     _cleanup,
     _is_special,
     _split_checksum,
+    copy_range,
     emit,
     pump,
     run_bulk,
@@ -73,7 +74,8 @@ def test_set_checksum_validation() -> None:
     params.set_checksum(1, "adler32", "abc")
     assert params.checksum_mode is checksum_mode.source
     assert (params.checksum_algorithm, params.checksum_value) == ("adler32", "abc")
-    params.set_checksum(checksum_mode.none, None, None)  # type: ignore[arg-type]
+    # None, as the bindings' callers pass it for "no algorithm/value".
+    params.set_checksum(checksum_mode.none, None, None)
     assert params.get_checksum() == (checksum_mode.none, "", "")
 
 
@@ -915,7 +917,7 @@ class Bulk(Copier):
 
     name = "bulk"
     schemes = ("bulk",)
-    handed: list[tuple[str, str, str, str]] = []
+    handed: ClassVar[list[tuple[str, str, str, str]]] = []
 
     def copy_check(self, source: str, destination: str) -> bool:
         return source.startswith("bulk://")
@@ -976,8 +978,8 @@ class ThirdParty(Plugin):
     schemes = ("tpc",)
     option_group = "THIRDPARTY PLUGIN"
     priority = 5
-    sums: dict[str, str] = {}
-    removed: list[str] = []
+    sums: ClassVar[dict[str, str]] = {}
+    removed: ClassVar[list[str]] = []
 
     def stat(self, url: str) -> Stat:
         raise GError("No such file", errno.ENOENT)
@@ -1032,3 +1034,211 @@ def test_the_third_party_check_can_be_turned_off(tctx: Gfal2Context) -> None:
     tctx.set_opt_boolean("CORE", "VERIFY_THIRD_PARTY", False)
     tctx.filecopy(tctx.transfer_parameters(), "tpc://src/f", "tpc://dst/f")
     assert ThirdParty.removed == []
+
+
+# -- the local copy_file_range fast path -------------------------------------------------
+
+
+class FakeCopyRange:
+    """``os.copy_file_range`` as Linux has it, for any platform: what each call did.
+
+    ``limit`` caps each call's count (a short copy), ``fail`` raises that
+    errno on call number ``fail_at``, and ``eof_at`` answers 0 from that call
+    on, as a filesystem that cannot copy a ``/proc``-like file does.
+    """
+
+    def __init__(
+        self, *, limit: int = 0, fail: int = 0, fail_at: int = 0, eof_at: int = -1
+    ) -> None:
+        self.limit, self.fail, self.fail_at, self.eof_at = limit, fail, fail_at, eof_at
+        self.calls: list[tuple[int, int, int]] = []
+        self.on_call: Any = None
+
+    def __call__(self, src: int, dst: int, count: int, offset_src: int, offset_dst: int) -> int:
+        self.calls.append((count, offset_src, offset_dst))
+        if self.on_call is not None:
+            self.on_call(len(self.calls))
+        if self.fail and len(self.calls) - 1 == self.fail_at:
+            raise OSError(self.fail, os.strerror(self.fail))
+        if len(self.calls) - 1 >= self.eof_at >= 0:
+            return 0
+        data = os.pread(src, min(count, self.limit or count), offset_src)
+        return os.pwrite(dst, data, offset_dst)
+
+
+@pytest.fixture
+def fake_range(monkeypatch: pytest.MonkeyPatch) -> FakeCopyRange:
+    fake = FakeCopyRange()
+    monkeypatch.setattr(os, "copy_file_range", fake, raising=False)
+    return fake
+
+
+def _small_chunks(ctx: Gfal2Context) -> None:
+    ctx.set_opt_integer("CORE", "COPY_BUFFERSIZE", 100_000)
+
+
+def test_local_copies_go_through_copy_file_range_in_chunks(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, fake_range: FakeCopyRange
+) -> None:
+    _small_chunks(ctx)
+    params = ctx.transfer_parameters()
+    params.set_checksum(checksum_mode.both, "adler32", "")
+    ctx.filecopy(params, file_url(src), file_url(tmp_path / "d"))
+    assert (tmp_path / "d").read_bytes() == src.read_bytes()
+    size = src.stat().st_size
+    # Whole chunks at advancing offsets, then the call that finds the end.
+    assert [call[0] for call in fake_range.calls] == [100_000] * len(fake_range.calls)
+    whole = size // 100_000 + 1
+    assert [call[1] for call in fake_range.calls] == [*range(0, whole * 100_000, 100_000), size]
+    assert not [t for t in threading.enumerate() if t.name == "xgfal-reader"]
+
+
+def test_copy_file_range_short_counts_are_carried_on(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, fake_range: FakeCopyRange
+) -> None:
+    fake_range.limit = 65_537  # never a whole chunk, never aligned
+    transfer = Transfer(ctx, TransferParameters(), file_url(src), file_url(tmp_path / "d"))
+    with ctx._open(file_url(src), os.O_RDONLY) as reader:
+        writer = ctx._open(file_url(tmp_path / "d"), os.O_WRONLY | os.O_CREAT, mode=0o644)
+        with writer:
+            done = copy_range(transfer, reader, writer, src.stat().st_size)
+    assert done == (src.stat().st_size, True)
+    assert transfer.transferred == src.stat().st_size
+    assert (tmp_path / "d").read_bytes() == src.read_bytes()
+
+
+@pytest.mark.parametrize(
+    "code", [errno.EXDEV, errno.ENOSYS, errno.EOPNOTSUPP, errno.EINVAL, errno.ETXTBSY]
+)
+@pytest.mark.parametrize("fail_at", [0, 3])
+def test_copy_file_range_refusals_hand_over_to_the_pipeline(
+    ctx: Gfal2Context,
+    src: Path,
+    tmp_path: Path,
+    fake_range: FakeCopyRange,
+    code: int,
+    fail_at: int,
+) -> None:
+    _small_chunks(ctx)
+    fake_range.fail, fake_range.fail_at = code, fail_at
+    params = ctx.transfer_parameters()
+    params.set_checksum(checksum_mode.both, "adler32", "")
+    ctx.filecopy(params, file_url(src), file_url(tmp_path / "d"))
+    # Neither a repeated nor a skipped byte where the pipeline took over.
+    assert (tmp_path / "d").read_bytes() == src.read_bytes()
+    assert len(fake_range.calls) == fail_at + 1
+
+
+def test_without_copy_file_range_the_pipeline_copies(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delattr(os, "copy_file_range", raising=False)  # macOS has none
+    ctx.filecopy(file_url(src), file_url(tmp_path / "d"))
+    assert (tmp_path / "d").read_bytes() == src.read_bytes()
+
+
+def test_a_copy_file_range_that_stops_early_is_checked_by_the_pipeline(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, fake_range: FakeCopyRange
+) -> None:
+    # A /proc-like file the kernel "copies" as empty: the pipeline reads it.
+    _small_chunks(ctx)
+    fake_range.eof_at = 2
+    ctx.filecopy(file_url(src), file_url(tmp_path / "d"))
+    assert (tmp_path / "d").read_bytes() == src.read_bytes()
+    assert len(fake_range.calls) == 3
+    # And an empty source is the pipeline's to confirm too.
+    (tmp_path / "empty").write_bytes(b"")
+    ctx.filecopy(file_url(tmp_path / "empty"), file_url(tmp_path / "e"))
+    assert (tmp_path / "e").read_bytes() == b""
+
+
+def test_copy_file_range_failures_fail_the_copy_and_clean_up(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, fake_range: FakeCopyRange
+) -> None:
+    _small_chunks(ctx)
+    fake_range.fail, fake_range.fail_at = errno.ENOSPC, 2
+    with pytest.raises(GError) as caught:
+        ctx.filecopy(file_url(src), file_url(tmp_path / "d"))
+    assert caught.value.code == errno.ENOSPC
+    assert caught.value.message == "errno reported by local system call No space left on device"
+    assert not (tmp_path / "d").exists()
+
+
+def test_copy_file_range_stops_between_chunks_when_cancelled(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, fake_range: FakeCopyRange
+) -> None:
+    _small_chunks(ctx)
+
+    def cancel_at_the_second_chunk(calls: int) -> None:
+        if calls == 2:
+            threading.Thread(target=ctx.cancel).start()
+
+    fake_range.on_call = cancel_at_the_second_chunk
+    with pytest.raises(GError) as caught:
+        ctx.filecopy(file_url(src), file_url(tmp_path / "d"))
+    assert caught.value.code == errno.ECANCELED
+    assert not (tmp_path / "d").exists()
+    assert len(fake_range.calls) < 11
+
+
+def test_a_transient_copy_file_range_read_failure_recovers_as_a_read_would(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, fake_range: FakeCopyRange
+) -> None:
+    _small_chunks(ctx)
+    ctx.set_opt_integer("CORE", "CONN_RETRY_INTERVAL", 0)
+    fake_range.fail, fake_range.fail_at = errno.ESTALE, 1
+    ctx.filecopy(file_url(src), file_url(tmp_path / "d"))
+    assert (tmp_path / "d").read_bytes() == src.read_bytes()
+    assert len(fake_range.calls) == 2
+    # With no retries left the same failure is the copy's.
+    ctx.set_opt_integer("CORE", "CONN_RETRY", 0)
+    fake_range.calls.clear()
+    with pytest.raises(GError) as caught:
+        ctx.filecopy(file_url(src), file_url(tmp_path / "d2"))
+    assert caught.value.code == errno.ESTALE
+    assert not (tmp_path / "d2").exists()
+
+
+def test_copy_file_range_is_only_for_two_regular_local_files(
+    ctx: Gfal2Context, src: Path, tmp_path: Path, fake_range: FakeCopyRange
+) -> None:
+    transfer = Transfer(ctx, TransferParameters(), "a", "b")
+    with ctx._open(file_url(src), os.O_RDONLY) as reader:
+        assert copy_range(transfer, reader, Sink(), None) == (0, False)
+        assert copy_range(transfer, Chunks(1), reader, None) == (0, False)
+        with ctx._open("file:///dev/null", os.O_WRONLY) as sink:
+            assert copy_range(transfer, reader, sink, None) == (0, False)
+        closed = ctx._open(file_url(tmp_path / "c"), os.O_WRONLY | os.O_CREAT, mode=0o644)
+        closed.close()
+        assert copy_range(transfer, reader, closed, None) == (0, False)
+        writer = ctx._open(file_url(tmp_path / "w"), os.O_WRONLY | os.O_CREAT, mode=0o644)
+        with writer:
+            ctx.set_opt_integer("CORE", "COPY_BUFFERSIZE", 0)
+            assert copy_range(transfer, reader, writer, None) == (0, False)
+    assert fake_range.calls == []
+
+
+class CancelThenBreak(Plugin):
+    """A plugin copy whose context is cancelled under it, and which then fails its own way."""
+
+    name = "breaks"
+    schemes = ("breaks",)
+    priority = 5
+    copy_manages_destination = True
+
+    def copy_check(self, source: str, destination: str) -> bool:
+        return True
+
+    def copy(self, transfer: Transfer) -> None:
+        self.context.cancel()
+        raise RuntimeError("the socket went away under me")
+
+
+def test_a_cancelled_copy_fails_as_cancelled_whatever_the_plugin_raised(
+    ctx: Gfal2Context,
+) -> None:
+    ctx.add_plugin(CancelThenBreak)
+    with pytest.raises(GError) as caught:
+        run_copy(ctx, TransferParameters(), "breaks://h/a", "breaks://h/b")
+    assert (caught.value.code, caught.value.message) == (errno.ECANCELED, "Transfer canceled")
+    assert isinstance(caught.value.__cause__, RuntimeError)

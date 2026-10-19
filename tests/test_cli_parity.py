@@ -1,8 +1,10 @@
 """Byte-for-byte parity of the ``gfal-*`` commands with gfal2-util 1.9.1.
 
-Both run in the ``gfal-ref:latest`` image, so the filesystem, clock, users and
-Python (3.9) are the same: the real ``gfal-<cmd>`` there, and this package's
-``python3 -m xgfalclient.cli <cmd>`` from a bind mount of ``src``. Every case
+Both run in one container of the ``gfal-ref:latest`` image (with AppStream
+Python 3.11 added, see :mod:`_interop_image`), so the filesystem, clock and
+users are the same: the real ``gfal-<cmd>`` on the system Python (3.9), and
+this package's ``python3.11 -m xgfalclient.cli <cmd>`` from a bind mount of
+``src`` (and of the host's ``xrdclient``). Every case
 starts from a fresh fixture tree whose files have a fixed mtime, so nothing
 needs masking but what is genuinely variable: event timestamps, staging
 tokens, ``ctime``, ``-V``'s list of plugins and tracebacks' bodies.
@@ -24,6 +26,8 @@ import tempfile
 from pathlib import Path
 
 import pytest
+
+from _interop_image import library_mounts, xgfal_image, xrdclient_src
 
 IMAGE = "gfal-ref:latest"
 ROOT = Path(__file__).resolve().parent.parent
@@ -295,7 +299,8 @@ KNOWN: dict[str, str] = {
     "ls-verbose": "gfal2 logs loading its C plugins and davix; we log the modules we load",
 }
 
-# The driver, run with the image's python3 (3.9).
+# The driver, run with the image's python3 (3.9); it runs gfal2-util's
+# commands as they are and this package's on python3.11.
 DRIVER = r"""
 import json, os, subprocess, sys
 
@@ -327,8 +332,9 @@ def run(side, commands, stdin):
             full = [argv[0] if "_" in argv[0] else "gfal-" + argv[0]] + argv[1:]
             env = dict(os.environ, **settings)
         else:
-            full = ["python3", "-m", "xgfalclient.cli"] + argv
-            env = dict(os.environ, PYTHONPATH="/src", **settings)
+            full = ["python3.11", "-m", "xgfalclient.cli"] + argv
+            path = "/src:/xrdclient:" + os.environ["PYTHONPATH"]  # + the libraries
+            env = dict(os.environ, PYTHONPATH=path, **settings)
         proc = subprocess.run(full, input=stdin.encode(), stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, cwd="/work", env=env, timeout=120)
         results.append([proc.returncode, proc.stdout.decode("utf-8", "replace"),
@@ -386,40 +392,59 @@ def run_parity(names: list[str] | None = None) -> dict[str, dict[str, list[list[
                 "-v",
                 f"{ROOT / 'src'}:/src:ro",
                 "-v",
+                f"{xrdclient_src()}:/xrdclient:ro",
+                *library_mounts(),
+                "-v",
                 f"{io_dir}:/io",
-                IMAGE,
+                xgfal_image(IMAGE),
                 "python3",
                 "/io/driver.py",
             ],
             check=True,
             timeout=1800,
         )
-        return json.loads(Path(io_dir, "report.json").read_text())  # type: ignore[no-any-return]
+        report: dict[str, dict[str, list[list[object]]]] = json.loads(
+            Path(io_dir, "report.json").read_text()
+        )
+        return report
+
+
+def _masked(runs: list[list[object]]) -> list[list[object]]:
+    """Each run's ``[rc, stdout, stderr]`` with the volatile parts masked."""
+    return [[rc, mask(str(out)), mask(str(err))] for rc, out, err in runs]
+
+
+def _field_diff(index: int, label: str, ref: object, ours: object) -> str:
+    """One differing field of run ``index``, as an indented unified diff."""
+    import difflib
+
+    diff = difflib.unified_diff(
+        str(ref).splitlines(),
+        str(ours).splitlines(),
+        "gfal2-util",
+        "xgfalclient",
+        lineterm="",
+        n=1,
+    )
+    return f"  [{index}] {label}:\n    " + "\n    ".join(diff)
+
+
+def _case_diff(ref: list[list[object]], ours: list[list[object]]) -> str:
+    """Every field that differs between the paired runs of one case."""
+    lines = []
+    for index, (r, o) in enumerate(zip(ref, ours, strict=False)):
+        for label, a, b in (("rc", r[0], o[0]), ("stdout", r[1], o[1]), ("stderr", r[2], o[2])):
+            if a != b:
+                lines.append(_field_diff(index, label, a, b))
+    return "\n".join(lines)
 
 
 def differences(report: dict[str, dict[str, list[list[object]]]]) -> dict[str, str]:
-    import difflib
-
     found: dict[str, str] = {}
     for name, sides in report.items():
-        ref = [[rc, mask(str(out)), mask(str(err))] for rc, out, err in sides["ref"]]
-        ours = [[rc, mask(str(out)), mask(str(err))] for rc, out, err in sides["ours"]]
-        if ref == ours:
-            continue
-        lines = []
-        for index, (r, o) in enumerate(zip(ref, ours)):
-            for label, a, b in (("rc", r[0], o[0]), ("stdout", r[1], o[1]), ("stderr", r[2], o[2])):
-                if a != b:
-                    diff = difflib.unified_diff(
-                        str(a).splitlines(),
-                        str(b).splitlines(),
-                        "gfal2-util",
-                        "xgfalclient",
-                        lineterm="",
-                        n=1,
-                    )
-                    lines.append(f"  [{index}] {label}:\n    " + "\n    ".join(diff))
-        found[name] = "\n".join(lines)
+        ref, ours = _masked(sides["ref"]), _masked(sides["ours"])
+        if ref != ours:
+            found[name] = _case_diff(ref, ours)
     return found
 
 

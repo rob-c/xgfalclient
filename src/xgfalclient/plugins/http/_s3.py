@@ -12,24 +12,41 @@ listings and renames, which must know where the bucket ends and the key
 begins. Keys never make an ``https://`` URL an S3 one: gfal2 sends those
 unsigned, as WebDAV.
 
-Every request is signed with SigV4 through botocore.
-davix falls back to the older SigV2 when no region is configured; this does
-not - SigV2 is retired at AWS and every S3 implementation that matters takes
-V4 - and signs for ``us-east-1`` instead, which is what they all accept.
-The signature travels in an ``Authorization`` header; davix puts it in the
-query string (``X-Amz-Signature=...``), which S3 accepts just the same.
+Every request is signed with SigV4 by xrdhttp
+(:func:`xrdhttp.s3.sigv4.sign`, whose canonicalisation and HMAC chain are
+botocore's own). davix falls back to the older SigV2 when no region is
+configured; this does not - SigV2 is retired at AWS and every S3
+implementation that matters takes V4 - and signs for ``us-east-1`` instead,
+which is what they all accept. The signature travels in an ``Authorization``
+header; davix puts it in the query string (``X-Amz-Signature=...``), which S3
+accepts just the same. Only pre-signed URLs (TPC, ``presign``) put it in the
+query, because there the URL is all the far side gets.
 
 S3 has no directories. As in davix, ``mkdir`` puts an empty ``<key>/``
 marker object, a "directory" is a key prefix that something lives under,
 modes are ``0755``, a listing is ``ListObjectsV2`` with ``/`` as the
 delimiter, and a rename is a server-side copy (``x-amz-copy-source``) and a
 delete.
+
+Uploads above :data:`MULTIPART_THRESHOLD` use the multipart API
+(``CreateMultipartUpload``, ``UploadPart``, ``CompleteMultipartUpload``),
+because S3 refuses a single ``PUT`` over 5 GiB; GCS's XML API has no such
+calls, so the plugin never sends GCS down this path (``_multipart``).
+Response documents are parsed by xrdhttp's botocore-model codec
+(:mod:`xrdhttp.s3.codec`), which also catches the ``<Error>`` S3 may embed
+in a ``200`` answer.
+
+Start reading at :func:`s3_keys` (configuration), :class:`S3Signer` (what
+goes on the wire) and :func:`_listing` (the namespace). Must not break: the
+group search order, the redacted ``repr`` of keys, and the rule that a
+failed copy never deletes the source.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import errno
 import hashlib
 import sys
@@ -40,19 +57,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from botocore.auth import S3SigV4QueryAuth  # type: ignore[import-untyped]
-from botocore.awsrequest import AWSRequest  # type: ignore[import-untyped]
-from botocore.credentials import Credentials as AWSCredentials  # type: ignore[import-untyped]
-from xrdclient._xml import UnsafeXML
-from xrdclient.s3._codec import decode, listing_items, manifest, modified
-from xrdclient.s3.sigv4 import _authorize, _signed_request
+from xrdcore.safexml import UnsafeXML
+from xrdhttp.s3.codec import decode, listing_items, manifest, modified
+from xrdhttp.s3.sigv4 import Credentials, presign, sign
 
 from ...errors import GError
 from ...plugin import PluginFile
 from ...types import Stat
 from ...url import URL, parse
 from . import _swift
-from ._client import Body, FileBody, Target, status_error
+from ._client import Body, FileBody, Streamed, Target, status_error
 from ._dav import epoch
 from ._gcloud import is_gcloud
 
@@ -62,10 +76,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "S3Keys",
-    "S3Signer",
     "S3PartWriter",
-    "s3_keys",
+    "S3Signer",
     "is_s3",
+    "s3_keys",
 ]
 
 ALGORITHM = "AWS4-HMAC-SHA256"
@@ -82,16 +96,26 @@ OBJECT_DIR_MODE = _swift.DIR_MODE
 
 @dataclass(frozen=True)
 class S3Keys:
+    """One S3 credential as gfal2 configures it; ``token`` is an STS session token or ``""``.
+
+    ``region`` is never empty: :func:`s3_keys` fills in
+    :data:`DEFAULT_REGION`, since SigV4 scopes every signature to a region.
+    The ``repr`` hides the secret so a key never lands in a log or a
+    traceback.
+    """
+
     access_key: str
     secret_key: str
     token: str
     region: str
 
     def __repr__(self) -> str:
+        """The access key and region; the secret (and session token) redacted."""
         return f"S3Keys({self.access_key!r}, secret_key=<redacted>, region={self.region!r})"
 
 
 def is_s3(url: URL) -> bool:
+    """Whether ``url`` is S3 by scheme (``s3``/``s3s``, with or without a ``+3rd`` suffix)."""
     return url.scheme.partition("+")[0] in ("s3", "s3s")
 
 
@@ -127,6 +151,7 @@ def s3_keys(options: Options, url: URL) -> S3Keys | None:
 
 
 def _alternate(options: Options, group: str) -> bool | None:
+    """``ALTERNATE`` in ``group``, or ``None`` so the next group gets its say."""
     try:
         return bool(options.get_boolean(group, "ALTERNATE"))
     except GError:
@@ -145,15 +170,27 @@ def path_style(options: Options, url: URL) -> bool:
 
 
 class S3Signer:
-    """Thin botocore adapter retaining GFAL's credential and target policy."""
+    """GFAL's credential and target policy over xrdhttp's public SigV4 signer.
+
+    xrdhttp signs with botocore's own signing steps (so signatures are
+    AWS's, byte for byte); this class decides *what* is signed - the
+    origin-form target exactly as :class:`Target` puts it on the wire, and
+    the ``Host`` header the connection will carry.
+    """
 
     def __init__(self, keys: S3Keys) -> None:
+        """Sign with ``keys``; the signer holds no other state and is safe to share."""
         self.keys = keys
 
-    def _credentials(self) -> AWSCredentials:
-        return AWSCredentials(self.keys.access_key, self.keys.secret_key, self.keys.token or None)
+    def _credentials(self) -> Credentials:
+        return Credentials(self.keys.access_key, self.keys.secret_key, self.keys.token)
 
     def target(self, method: str, target: Target) -> Target:
+        """S3 signs the request where it is going: the target is left as it is.
+
+        (The :class:`~._client.Signer` hook exists for GCS, whose signature
+        lives in the URL and so changes the target itself.)
+        """
         return target
 
     def sign(
@@ -164,13 +201,26 @@ class S3Signer:
         body: Body | None,
         when: datetime | None = None,
     ) -> dict[str, str]:
-        if isinstance(body, FileBody):
+        """The SigV4 headers (``Authorization``, ``x-amz-date``, ...) to add to a request.
+
+        ``when`` pins the signing moment for tests; a signature is valid for
+        15 minutes around it, so a client clock that far off fails with
+        ``RequestTimeTooSkewed`` (403) rather than anything here.
+        """
+        # A file body is streamed with sendfile and never held in memory, and
+        # a streamed upload's body is not even written yet when its head is
+        # signed, so neither SHA-256 is known up front: S3 accepts the literal
+        # ``UNSIGNED-PAYLOAD`` there (TLS still protects it in transit).
+        # Signing the empty-body hash instead, as this did before 0.4.0, is
+        # refused by S3 as soon as the bytes arrive (XAmzContentSHA256Mismatch).
+        # In-memory bodies are small and hashed, as davix hashes them.
+        if isinstance(body, FileBody | Streamed):
             payload = UNSIGNED
         else:
             payload = hashlib.sha256(body or b"").hexdigest()
-        signed = _signed_request(
+        signed = sign(
             method,
-            f"{target.base}{target.path}",
+            target.path,
             target.host_header,
             headers,
             payload,
@@ -178,20 +228,34 @@ class S3Signer:
             region=self.keys.region,
             when=when,
         )
+        # ``Host`` was signed (SigV4 requires it) but the connection writes
+        # its own from the same :attr:`Target.host_header`; a second copy
+        # would be a malformed request.
         return {k: v for k, v in signed.items() if k.lower() != "host"}
 
     def presign(
         self, method: str, url: str, expires: int = 3600, when: datetime | None = None
     ) -> str:
+        """``url`` with a SigV4 query-string signature, good for ``expires`` seconds.
+
+        What a third-party copy hands the far side (gfal2's
+        ``S3_SIGNED_URL``): the other server has no keys, so the URL itself
+        must carry the authority. Done by :func:`xrdhttp.s3.sigv4.presign`.
+        """
         target = Target.of(url, s3=True)
-        request = AWSRequest(
-            method=method.upper(),
-            url=f"{target.base}{target.path}",
-            headers={"host": target.host_header},
+        signed = presign(
+            method,
+            target.path,
+            target.host_header,
+            credentials=self._credentials(),
+            region=self.keys.region,
+            expires=expires,
+            when=when,
         )
-        auth = S3SigV4QueryAuth(self._credentials(), "s3", self.keys.region, expires=expires)
-        _authorize(auth, request, when)
-        return str(request.url)
+        # xrdhttp spells the URL ``https://``. SigV4 signs the Host header
+        # and the target, never the scheme, so a plain-HTTP endpoint (a local
+        # MinIO, say) gets its own scheme back with the signature unchanged.
+        return target.base + signed.removeprefix(f"https://{target.host_header}")
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +264,11 @@ class S3Signer:
 
 
 def _answer(payload: bytes, operation: str, what: str = "S3 response") -> dict[str, Any]:
+    """``payload`` decoded as the answer to ``operation``; ``EIO`` if it is not XML.
+
+    A document with a ``DOCTYPE`` is refused outright (``UnsafeXML``):
+    entity expansion is the classic XML bomb, and no S3 answer has one.
+    """
     try:
         return decode(operation, payload, lenient=True)
     except UnsafeXML as exc:
@@ -209,6 +278,13 @@ def _answer(payload: bytes, operation: str, what: str = "S3 response") -> dict[s
 
 
 def _entries(page: dict[str, Any], prefix: str) -> Iterator[tuple[str, Stat]]:
+    """One listing page as ``(name, stat)``: common prefixes as directories, then objects.
+
+    The names come from xrdhttp's ``listing_items``, which already hides
+    the directory's own ``<prefix>/`` marker. An object's ``st_mtime`` is
+    its ``LastModified`` - S3 keeps no other time, and no mode at all, so
+    every object reports davix's fixed ``0755`` mode.
+    """
     for name, item in listing_items(page, prefix):
         if item is None:
             name = name.strip("/")
@@ -257,14 +333,7 @@ def _listing(plugin: HTTPPlugin, url: str, *, limit: int = 0) -> tuple[list[tupl
     seen = 0
     token = ""
     while True:
-        query: dict[str, str] = {"prefix": prefix, "delimiter": "/"}
-        if not v1:
-            query["list-type"] = "2"
-        if limit:
-            query["max-keys"] = str(limit)
-        if token:
-            query["marker" if v1 else "continuation-token"] = token
-        listing = f"{bucket}?{urllib.parse.urlencode(query, quote_via=urllib.parse.quote)}"
+        listing = f"{bucket}?{_page_query(prefix, v1, limit, token)}"
         response = plugin._request("GET", listing, cred_url=url)
         payload = response.body()
         if response.status != 200:
@@ -273,13 +342,33 @@ def _listing(plugin: HTTPPlugin, url: str, *, limit: int = 0) -> tuple[list[tupl
         seen += len(root.get("CommonPrefixes", [])) + len(root.get("Contents", []))
         entries.extend(_entries(root, prefix))
         token = root.get("NextMarker" if v1 else "NextContinuationToken", "")
+        # A limited listing is an existence probe: one page is the answer.
+        # A truncated page without a token would loop forever, so it ends too.
         if limit or not root.get("IsTruncated") or not token:
             return entries, seen
+
+
+def _page_query(prefix: str, v1: bool, limit: int, token: str) -> str:
+    """The query string for one page of a listing of ``prefix``.
+
+    V2 pages with an opaque continuation token; V1 (GCS) with the last key
+    seen. Either way the server says whether there is more.
+    """
+    query: dict[str, str] = {"prefix": prefix, "delimiter": "/"}
+    if not v1:
+        query["list-type"] = "2"
+    if limit:
+        query["max-keys"] = str(limit)
+    if token:
+        query["marker" if v1 else "continuation-token"] = token
+    return urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
 
 
 def stat(plugin: HTTPPlugin, url: str) -> Stat:
     """``HEAD`` the object; a key that is only a prefix is a directory."""
     _, key = split(plugin, url)
+    # A key can be an object, a ``key/`` marker, a prefix with objects under
+    # it, or nothing; only the HEAD and then a one-key listing tell them apart.
     if key.strip("/"):
         response = plugin._request("HEAD", url)
         response.close()
@@ -306,13 +395,19 @@ def rename(plugin: HTTPPlugin, old: str, new: str) -> None:
     if is_gcloud(parsed.scheme) or path_style(plugin.options, parsed):
         path = parsed.path
     else:
+        # Virtual-host style: the bucket is the first host label, and the
+        # copy source must still name it, as ``/<bucket>/<key>``.
         path = f"/{parsed.host.partition('.')[0]}{parsed.path}"
-    _swift.rename(
-        plugin, old, new, copy_header="x-amz-copy-source", source=path, ok=200, verify=_copied
-    )
+    _swift.rename(plugin, old, new, _swift.ServerCopy("x-amz-copy-source", path, 200, _copied))
 
 
 def _copied(payload: bytes) -> None:
+    """Refuse a ``CopyObject`` that said ``200`` but failed; the delete must not follow.
+
+    S3 may answer ``200`` before a long copy is done (keeping the connection
+    alive with whitespace), so a failure during the copy arrives as an
+    ``<Error>`` inside that body rather than as a status.
+    """
     if "Error" in _answer(payload, "CopyObject"):
         raise GError("S3 copy failed; the original file has not been deleted", errno.EIO)
 
@@ -328,6 +423,8 @@ def checksum(plugin: HTTPPlugin, url: str, algorithm: str) -> str:
     if response.status != 200:
         raise status_error(response.status)
     wanted = algorithm.strip().lower()
+    # ``x-goog-hash: crc32c=<b64>,md5=<b64>``: the digest bytes, base64ed,
+    # where gfal2 compares hex.
     for item in response.header("x-goog-hash").split(","):
         name, _, value = item.strip().partition("=")
         if name.lower() == wanted and value:
@@ -336,6 +433,8 @@ def checksum(plugin: HTTPPlugin, url: str, algorithm: str) -> str:
             except (binascii.Error, ValueError):
                 break
     etag = response.header("ETag").strip('"')
+    # A multipart object's ETag is ``<md5 of the part MD5s>-<parts>``: no
+    # file's MD5, so it is refused rather than reported wrongly.
     if wanted == "md5" and etag and "-" not in etag:
         return etag.lower()
     raise GError(f"checksum calculation for {algorithm} not supported for {url}", errno.ENOSYS)
@@ -347,9 +446,23 @@ def checksum(plugin: HTTPPlugin, url: str, algorithm: str) -> str:
 
 
 class Multipart:
-    """One multipart upload: create, send parts, complete (or abort)."""
+    """One multipart upload: create, send parts, complete (or abort).
+
+    The S3 protocol: ``POST ?uploads`` returns an ``UploadId``; each
+    ``PUT ?partNumber=N&uploadId=...`` stores a part (every part but the
+    last at least 5 MiB, at most 10 000 parts) and answers its ``ETag``;
+    ``POST ?uploadId=...`` with the list of ETags assembles the object,
+    and ``DELETE ?uploadId=...`` discards the parts. Until completed,
+    nothing is visible at the key - so a failed upload never leaves a
+    truncated object behind, only parts that :meth:`abort` (or the
+    bucket's lifecycle rule) cleans up.
+
+    Not thread-safe: parts are numbered in the order :meth:`send` is
+    called, which is the order they are assembled in.
+    """
 
     def __init__(self, plugin: HTTPPlugin, url: str) -> None:
+        """Create the upload at ``url``; ``EPROTO`` if S3 answers without an id."""
         self.plugin = plugin
         self.url = url
         self.parts: list[str] = []
@@ -362,6 +475,7 @@ class Multipart:
             raise GError(f"S3 did not return an upload id for {url}", errno.EPROTO)
 
     def _with(self, query: str) -> str:
+        """The object URL with ``query`` added to any query it already carries."""
         head, sep, existing = self.url.partition("?")
         return f"{head}?{existing}&{query}" if sep and existing else f"{head}?{query}"
 
@@ -369,6 +483,7 @@ class Multipart:
         return urllib.parse.quote(self.upload_id, safe="")
 
     def send(self, body: bytes | FileBody, size: int) -> None:
+        """Upload the next part and remember its ``ETag`` for :meth:`complete`."""
         number = len(self.parts) + 1
         query = f"partNumber={number}&uploadId={self._id()}"
         response = self.plugin._request(
@@ -380,6 +495,7 @@ class Multipart:
         self.parts.append(response.header("ETag"))
 
     def complete(self) -> None:
+        """Assemble the parts into the object; any failure is a ``GError`` by status."""
         body = manifest(self.parts)
         response = self.plugin._request(
             "POST", self._with(f"uploadId={self._id()}"), body=body, cred_url=self.url
@@ -390,12 +506,12 @@ class Multipart:
             raise status_error(response.status if response.status != 200 else 500)
 
     def abort(self) -> None:
-        try:
+        """Discard the parts sent so far; never raises, as it runs on a failure path."""
+        # Best effort: the lifecycle policy reaps what this leaves.
+        with contextlib.suppress(GError):
             self.plugin._request(
                 "DELETE", self._with(f"uploadId={self._id()}"), cred_url=self.url
             ).close()
-        except GError:
-            pass  # best effort: the lifecycle policy reaps what this leaves
 
 
 def upload_file(plugin: HTTPPlugin, url: str, body: FileBody) -> None:
@@ -414,14 +530,21 @@ def upload_file(plugin: HTTPPlugin, url: str, body: FileBody) -> None:
 
 
 class S3PartWriter(PluginFile):
-    """A write handle that fills parts in memory and sends each as it fills."""
+    """A write handle that fills parts in memory and sends each as it fills.
+
+    Memory use is bounded by one :data:`PART_SIZE` buffer. Writes must be
+    sequential - S3 has no partial update - and any failure aborts the
+    upload, so a key is either the whole file or untouched.
+    """
 
     def __init__(self, plugin: HTTPPlugin, url: str) -> None:
+        """Start the multipart upload at once, so a refused bucket fails the open."""
         super().__init__(url)
         self._upload = Multipart(plugin, url)
         self._part = bytearray()
 
     def write(self, data: bytes | bytearray | memoryview) -> int:
+        """Buffer ``data``, sending every part that fills; all of it is always taken."""
         view = memoryview(data).cast("B")
         try:
             self._part += view
@@ -436,11 +559,19 @@ class S3PartWriter(PluginFile):
         return view.nbytes
 
     def pwrite(self, data: bytes | bytearray | memoryview, offset: int) -> int:
+        """:meth:`write`, allowed only at the current end (``ESPIPE`` elsewhere)."""
         if offset != self.position:
             raise GError("S3 uploads are sequential: pwrite must continue the file", errno.ESPIPE)
         return self.write(data)
 
     def close(self) -> None:
+        """Send the last part and complete - or abort, if closed while an exception unwinds.
+
+        A close inside an ``except``/``with`` that is propagating an error
+        must not publish a half-written object, hence the look at
+        ``sys.exc_info()``. An empty file is still one (empty) part: S3
+        refuses to complete an upload with none.
+        """
         if self.closed:
             return
         self.closed = True

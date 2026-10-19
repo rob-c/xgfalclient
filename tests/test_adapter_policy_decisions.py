@@ -5,26 +5,30 @@ from __future__ import annotations
 import errno
 import importlib
 import os
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from email.message import Message
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn, cast
 
 import pytest
 
-from xgfalclient._xml import fromstring
+import xgfalclient
+from xgfalclient.crypto import ciphers
 from xgfalclient.errors import GError
 from xgfalclient.plugins import file as local
-from xgfalclient.plugins.http import _client, _copy, _io, _metalink, _s3
+from xgfalclient.plugins.http import _client, _io, _metalink, _ranged, _s3
 from xgfalclient.plugins.http.plugin import HTTPPlugin
 from xgfalclient.plugins.sftp import ssh
 
 
-def _raise(error):
+def _raise(error: BaseException) -> NoReturn:
     raise error
 
 
-def test_missing_optional_platform_errno_is_not_required(monkeypatch):
+def test_missing_optional_platform_errno_is_not_required(monkeypatch: pytest.MonkeyPatch) -> None:
     original_namespace = dict(vars(local))
     try:
         with monkeypatch.context() as patcher:
@@ -38,7 +42,9 @@ def test_missing_optional_platform_errno_is_not_required(monkeypatch):
 
 
 @pytest.mark.parametrize("case", ["unseekable", "write_mode", "permanent"])
-def test_local_read_recovery_rejects_unsafe_or_permanent_retries(tmp_path, ctx, case):
+def test_local_read_recovery_rejects_unsafe_or_permanent_retries(
+    tmp_path: Path, ctx: xgfalclient.Gfal2Context, case: str
+) -> None:
     path = tmp_path / "data"
     path.write_bytes(b"data")
     handle = local.LocalFile(path.as_uri(), str(path), os.O_RDONLY, 0o600, ctx.options)
@@ -53,7 +59,9 @@ def test_local_read_recovery_rejects_unsafe_or_permanent_retries(tmp_path, ctx, 
         handle.close()
 
 
-def test_local_open_stops_after_the_configured_retry_budget(monkeypatch, ctx):
+def test_local_open_stops_after_the_configured_retry_budget(
+    monkeypatch: pytest.MonkeyPatch, ctx: xgfalclient.Gfal2Context
+) -> None:
     ctx.set_opt_integer("CORE", "CONN_RETRY", 0)
     monkeypatch.setattr(local, "LocalFile", lambda *args: _raise(OSError(errno.ESTALE, "stale")))
     with pytest.raises(GError) as error:
@@ -61,29 +69,26 @@ def test_local_open_stops_after_the_configured_retry_budget(monkeypatch, ctx):
     assert error.value.code == errno.ESTALE
 
 
-def test_returning_a_connection_after_pool_shutdown_closes_it(ctx):
-    client = _client.HTTPClient(ctx)
-    calls = []
-    exchange = SimpleNamespace(key=("http", "unused", 80, 0), close=lambda: calls.append("close"))
-    client._checkin(exchange)
-    assert calls == ["close"]
-
-
-def test_destination_write_error_without_errno_has_a_plain_fallback(monkeypatch):
-    monkeypatch.setattr(_copy.os, "pwrite", lambda *args: _raise(OSError("write failed")))
+def test_destination_write_error_without_errno_has_a_plain_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "pwrite", lambda *args: _raise(OSError("write failed")))
     with pytest.raises(GError, match="write failed") as error:
-        _copy._pwrite_all(-1, memoryview(b"x"), 0)
+        _ranged._pwrite_all(-1, memoryview(b"x"), 0)
     assert error.value.code == errno.EIO
 
 
 @pytest.mark.parametrize("method", ["_retry_stream", "_failover_stream", "pread"])
-def test_read_timeout_never_selects_another_replica(monkeypatch, method):
+def test_read_timeout_never_selects_another_replica(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
     plugin = SimpleNamespace(conn_retry=lambda: 0)
-    handle = _io.HTTPReadFile(plugin, "https://unused.example/data", 1)
+    handle = _io.HTTPReadFile(cast(HTTPPlugin, plugin), "https://unused.example/data", 1)
     monkeypatch.setattr(
         handle, "_next_replica", lambda: _raise(AssertionError("timeout must not fail over"))
     )
     timeout = _client.TransportError("timed out", errno.ETIMEDOUT)
+    call: Callable[[], object]
     if method == "_retry_stream":
         call = partial(handle._retry_stream, timeout, 0)
     elif method == "_failover_stream":
@@ -97,9 +102,12 @@ def test_read_timeout_never_selects_another_replica(monkeypatch, method):
 
 
 @pytest.mark.parametrize("operation", ["request", "stat"])
-def test_http_timeout_preserves_code_and_does_not_attempt_recovery(ctx, monkeypatch, operation):
+def test_http_timeout_preserves_code_and_does_not_attempt_recovery(
+    ctx: xgfalclient.Gfal2Context, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
     plugin = HTTPPlugin(ctx)
     timeout = _client.TransportError("timed out", errno.ETIMEDOUT)
+    call: Callable[[], object]
     if operation == "request":
         monkeypatch.setattr(plugin.client, "request", lambda *args, **kwargs: _raise(timeout))
         call = partial(plugin._request, "GET", "https://unused.example/data")
@@ -115,43 +123,49 @@ def test_http_timeout_preserves_code_and_does_not_attempt_recovery(ctx, monkeypa
     assert error.value.code == errno.ETIMEDOUT
 
 
-def _descriptor_response(relation):
+def _descriptor_response(relation: str | None) -> _client.Response:
     headers = Message()
     suffix = "" if relation is None else f'; rel="{relation}"'
     headers["Link"] = f'<https://unused.example/catalog>; type="application/metalink4+xml"{suffix}'
-    return SimpleNamespace(headers=headers, header=lambda name: headers.get(name, ""))
+    response = SimpleNamespace(headers=headers, header=lambda name: headers.get(name, ""))
+    return cast(_client.Response, response)
 
 
 @pytest.mark.parametrize("relation", [None, "alternate"])
-def test_metalink_link_relation_may_be_missing_but_must_not_be_unrelated(relation):
+def test_metalink_link_relation_may_be_missing_but_must_not_be_unrelated(
+    relation: str | None,
+) -> None:
     found = _metalink.descriptor_url(_descriptor_response(relation), "https://unused.example/data")
     assert found == ("https://unused.example/catalog" if relation is None else None)
 
 
-def test_empty_metalink_size_does_not_invent_a_file_length():
-    assert _metalink._size(fromstring(b"<metalink><size/></metalink>")) is None
+def test_empty_metalink_size_does_not_invent_a_file_length() -> None:
+    document = b"<metalink><size/><url>https://h/f</url></metalink>"
+    assert _metalink.parse_metalink(document, base_url="https://h/f.meta4").size is None
 
 
 class OfflineResponse:
-    def __init__(self, status, headers):
+    def __init__(self, status: int, headers: Message) -> None:
         self.status = status
         self.headers = headers
         self.closed = False
 
-    def __enter__(self):
+    def __enter__(self) -> OfflineResponse:
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: object) -> None:
         self.close()
 
-    def header(self, name):
-        return self.headers.get(name, "")
+    def header(self, name: str) -> str:
+        return str(self.headers.get(name, ""))
 
-    def close(self):
+    def close(self) -> None:
         self.closed = True
 
 
-def test_metalink_descriptor_with_informational_status_is_not_a_success(ctx, monkeypatch):
+def test_metalink_descriptor_with_informational_status_is_not_a_success(
+    ctx: xgfalclient.Gfal2Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
     plugin = HTTPPlugin(ctx)
     monkeypatch.setattr(plugin, "_metalink_enabled", lambda url: True)
     head = OfflineResponse(200, _descriptor_response("describedby").headers)
@@ -165,7 +179,7 @@ def test_metalink_descriptor_with_informational_status_is_not_a_success(ctx, mon
     assert head.closed and descriptor.closed
 
 
-def test_botocore_replaces_stale_signing_headers():
+def test_botocore_replaces_stale_signing_headers() -> None:
     signer = _s3.S3Signer(_s3.S3Keys("test-access", "test-secret", "test-token", "us-east-1"))
     target = _client.Target.of("https://unused.example/bucket/key", s3=True)
     signed = signer.sign(
@@ -178,7 +192,7 @@ def test_botocore_replaces_stale_signing_headers():
             "X-Amz-Meta-Name": "retained",
         },
         None,
-        when=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        when=datetime(2026, 1, 1, tzinfo=UTC),
     )
     lowered = {name.lower(): value for name, value in signed.items()}
     assert lowered["x-amz-date"] == "20260101T000000Z"
@@ -187,9 +201,9 @@ def test_botocore_replaces_stale_signing_headers():
     assert lowered["x-amz-content-sha256"] != "stale"
 
 
-def test_ssh_preferences_keep_aes_ctr_when_optional_fast_modes_are_unavailable():
+def test_ssh_preferences_keep_aes_ctr_when_optional_fast_modes_are_unavailable() -> None:
     backend = SimpleNamespace(has_gcm=False, fast_chacha=False)
-    assert ssh._ciphers_preferred(backend) == (
+    assert ssh._ciphers_preferred(cast(ciphers.Backend, backend)) == (
         "aes256-ctr",
         "aes192-ctr",
         "aes128-ctr",

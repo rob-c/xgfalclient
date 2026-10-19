@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import sys
-import types
 import zlib
 
 import pytest
+from xrdcore.checksum import Checksum
 
 from xgfalclient import checksum
 
@@ -51,7 +50,7 @@ def test_incremental_equals_one_shot() -> None:
         assert digest.name == name
     assert checksum.checksum_chunks("adler32", [b"hello ", b"world\n"]) == "1e720467"
     rolling = checksum.new("adler32")
-    assert rolling.value == 1  # type: ignore[union-attr]
+    assert isinstance(rolling, Checksum) and rolling.value == 1
 
 
 def test_unknown_algorithm() -> None:
@@ -67,15 +66,21 @@ def test_normalise_and_compare() -> None:
     assert not checksum.checksums_match("abc", "abd")
 
 
-def test_accelerator_is_used_when_importable(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = types.ModuleType("fake_crc32c")
-    fake.extend = lambda crc, data: checksum.crc32c_py(data, crc)  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "fake_crc32c", fake)
-    fast = checksum._accelerated("fake_crc32c")
-    assert fast is not None
-    assert fast(b"123456789", 0) == 0xE3069283
-    assert checksum._select(fast) is fast
-    assert checksum._select(None) is checksum.crc32c_py
-    assert checksum._accelerated("module_that_does_not_exist") is None
-    monkeypatch.setitem(sys.modules, "no_extend", types.ModuleType("no_extend"))
-    assert checksum._accelerated("no_extend") is None
+def test_crc32c_is_the_shared_implementation() -> None:
+    """One CRC-32C for every client: xrdcore's, accelerator probe and all."""
+    import importlib
+
+    shared = importlib.import_module("xrdcore.crc32c")
+
+    assert checksum.crc32c is shared.crc32c
+    assert checksum.crc32c_py is shared.crc32c_py
+    assert checksum.IS_ACCELERATED is shared.IS_ACCELERATED
+    with pytest.raises(AttributeError, match="no_such_name"):
+        _ = checksum.no_such_name
+
+
+def test_gfal2_algorithm_set_is_kept() -> None:
+    """xrdcore computes CRC-64 too; gfal2 knows no such algorithm."""
+    assert "crc64" not in checksum.algorithms()
+    with pytest.raises(ValueError, match="crc64"):
+        checksum.new("crc64")

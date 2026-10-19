@@ -8,12 +8,12 @@ import os
 import pickle
 import stat as stat_module
 import warnings
+from pathlib import Path
 
 import pytest
 
 import xgfalclient
 from xgfalclient import errors
-from xgfalclient._compat import dataclass_slots, peer_chain_der
 from xgfalclient.enums import checksum_mode, event_side, verbose_level
 from xgfalclient.events import BOTH, DESTINATION, SOURCE, GfaltEvent, log_event, markup_escape
 from xgfalclient.types import (
@@ -24,6 +24,7 @@ from xgfalclient.types import (
     Dirent,
     Stat,
     TransferParameters,
+    _Field,
     dtype_for_mode,
 )
 from xgfalclient.url import URL, basename, join, parent, parse, scheme_of
@@ -99,7 +100,7 @@ def test_enums_build_nameless_members_from_ints() -> None:
     assert repr(made) == str(made) == "gfal2.checksum_mode(2)"
     assert repr(checksum_mode(9)) == "gfal2.checksum_mode(9)"
     with pytest.raises(AttributeError):
-        made.name  # noqa: B018
+        _ = made.name
 
 
 def test_duplicate_values_keep_the_last_member() -> None:
@@ -177,8 +178,8 @@ def test_stat_rejects_unknown_fields_and_compares() -> None:
     assert Stat() != "stat"
 
 
-def test_stat_from_os(tmp_path: object) -> None:
-    info = Stat.from_os(os.stat(os.fspath(tmp_path)))  # type: ignore[arg-type]
+def test_stat_from_os(tmp_path: Path) -> None:
+    info = Stat.from_os(os.stat(os.fspath(tmp_path)))
     assert info.is_dir()
 
 
@@ -224,6 +225,23 @@ def test_parse_keeps_everything() -> None:
     assert parsed.userinfo == "user"
     assert parsed.base == "root://user@host.example:1095"
     assert parsed.query_dict() == {"authz": "x"}
+
+
+def test_opaque_lfn_and_guid_urls() -> None:
+    # The LFC's names have no authority: "lfn:/grid/f" is the path /grid/f
+    # (not host "rid"), and both it and gfal2's "lfn:///grid/f" round-trip.
+    for url in ("lfn:/grid/vo/f", "lfn:///grid/vo/f", "guid:5c2b-77", "lfn:/grid/f?x=1#y"):
+        assert str(parse(url)) == url
+    opaque = parse("lfn:/grid/vo/f")
+    assert (opaque.scheme, opaque.netloc, opaque.path) == ("lfn", "", "/grid/vo/f")
+    assert parse("lfn:///grid/vo/f").path == "/grid/vo/f"
+    assert parent("lfn:/grid/vo/f") == "lfn:/grid/vo"
+    assert parent("lfn:/grid") == "lfn:/"
+    assert parent("lfn:/") == "lfn:/"  # the root is its own parent: a climb stops
+    assert parent("lfn:///grid/vo/f") == "lfn:///grid/vo"
+    assert join("lfn:/grid", "f") == "lfn:/grid/f"
+    assert basename("lfn:/grid/vo/f") == "f"
+    assert parent("guid:5c2b-77") == "guid:5c2b-77"  # a GUID has no directory
 
 
 def test_parse_ipv6_and_default_ports() -> None:
@@ -300,60 +318,6 @@ def test_join_parent_basename() -> None:
     assert basename("davs://h/a/b/") == "b"
 
 
-# -- the version shims -------------------------------------------------------------
-
-
-def test_dataclass_slots_only_from_3_10() -> None:
-    assert dataclass_slots((3, 9, 18)) == {}
-    assert dataclass_slots((3, 10, 0)) == {"slots": True}
-
-
-class _Link:
-    """An ``_ssl.Certificate`` before 3.13: no ``public_bytes``, but buffer-convertible."""
-
-    def __init__(self, der: bytes) -> None:
-        self.der = der
-
-    def __bytes__(self) -> bytes:
-        return self.der
-
-
-class _PublicLink(_Link):
-    """A 3.13 ``ssl.Certificate``: ``public_bytes(2)`` is the DER form."""
-
-    def public_bytes(self, encoding: int) -> bytes:
-        assert encoding == 2
-        return self.der
-
-
-class _Tls:
-    """Just enough of an ``SSLSocket``: the leaf via ``getpeercert``, nothing else."""
-
-    def __init__(self, leaf: bytes | None) -> None:
-        self.leaf = leaf
-
-    def getpeercert(self, binary_form: bool = False) -> bytes | None:
-        assert binary_form
-        return self.leaf
-
-
-def test_peer_chain_der_public_method() -> None:
-    tls = _Tls(b"unused")
-    tls.get_unverified_chain = lambda: [_PublicLink(b"leaf"), _PublicLink(b"ca")]  # type: ignore[attr-defined]
-    assert peer_chain_der(tls) == [b"leaf", b"ca"]
-
-
-def test_peer_chain_der_private_method_before_3_13() -> None:
-    tls = _Tls(b"unused")
-    tls._sslobj = type("SSLObject", (), {"get_unverified_chain": lambda self: [_Link(b"leaf")]})()  # type: ignore[attr-defined]
-    assert peer_chain_der(tls) == [b"leaf"]
-
-
-def test_peer_chain_der_leaf_only_on_3_9() -> None:
-    assert peer_chain_der(_Tls(b"leaf")) == [b"leaf"]
-    assert peer_chain_der(_Tls(None)) == []
-
-
 # -- TransferParameters -----------------------------------------------------------
 
 
@@ -380,8 +344,9 @@ def test_parameter_defaults_match_gfal2() -> None:
     )
     field = TransferParameters.__dict__["timeout"]
     assert TransferParameters.timeout is field  # the descriptor, read from the class
+    assert type(field).__mro__[1] is _Field
     with pytest.raises(NotImplementedError):
-        type(field).__mro__[1].convert(field, 1)  # the base field converts nothing
+        _Field.convert(field, 1)  # the base field converts nothing
 
 
 def test_parameters_are_typed_as_the_bindings_type_them() -> None:
@@ -395,10 +360,10 @@ def test_parameters_are_typed_as_the_bindings_type_them() -> None:
     for name, value in [("timeout", -1), ("tcp_buffersize", -1), ("nbstreams", 2**32)]:
         with pytest.raises(OverflowError):
             setattr(params, name, value)
-    params.overwrite = 1  # type: ignore[assignment]
+    params.overwrite = 1
     assert params.overwrite is True
     with pytest.raises(TypeError):
-        params.overwrite = "x"  # type: ignore[assignment]
+        params.overwrite = "x"
     params.dst_spacetoken = "T"
     assert params.dst_spacetoken == "T" and params.timeout == 1
 
@@ -438,7 +403,8 @@ def test_set_checksum_validation() -> None:
         assert caught.value.message == "Checksum value required if mode is not end to end"
     params.set_checksum(1, "adler32", "abc")
     assert params.get_checksum() == (checksum_mode.source, "adler32", "abc")
-    params.set_checksum(checksum_mode.none, None, None)  # type: ignore[arg-type]
+    # None, as the bindings' callers pass it for "no algorithm/value".
+    params.set_checksum(checksum_mode.none, None, None)
     assert params.get_checksum() == (checksum_mode.none, "", "")
 
 

@@ -13,7 +13,7 @@ from xgfalclient.errors import _USER_ERRORS, GError, from_oserror, gerror
 
 @pytest.mark.parametrize("code", sorted(_USER_ERRORS))
 @pytest.mark.parametrize("kind", ["empty", "system", "file_plugin", "scoped"])
-def test_common_errors_have_a_clear_display_and_unchanged_payload(code, kind):
+def test_common_errors_have_a_clear_display_and_unchanged_payload(code: int, kind: str) -> None:
     messages = {
         "empty": "",
         "system": os.strerror(code),
@@ -35,19 +35,19 @@ def test_common_errors_have_a_clear_display_and_unchanged_payload(code, kind):
     assert str(recovered) == str(error)
 
 
-def test_existing_actionable_details_are_not_replaced_by_generic_advice():
+def test_existing_actionable_details_are_not_replaced_by_generic_advice() -> None:
     error = gerror(errno.EACCES, "Your bearer token has expired. Get a new token.", "http")
     assert error.user_message == "Your bearer token has expired. Get a new token."
     assert error.message.startswith("[http]")
 
 
-def test_unknown_error_numbers_are_retained_without_guessing_the_cause():
+def test_unknown_error_numbers_are_retained_without_guessing_the_cause() -> None:
     error = GError(os.strerror(9876), 9876)
     assert error.code == 9876
     assert error.user_message == "The request failed. Check the command and service configuration."
 
 
-def test_local_missing_file_is_not_a_jargon_message():
+def test_local_missing_file_is_not_a_jargon_message() -> None:
     error = from_oserror(FileNotFoundError(errno.ENOENT, "gone", "/tmp/data.root"))
     assert error.code == errno.ENOENT
     assert error.user_message == "File or folder not found. Check the path and try again."

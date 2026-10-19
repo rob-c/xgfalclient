@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import errno
+import os
 import socket
 import struct
 import sys
 import threading
 from collections.abc import Callable, Iterator
+from typing import cast
 
 import pytest
 
@@ -159,8 +161,8 @@ def test_local_identity_of_an_unnamed_uid(monkeypatch: pytest.MonkeyPatch) -> No
 def test_local_identity_without_pwd(monkeypatch: pytest.MonkeyPatch) -> None:
     """As on Windows: no ``pwd``, no ``geteuid``, so uid and gid are 0."""
     monkeypatch.setitem(sys.modules, "pwd", None)
-    monkeypatch.delattr(csec.os, "geteuid", raising=False)
-    monkeypatch.delattr(csec.os, "getegid", raising=False)
+    monkeypatch.delattr(os, "geteuid", raising=False)
+    monkeypatch.delattr(os, "getegid", raising=False)
     assert csec.local_identity() == (0, 0, "0")
 
 
@@ -361,6 +363,6 @@ def test_available_krb5(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_base_mechanism() -> None:
     with pytest.raises(NotImplementedError):
-        csec.Mechanism().authenticate(None, "h")  # type: ignore[arg-type]
+        csec.Mechanism().authenticate(cast("csec.TokenLink", None), "h")
     with pytest.raises(NotImplementedError):
         csec._TokenMechanism().context("h")

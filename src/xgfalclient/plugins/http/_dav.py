@@ -1,31 +1,44 @@
 """WebDAV and RFC 3230 parsing: ``PROPFIND`` multistatus bodies and ``Digest`` headers.
 
-A multistatus is loaded through the local standard-library XML wrapper,
-which refuses DTDs, entities and external resources. A body that does not parse
-is ``EIO`` ``XML Parsing Error: ...``
-as in davix, but the rest of the message is expat's diagnosis, not
-libxml2's (``XML parse error at line 1: Document is empty``).
+The parsing itself is xrdhttp's (:mod:`xrdhttp.webdav`; xrdclient's
+``http._webdav`` until 0.4.0), shared by every client: what a
+``<D:response>`` says, which path an ``<D:href>`` names, HTTP and ISO 8601
+dates, and which ``Digest`` value is the checksum asked for. What this
+module adds is davix's reading of the result.
+
+A multistatus is loaded through :mod:`xrdcore.safexml`, which refuses DTDs,
+entities and external resources. A body that does not parse is ``EIO``
+``XML Parsing Error: ...`` as in davix, but the rest of the message is
+expat's diagnosis, not libxml2's (``XML parse error at line 1: Document is
+empty``).
 
 The ``stat`` a ``<D:response>`` becomes is davix's: WebDAV has no owner and
 no permissions, so the mode is ``0777`` plus the file type, uid, gid, nlink
 and inode are zero, ``mtime`` comes from ``getlastmodified`` and ``ctime``
-from ``creationdate`` when the server sends one.
+from ``creationdate`` when the server sends one. Unlike xrdclient, which
+refuses one, a ``<D:response>`` with no ``href`` is skipped, and responses
+nested anywhere in the document count, as davix's parser finds them.
+
+Per RFC 4918 (section 14.16) a multistatus holds one ``<D:response>`` per
+resource, each with an ``<D:href>`` and ``<D:propstat>`` blocks; a ``404``
+propstat for a property the server lacks (say ``creationdate``) is normal
+and just leaves that field at zero.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
-import email.utils
 import errno
-import hashlib
 import posixpath
 import stat as _stat
-import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime
 
-from ..._xml import UnsafeXML, fromstring
+from xrdcore.safexml import UnsafeXML, fromstring
+from xrdhttp.webdav import DAV as _DAV
+from xrdhttp.webdav import epoch as epoch
+from xrdhttp.webdav import href_path as href_path
+from xrdhttp.webdav import pick_digest, resource
+from xrdhttp.webdav import text as _text
+
 from ...errors import GError
 from ...types import Stat
 
@@ -38,8 +51,6 @@ __all__ = [
     "parse_xml",
     "stat_for",
 ]
-
-_DAV = "{DAV:}"
 
 #: The properties a listing asks for: what ``Stat`` needs and nothing else.
 PROPFIND_BODY = (
@@ -65,50 +76,14 @@ def parse_xml(payload: bytes, what: str = "WebDAV response") -> ET.Element:
         raise GError(f"XML Parsing Error: {what}: {exc}", errno.EIO) from exc
 
 
-def epoch(stamp: str) -> int:
-    """Seconds since the epoch from an HTTP date or an ISO 8601 one."""
-    text = stamp.strip()
-    if not text:
-        return 0
-    try:
-        return int(email.utils.parsedate_to_datetime(text).timestamp())
-    except (TypeError, ValueError, IndexError):
-        pass
-    try:
-        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
-    except ValueError:
-        return 0
-
-
-def href_path(href: str) -> str:
-    """The unquoted server path an ``<D:href>`` names, absolute or not."""
-    raw = urllib.parse.urlsplit(href).path if "://" in href else href
-    return urllib.parse.unquote(raw) or "/"
-
-
-def _text(element: ET.Element | None, name: str) -> str:
-    if element is None:
-        return ""
-    found = element.find(_DAV + name)
-    return (found.text or "").strip() if found is not None else ""
-
-
 def stat_for(response: ET.Element) -> Stat:
     """One ``<D:response>`` as the ``Stat`` davix makes of it."""
-    prop = None
-    for propstat in response.findall(_DAV + "propstat"):
-        status = _text(propstat, "status")
-        if not status or " 200 " in f"{status} ":
-            prop = propstat.find(_DAV + "prop")
-            break
-    kind = prop.find(_DAV + "resourcetype") if prop is not None else None
-    is_dir = kind is not None and kind.find(_DAV + "collection") is not None
-    size = _text(prop, "getcontentlength")
+    found = resource(response)
     return Stat(
-        st_mode=DIR_MODE if is_dir else FILE_MODE,
-        st_size=int(size) if size.isdigit() else 0,
-        st_mtime=epoch(_text(prop, "getlastmodified")),
-        st_ctime=epoch(_text(prop, "creationdate")),
+        st_mode=DIR_MODE if found.is_dir else FILE_MODE,
+        st_size=found.size,
+        st_mtime=found.mtime,
+        st_ctime=found.ctime,
     )
 
 
@@ -124,49 +99,20 @@ def parse_multistatus(payload: bytes) -> list[tuple[str, Stat]]:
 
 
 def same_path(left: str, right: str) -> bool:
-    """Equal as collection paths: trailing slashes and ``//`` do not count."""
+    """Equal as collection paths: trailing slashes and ``//`` do not count.
+
+    Used to find a listing's own entry: servers answer ``/dir`` asked as
+    ``/dir/`` and the reverse, and some double a slash at a mount point.
+    """
     return posixpath.normpath("/" + left.strip("/")) == posixpath.normpath("/" + right.strip("/"))
 
 
-# ---------------------------------------------------------------------------
-# RFC 3230 digests
-# ---------------------------------------------------------------------------
-
-#: Digests storage sends in hex; every other algorithm arrives base64-encoded.
-_HEX = frozenset({"adler32", "crc32", "crc32c", "unixcksum", "cksum"})
-#: The RFC 3230 names that differ from the names users type.
-_ALIASES = {"sha": "sha1", "sha-1": "sha1", "sha-256": "sha256", "sha-512": "sha512"}
-
-
-def _canonical(name: str) -> str:
-    key = name.strip().lower()
-    return _ALIASES.get(key, key)
-
-
 def digest_value(header: str, algorithm: str) -> str:
-    """``algorithm``'s value out of a ``Digest`` header, as lower-case hex ('' if absent)."""
-    wanted = _canonical(algorithm)
-    for item in header.split(","):
-        name, sep, raw = item.strip().partition("=")
-        if not sep or _canonical(name) != wanted:
-            continue
-        return _as_hex(raw.strip(), wanted)
-    return ""
+    """``algorithm``'s value out of a ``Digest`` header, as lower-case hex ('' if absent).
 
-
-def _as_hex(value: str, algorithm: str) -> str:
-    """RFC 3230 base64 for hashes; hex for the checksums storage speaks natively."""
-    if algorithm in _HEX or _looks_hex(value, algorithm):
-        return value.lower()
-    try:
-        return base64.b64decode(value, validate=True).hex()
-    except (binascii.Error, ValueError):
-        return value.lower()
-
-
-def _looks_hex(value: str, algorithm: str) -> bool:
-    try:
-        width = 2 * hashlib.new(algorithm).digest_size
-    except ValueError:
-        return False
-    return len(value) == width and all(char in "0123456789abcdefABCDEF" for char in value)
+    RFC 3230 base64 for hashes, hex for the checksums storage speaks natively
+    (ADLER32, the CRCs): xrdhttp's
+    :func:`~xrdhttp.webdav.pick_digest`, which compares names in
+    canonical form (``sha``, ``SHA-1`` and ``sha1`` are one algorithm).
+    """
+    return pick_digest(header, algorithm)

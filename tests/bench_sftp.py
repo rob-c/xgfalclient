@@ -1,10 +1,11 @@
-# ruff: noqa: E501
 """A 256 MiB upload/download benchmark for the sftp plugin, inside the Docker VM.
 
-Run from the host; it launches a client container on ``xgfal-sftp-net`` (the
-``gfal-sftp-ref`` snapshot, which carries ``gfal2-plugin-sftp``) that transfers
-a 256 MiB file to and from the sshd in ``xgfal-sftp-ref`` through each
-xgfalclient transport tier and through real gfal2, and prints MB/s.
+Run from the host; it launches client containers on ``xgfal-sftp-net`` (the
+``gfal-sftp-ref`` snapshot, which carries ``gfal2-plugin-sftp``) that transfer
+a 256 MiB file to and from the sshd in ``xgfal-sftp-ref`` through real gfal2
+(on the system Python 3.9) and through each xgfalclient transport tier (on
+AppStream Python 3.11, in an image derived for it by ``_interop_image``), and
+prints MB/s.
 
     python tests/bench_sftp.py
 
@@ -20,6 +21,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
+
+from _interop_image import GFAL2_PYTHON, XGFAL_PYTHON, library_mounts, xgfal_image, xrdclient_src
 
 IMAGE = "gfal-sftp-ref:latest"
 NETWORK = "xgfal-sftp-net"
@@ -28,11 +32,16 @@ HOST = "sftpref"
 ROOT = Path(__file__).resolve().parent.parent
 SIZE = 256 * 1024 * 1024
 
+#: One side per run: ``gfal2`` on the system python3 (keep to 3.9 syntax), or
+#: ``xgfal``'s tiers on python3.11, so that each imports only what it can.
 DRIVER = r"""
-import importlib, json, os, sys, time
-sys.path.insert(0, "/src/src")
-import xgfalclient
-real = importlib.import_module("gfal2")
+import json, os, sys, time
+SIDE = sys.argv[1]
+if SIDE == "xgfal":
+    sys.path[:0] = ["/src/src", "/xrd"]
+    import xgfalclient
+else:
+    import gfal2 as real
 HOST = os.environ["IHOST"]
 SIZE = int(os.environ["SIZE"])
 home = "/home/alice"
@@ -72,8 +81,11 @@ def cfg(ctx, tier, passwd):
     return ctx
 
 report = {}
-gctx = cfg(real.creat_context(), "gfal2", True)
-report["gfal2 (libssh2)"] = bench(real, gctx, "sftp://%s%s/real" % (HOST, home), "gfal2")
+if SIDE != "xgfal":
+    gctx = cfg(real.creat_context(), "gfal2", True)
+    report["gfal2 (libssh2)"] = bench(real, gctx, "sftp://%s%s/real" % (HOST, home), "gfal2")
+    print("BENCHJSON" + json.dumps(report))
+    sys.exit(0)
 
 for tier, transport, passwd in [
     ("openssh", "openssh", False),
@@ -85,10 +97,53 @@ for tier, transport, passwd in [
     ctx.set_opt_string("SFTP PLUGIN", "TRANSPORT", transport)
     label = "xgfal %s (%s)" % (tier, xgfalclient.__name__)
     from xgfalclient.crypto import ciphers
-    report["xgfal " + tier + " [" + ciphers.get().name + "]"] = bench(xgfalclient, ctx, "sftp://%s%s/%s" % (HOST, home, tier), tier)
+    url = "sftp://%s%s/%s" % (HOST, home, tier)
+    report["xgfal " + tier + " [" + ciphers.get().name + "]"] = bench(xgfalclient, ctx, url, tier)
 
 print("BENCHJSON" + json.dumps(report))
 """
+
+
+def _run_side(side: str, keys: str) -> dict[str, Any] | None:
+    """One side of the driver in a client container of its own: its report."""
+    if side == "xgfal":
+        image, python = xgfal_image(IMAGE), XGFAL_PYTHON
+    else:
+        image, python = IMAGE, GFAL2_PYTHON
+    proc = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            NETWORK,
+            "-e",
+            f"IHOST={HOST}",
+            "-e",
+            f"SIZE={SIZE}",
+            "-v",
+            f"{ROOT}:/src:ro",
+            "-v",
+            f"{xrdclient_src()}:/xrd:ro",
+            *library_mounts(),
+            "-v",
+            f"{keys}:/keys:ro",
+            image,
+            python,
+            "-c",
+            DRIVER,
+            side,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1200,
+    )
+    if "BENCHJSON" not in proc.stdout:
+        print("STDOUT:\n" + proc.stdout)
+        print("STDERR:\n" + proc.stderr)
+        return None
+    report: dict[str, Any] = json.loads(proc.stdout.split("BENCHJSON", 1)[1])
+    return report
 
 
 def main() -> int:
@@ -114,35 +169,12 @@ def main() -> int:
             capture_output=True,
         )
         Path(f"{tmp}/id_ed25519").chmod(0o600)
-        proc = subprocess.run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--network",
-                NETWORK,
-                "-e",
-                f"IHOST={HOST}",
-                "-e",
-                f"SIZE={SIZE}",
-                "-v",
-                f"{ROOT}:/src:ro",
-                "-v",
-                f"{tmp}:/keys:ro",
-                IMAGE,
-                "python3",
-                "-c",
-                DRIVER,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=1200,
-        )
-    if "BENCHJSON" not in proc.stdout:
-        print("STDOUT:\n" + proc.stdout)
-        print("STDERR:\n" + proc.stderr)
-        return 1
-    report = json.loads(proc.stdout.split("BENCHJSON", 1)[1])
+        report = {}
+        for side in ("gfal2", "xgfal"):
+            found = _run_side(side, tmp)
+            if found is None:
+                return 1
+            report.update(found)
     print(f"\n256 MiB transfers to/from {HOST} (inside the Docker VM):\n")
     print(f"{'stack':<34} {'upload MB/s':>12} {'download MB/s':>14}")
     for label, r in report.items():

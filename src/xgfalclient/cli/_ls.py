@@ -11,21 +11,27 @@ from __future__ import annotations
 import math
 import os
 import stat
+from collections.abc import Callable
 from datetime import datetime
-from typing import Callable
 
 from ..types import Stat
 from ._base import Command, Spec, arg, out, output, stat_record, stdout_isatty, surl
 from ._utils import file_mode_str, ls_colors
 
-__all__ = ["SPECS", "size_to_human", "TIME_FORMATS"]
+__all__ = ["SPECS", "TIME_FORMATS", "size_to_human"]
 
 
 def _full_iso(stamp: int) -> str:
+    """``--time-style=full-iso``: local time labelled ``+0000`` whatever the zone.
+
+    The label is gfal2-util's (it hard-codes the offset); correcting it
+    would change output that scripts already parse.
+    """
     return datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M:%S.%f +0000")
 
 
 def _long_iso(stamp: int) -> str:
+    """``--time-style=long-iso`` (and ``--full-time``): ``YYYY-MM-DD HH:MM``."""
     return datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M")
 
 
@@ -35,16 +41,22 @@ def _recent(when: datetime) -> bool:
 
 
 def _iso(stamp: int) -> str:
+    """``--time-style=iso``: ``MM-DD HH:MM`` if recent, else ``YYYY-MM-DD``, as GNU ``ls``."""
     when = datetime.fromtimestamp(stamp)
     return when.strftime("%m-%d %H:%M" if _recent(when) else "%Y-%m-%d")
 
 
 def _locale(stamp: int) -> str:
+    """The default style: ``Mon DD HH:MM`` if recent, else ``Mon DD  YYYY`` (two spaces).
+
+    The day is space-padded to two columns, as GNU ``ls`` pads it.
+    """
     when = datetime.fromtimestamp(stamp)
     day = when.strftime("%d").lstrip("0").rjust(2)
     return when.strftime(f"%b {day} %H:%M" if _recent(when) else f"%b {day}  %Y")
 
 
+#: ``--time-style`` choices to their formatters; the keys are the option's choices.
 TIME_FORMATS: dict[str, Callable[[int], str]] = {
     "full-iso": _full_iso,
     "long-iso": _long_iso,
@@ -54,7 +66,11 @@ TIME_FORMATS: dict[str, Callable[[int], str]] = {
 
 
 def size_to_human(size: float) -> str:
-    """``1.5K``, ``234M``: one decimal below 10, rounded up."""
+    """``1.5K``, ``234M``: one decimal below 10, rounded up.
+
+    Powers of 1024 with single-letter suffixes, as ``ls -lh``; rounding is
+    always up (``ceil``), so a size never reads smaller than it is.
+    """
     symbols = ["", "K", "M", "G", "T", "P"]
     degree = 0
     while float(size) >= 1024.0 and degree < len(symbols) - 1:
@@ -66,7 +82,15 @@ def size_to_human(size: float) -> str:
 
 
 class _Lister:
+    """The formatting state of one ``gfal-ls`` run: long or short, colour or not.
+
+    A machine-readable report always wants the metadata, so with ``--json``
+    the entries are stat-ed (``detailed``) even without ``-l``; the human
+    output still follows ``-l``.
+    """
+
     def __init__(self, cmd: Command) -> None:
+        """Decide colour once: ``always``, or ``auto`` on a terminal."""
         self.cmd = cmd
         self.params = cmd.params
         self.detailed = self.params.long or output.current() is not None
@@ -77,6 +101,11 @@ class _Lister:
         self.colors = ls_colors()
 
     def color(self, name: str, mode: int | None) -> str:
+        """``name`` wrapped in its ``LS_COLORS`` escape (``di``, ``ln``, ``ex``, ``no``).
+
+        Only those four keys, as gfal2-util reads them; ``037`` is its
+        default for anything ``LS_COLORS`` does not cover.
+        """
         if not self.colorize:
             return name
         color = "037"
@@ -91,6 +120,7 @@ class _Lister:
         return f"\033[{color}m{name}\033[0m"
 
     def extra(self, url: str) -> list[str]:
+        """The ``--xattr`` values for ``url``, only with ``-l`` (one request each)."""
         if not self.params.long:
             return []
         return [self.cmd.context.getxattr(url, name) for name in self.params.xattr]
@@ -101,11 +131,14 @@ class _Lister:
             status="succeeded",
             name=name,
             value=stat_record(info),
-            attributes=dict(zip(self.params.xattr, extra)),
+            attributes=dict(zip(self.params.xattr, extra, strict=False)),
         )
         if info is None:
             out(f"{self.color(name, None)}\n")
             return
+        # Column widths are gfal2-util's: nlink right in 3, uid and gid left
+        # in 5, size right in 9 (4 with -H), the date left in 11, then the
+        # name and a tab before any --xattr values.
         size: object = info.st_size
         width = 9
         if self.params.human_readable:
@@ -120,6 +153,14 @@ class _Lister:
 
 
 def ls(cmd: Command) -> int:
+    """``gfal-ls [-l] [-a] [-d] URL``: one entry for a file (or ``-d``), else the listing.
+
+    The URL is stat-ed first, as gfal2-util does, so a missing path fails
+    with ``ENOENT`` rather than an ``opendir`` error. Entries starting with
+    ``.`` are hidden without ``-a`` - including ``.`` and ``..`` when the
+    plugin lists them. With ``-l`` each entry comes from ``readpp``, which
+    stats entries the protocol listed without metadata.
+    """
     params = cmd.params
     output.identify("ls", url=params.file)
     if params.full_time:

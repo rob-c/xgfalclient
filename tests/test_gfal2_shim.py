@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import pickle
 import sys
 import traceback
+from pathlib import Path
 
 import pytest
 
@@ -41,9 +43,25 @@ def test_import_gfal2_is_this_api() -> None:
     assert xgfalclient.VERSION == xgfalclient.__version__ != gfal2.__version__
 
 
-def test_from_gfal2_import_names() -> None:
-    from gfal2 import GError, Gfal2Context, checksum_mode, creat_context  # noqa: F401
+def test_the_type_stub_names_what_the_module_holds() -> None:
+    """``gfal2/__init__.pyi`` lists exactly the public names ``import gfal2`` gives."""
+    import gfal2
 
+    assert gfal2.__file__ is not None
+    stub = ast.parse(Path(gfal2.__file__).with_suffix(".pyi").read_text())
+    declared = {
+        alias.asname or alias.name
+        for node in stub.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert declared == {name for name in dir(gfal2) if not name.startswith("_")}
+
+
+def test_from_gfal2_import_names() -> None:
+    from gfal2 import GError, Gfal2Context, checksum_mode, creat_context
+
+    assert issubclass(GError, Exception)
     assert isinstance(creat_context(), Gfal2Context)
     assert str(checksum_mode.both) == "both"
 

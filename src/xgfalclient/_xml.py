@@ -1,12 +1,19 @@
-"""Compatibility import; the shared implementation lives in xrdclient._xml.
+"""Compatibility import; the shared implementation is :mod:`xrdcore.safexml`.
 
-Alias the module as well as its exports so existing imports and test hooks
-refer to the same implementation, rather than a second copy.
+The DTD-free XML parsing (any ``<!DOCTYPE`` is refused, which rules out
+entity expansion and external entities) that WebDAV ``PROPFIND`` replies,
+SRM SOAP, BDII answers and metalinks go through is xrdcore's, shared with
+xrdclient, xrdhttp and xrdarc. This module replaces itself in
+``sys.modules`` with xrdcore's, rather than re-exporting names, so that a
+test patching ``xgfalclient._xml.X`` patches the object the code calls.
+xgfalclient's own modules import :mod:`xrdcore.safexml` directly.
 """
 
 import sys
 
-from xrdclient import _xml as _shared
-from xrdclient._xml import *  # noqa: F403
+from xrdcore import safexml as _shared
+from xrdcore.safexml import UnsafeXML, fromstring
+
+__all__ = ["UnsafeXML", "fromstring"]
 
 sys.modules[__name__] = _shared

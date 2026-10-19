@@ -6,7 +6,10 @@ import errno
 import os
 import stat
 import zlib
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -15,20 +18,24 @@ from xgfalclient.crypto.sshkeys import PrivateKey, encode_openssh_private
 from xgfalclient.errors import GError
 from xgfalclient.plugins.sftp import plugin as sftp_plugin
 from xgfalclient.plugins.sftp import ssh
+from xgfalclient.plugins.sftp.client import SFTPClient
 from xgfalclient.plugins.sftp.endpoint import Endpoint
 from xgfalclient.plugins.sftp.plugin import SFTPPlugin
 from xgfalclient.testing.sftp import SFTPServer, SSHServer
 
+#: What the ``wired`` fixture yields: the context, the served root and the server.
+Wired = tuple[xgfalclient.Gfal2Context, Path, SSHServer]
+
 
 def test_local_download_refuses_zero_pwrite_progress(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sftp_plugin.os, "pwrite", lambda *_: 0)
+    monkeypatch.setattr(os, "pwrite", lambda *_: 0)
     with pytest.raises(OSError) as caught:
         sftp_plugin._pwrite_all(123, memoryview(b"payload"), 0)
     assert caught.value.errno == errno.EIO
 
 
 @pytest.fixture
-def wired(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+def wired(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Wired]:
     """A context whose python-tier SSH connections reach an in-process server."""
     root = tmp_path / "root"
     root.mkdir()
@@ -57,12 +64,26 @@ def wired(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-u
 B = "sftp://server.example/"
 
 
+def _sftp(ctx: xgfalclient.Gfal2Context) -> SFTPPlugin:
+    """The context's loaded SFTP plugin."""
+    plugin = next(p for p in ctx.plugins if p.name == "sftp")
+    assert isinstance(plugin, SFTPPlugin)
+    return plugin
+
+
+def _session(handle: xgfalclient.FileType) -> SFTPClient:
+    """The pooled SFTP session an open ``ctx.open`` handle has checked out."""
+    remote = handle._file
+    assert isinstance(remote, sftp_plugin._RemoteFile)
+    return remote._client
+
+
 def test_plugin_registered(ctx: xgfalclient.Gfal2Context) -> None:
     names = ctx.get_plugin_names()
     assert any(n.startswith("sftp-") for n in names)
 
 
-def test_stat_and_lstat(wired) -> None:  # type: ignore[no-untyped-def]
+def test_stat_and_lstat(wired: Wired) -> None:
     ctx, _root, _server = wired
     info = ctx.stat(B + "hello.txt")
     assert info.st_size == 12
@@ -72,7 +93,7 @@ def test_stat_and_lstat(wired) -> None:  # type: ignore[no-untyped-def]
     assert caught.value.code == errno.ENOENT
 
 
-def test_mkdir_and_rec_and_rmdir(wired) -> None:  # type: ignore[no-untyped-def]
+def test_mkdir_and_rec_and_rmdir(wired: Wired) -> None:
     ctx, root, _server = wired
     ctx.mkdir(B + "d", 0o755)
     assert (root / "d").is_dir()
@@ -85,7 +106,7 @@ def test_mkdir_and_rec_and_rmdir(wired) -> None:  # type: ignore[no-untyped-def]
     assert not (root / "a" / "b" / "c").exists()
 
 
-def test_unlink_rename_chmod(wired) -> None:  # type: ignore[no-untyped-def]
+def test_unlink_rename_chmod(wired: Wired) -> None:
     ctx, root, _server = wired
     (root / "victim").write_bytes(b"x")
     ctx.unlink(B + "victim")
@@ -96,7 +117,7 @@ def test_unlink_rename_chmod(wired) -> None:  # type: ignore[no-untyped-def]
     assert (root / "renamed.txt").stat().st_mode & 0o777 == 0o600
 
 
-def test_symlink_and_readlink(wired) -> None:  # type: ignore[no-untyped-def]
+def test_symlink_and_readlink(wired: Wired) -> None:
     ctx, _root, _server = wired
     ctx.symlink(B + "hello.txt", B + "link")
     assert ctx.readlink(B + "link") == "/hello.txt"
@@ -105,7 +126,7 @@ def test_symlink_and_readlink(wired) -> None:  # type: ignore[no-untyped-def]
     assert ctx.readlink(B + "link2") == "/hello.txt"
 
 
-def test_opendir_omits_dot_entries(wired) -> None:  # type: ignore[no-untyped-def]
+def test_opendir_omits_dot_entries(wired: Wired) -> None:
     ctx, _root, _server = wired
     names = ctx.listdir(B)
     assert "hello.txt" in names and "sub" in names
@@ -114,7 +135,7 @@ def test_opendir_omits_dot_entries(wired) -> None:  # type: ignore[no-untyped-de
     assert all(name not in (".", "..") for name in [e.d_name for e in entries])
 
 
-def test_access_is_not_supported_as_in_gfal2(wired) -> None:  # type: ignore[no-untyped-def]
+def test_access_is_not_supported_as_in_gfal2(wired: Wired) -> None:
     ctx, _root, _server = wired
     # gfal2's sftp plugin has no access, and its core does not fall back to stat.
     for url in (B + "hello.txt", B + "missing"):
@@ -124,7 +145,7 @@ def test_access_is_not_supported_as_in_gfal2(wired) -> None:  # type: ignore[no-
         assert caught.value.message == f"Protocol not supported or path/url invalid: {url}"
 
 
-def test_rmdir_and_unlink_say_what_is_in_the_way(wired) -> None:  # type: ignore[no-untyped-def]
+def test_rmdir_and_unlink_say_what_is_in_the_way(wired: Wired) -> None:
     ctx, root, _server = wired
     (root / "full").mkdir()
     (root / "full" / "f").write_bytes(b"x")
@@ -142,17 +163,17 @@ def test_rmdir_and_unlink_say_what_is_in_the_way(wired) -> None:  # type: ignore
         assert words in caught.value.message
 
 
-def test_rmdir_failures_nothing_explains(wired, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
+def test_rmdir_failures_nothing_explains(wired: Wired, monkeypatch: pytest.MonkeyPatch) -> None:
     ctx, root, _server = wired
     (root / "d").mkdir()
     real = os.rmdir
 
-    def refuse(path: object, *args: object, **kwargs: object) -> None:
+    def refuse(path: Any, *args: Any, **kwargs: Any) -> None:
         if str(path).endswith("/d"):
             raise OSError(errno.EBUSY, "busy")  # FAILURE, on an empty directory
         if str(path).endswith("/ghost"):
             raise FileNotFoundError(errno.ENOENT, "gone")
-        real(path, *args, **kwargs)  # type: ignore[arg-type]
+        real(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "rmdir", refuse)
     with pytest.raises(GError) as caught:
@@ -172,7 +193,9 @@ def test_rmdir_failures_nothing_explains(wired, monkeypatch: pytest.MonkeyPatch)
     assert caught.value.code == errno.EACCES
 
 
-def test_unlink_failure_on_a_file_stays_a_failure(wired, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
+def test_unlink_failure_on_a_file_stays_a_failure(
+    wired: Wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ctx, _root, _server = wired
 
     def busy(path: object, *args: object, **kwargs: object) -> None:
@@ -184,14 +207,14 @@ def test_unlink_failure_on_a_file_stays_a_failure(wired, monkeypatch: pytest.Mon
     assert caught.value.code == errno.EIO
 
 
-def test_upper_case_scheme_is_nobodys(wired) -> None:  # type: ignore[no-untyped-def]
+def test_upper_case_scheme_is_nobodys(wired: Wired) -> None:
     ctx, _root, _server = wired
     with pytest.raises(GError) as caught:
         ctx.stat("SFTP://server.example/hello.txt")
     assert caught.value.code == errno.EPROTONOSUPPORT
 
 
-def test_open_read_write_seek(wired) -> None:  # type: ignore[no-untyped-def]
+def test_open_read_write_seek(wired: Wired) -> None:
     ctx, root, _server = wired
     with ctx.open(B + "w.txt", "w") as handle:
         assert handle.write("some data here\n") == 15
@@ -203,7 +226,7 @@ def test_open_read_write_seek(wired) -> None:  # type: ignore[no-untyped-def]
         assert handle.pread(0, 4) == "some"
 
 
-def test_open_readinto(wired) -> None:  # type: ignore[no-untyped-def]
+def test_open_readinto(wired: Wired) -> None:
     ctx, root, _server = wired
     (root / "big.bin").write_bytes(os.urandom(100_000))
     handle = ctx.open(B + "big.bin", "r")
@@ -218,7 +241,7 @@ def test_open_readinto(wired) -> None:  # type: ignore[no-untyped-def]
     assert total == 100_000 and bytes(buf) == (root / "big.bin").read_bytes()
 
 
-def test_open_rdwr_pwrite(wired) -> None:  # type: ignore[no-untyped-def]
+def test_open_rdwr_pwrite(wired: Wired) -> None:
     ctx, root, _server = wired
     handle = ctx.open(B + "rw.bin", "rw")
     handle.pwrite(b"abc", 4)
@@ -226,21 +249,21 @@ def test_open_rdwr_pwrite(wired) -> None:  # type: ignore[no-untyped-def]
     assert (root / "rw.bin").read_bytes()[4:7] == b"abc"
 
 
-def test_open_missing_raises(wired) -> None:  # type: ignore[no-untyped-def]
+def test_open_missing_raises(wired: Wired) -> None:
     ctx, _root, _server = wired
     with pytest.raises(GError) as caught:
         ctx.open(B + "does-not-exist", "r")
     assert caught.value.code == errno.ENOENT
 
 
-def test_write_file_error_on_close(wired) -> None:  # type: ignore[no-untyped-def]
+def test_write_file_error_on_close(wired: Wired) -> None:
     ctx, _root, _server = wired
     # Opening a directory for writing fails; the failure surfaces at once.
     with pytest.raises(GError):
         ctx.open(B + "sub", "w")
 
 
-def test_checksum_by_reading(wired) -> None:  # type: ignore[no-untyped-def]
+def test_checksum_by_reading(wired: Wired) -> None:
     import hashlib
 
     ctx, _root, _server = wired
@@ -271,7 +294,7 @@ def test_checksum_with_check_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         ctx.free()
 
 
-def test_checksum_refused_when_disabled(wired) -> None:  # type: ignore[no-untyped-def]
+def test_checksum_refused_when_disabled(wired: Wired) -> None:
     ctx, _root, _server = wired
     ctx.set_opt_boolean("SFTP PLUGIN", "CHECKSUM_BY_READ", False)
     with pytest.raises(GError) as caught:
@@ -279,14 +302,14 @@ def test_checksum_refused_when_disabled(wired) -> None:  # type: ignore[no-untyp
     assert caught.value.code == errno.EPROTONOSUPPORT
 
 
-def test_checksum_unknown_algorithm(wired) -> None:  # type: ignore[no-untyped-def]
+def test_checksum_unknown_algorithm(wired: Wired) -> None:
     ctx, _root, _server = wired
     with pytest.raises(GError) as caught:
         ctx.checksum(B + "hello.txt", "no-such-hash")
     assert caught.value.code == errno.EPROTONOSUPPORT  # gfal2's answer for every algorithm
 
 
-def test_checksum_by_read_knows_gfal2s_algorithms(wired) -> None:  # type: ignore[no-untyped-def]
+def test_checksum_by_read_knows_gfal2s_algorithms(wired: Wired) -> None:
     ctx, root, _server = wired
     data = (root / "hello.txt").read_bytes()
     assert ctx.checksum(B + "hello.txt", "ADLER32") == f"{zlib.adler32(data):08x}"
@@ -297,7 +320,7 @@ def test_checksum_by_read_knows_gfal2s_algorithms(wired) -> None:  # type: ignor
 # -- copies -------------------------------------------------------------------
 
 
-def test_copy_upload_and_download(wired, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_copy_upload_and_download(wired: Wired, tmp_path: Path) -> None:
     ctx, root, _server = wired
     src = tmp_path / "src.bin"
     payload = os.urandom(400_000)
@@ -319,7 +342,7 @@ def test_copy_check_only_file_pairs() -> None:
     assert not plugin.copy_check("file:///a", "file:///b")
 
 
-def test_copy_download_directory_is_error(wired, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_copy_download_directory_is_error(wired: Wired, tmp_path: Path) -> None:
     ctx, _root, _server = wired
     params = ctx.transfer_parameters()
     params.overwrite = True
@@ -328,7 +351,7 @@ def test_copy_download_directory_is_error(wired, tmp_path: Path) -> None:  # typ
     assert caught.value.code == errno.EISDIR
 
 
-def test_copy_upload_directory_is_error(wired, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_copy_upload_directory_is_error(wired: Wired, tmp_path: Path) -> None:
     ctx, _root, _server = wired
     d = tmp_path / "adir"
     d.mkdir()
@@ -465,25 +488,25 @@ def test_load_keys_corrupt(tmp_path: Path) -> None:
 # -- pooling ------------------------------------------------------------------
 
 
-def test_session_pool_reuse_and_close(wired) -> None:  # type: ignore[no-untyped-def]
+def test_session_pool_reuse_and_close(wired: Wired) -> None:
     ctx, _root, _server = wired
     ctx.stat(B + "hello.txt")  # loads the plugin and pools a session
     ctx.stat(B + "hello.txt")  # reuses the pooled session
-    plugin = next(p for p in ctx.plugins if p.name == "sftp")
+    plugin = _sftp(ctx)
     total = sum(len(v) for v in plugin._idle.values())
     assert total >= 1
     plugin.close()
     assert not plugin._idle
 
 
-def test_session_pool_holds_several(wired) -> None:  # type: ignore[no-untyped-def]
+def test_session_pool_holds_several(wired: Wired) -> None:
     ctx, _root, _server = wired
     # Two files open at once need two sessions; both are pooled on close.
     first = ctx.open(B + "hello.txt", "r")
     second = ctx.open(B + "hello.txt", "r")
     first.close()
     second.close()
-    plugin = next(p for p in ctx.plugins if p.name == "sftp")
+    plugin = _sftp(ctx)
     assert sum(len(v) for v in plugin._idle.values()) == 2
     # A namespace call takes just one of them, and gives it back.
     ctx.stat(B + "hello.txt")
@@ -491,8 +514,8 @@ def test_session_pool_holds_several(wired) -> None:  # type: ignore[no-untyped-d
 
 
 def test_session_dead_after_success_is_not_pooled(
-    wired, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:  # type: ignore[no-untyped-def]
+    wired: Wired, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
     from xgfalclient.testing import sftp as tsftp
 
@@ -508,11 +531,11 @@ def test_session_dead_after_success_is_not_pooled(
     params.overwrite = True
     ctx.filecopy(params, B + "hello.txt", "file://" + str(tmp_path / "o"))
     assert (tmp_path / "o").read_bytes() == b"hello world\n"
-    plugin = next(p for p in ctx.plugins if p.name == "sftp")
+    plugin = _sftp(ctx)
     assert not any(plugin._idle.values())
 
 
-def test_url_without_path_is_the_root(wired) -> None:  # type: ignore[no-untyped-def]
+def test_url_without_path_is_the_root(wired: Wired) -> None:
     ctx, _root, _server = wired
     assert stat.S_ISDIR(ctx.stat("sftp://server.example").st_mode)
 
@@ -520,7 +543,7 @@ def test_url_without_path_is_the_root(wired) -> None:  # type: ignore[no-untyped
 # -- error paths and remaining branches ---------------------------------------
 
 
-def test_namespace_error_paths(wired) -> None:  # type: ignore[no-untyped-def]
+def test_namespace_error_paths(wired: Wired) -> None:
     ctx, _root, _server = wired
     with pytest.raises(GError):
         ctx.chmod(B + "missing", 0o600)
@@ -540,7 +563,7 @@ def test_namespace_error_paths(wired) -> None:  # type: ignore[no-untyped-def]
         ctx.symlink(B + "hello.txt", B + "sub")  # target path already exists
 
 
-def test_checksum_with_offset_and_length(wired) -> None:  # type: ignore[no-untyped-def]
+def test_checksum_with_offset_and_length(wired: Wired) -> None:
     import hashlib
 
     ctx, _root, _server = wired
@@ -558,7 +581,7 @@ def test_pflags_mapping() -> None:
     assert _pflags(O_RDWR) == (fx.FXF_READ | fx.FXF_WRITE)
 
 
-def test_file_read_error(wired) -> None:  # type: ignore[no-untyped-def]
+def test_file_read_error(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -572,7 +595,7 @@ def test_file_read_error(wired) -> None:  # type: ignore[no-untyped-def]
     handle.close()
 
 
-def test_file_pwrite_error_rdwr(wired) -> None:  # type: ignore[no-untyped-def]
+def test_file_pwrite_error_rdwr(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -583,7 +606,7 @@ def test_file_pwrite_error_rdwr(wired) -> None:  # type: ignore[no-untyped-def]
     handle.close()
 
 
-def test_write_file_errors(wired) -> None:  # type: ignore[no-untyped-def]
+def test_write_file_errors(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -596,7 +619,7 @@ def test_write_file_errors(wired) -> None:  # type: ignore[no-untyped-def]
         handle.close()
 
 
-def test_write_file_pwrite_error(wired) -> None:  # type: ignore[no-untyped-def]
+def test_write_file_pwrite_error(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -608,14 +631,14 @@ def test_write_file_pwrite_error(wired) -> None:  # type: ignore[no-untyped-def]
         handle.close()
 
 
-def test_file_size_and_seek_end(wired) -> None:  # type: ignore[no-untyped-def]
+def test_file_size_and_seek_end(wired: Wired) -> None:
     ctx, _root, _server = wired
     handle = ctx.open(B + "hello.txt", "r")
     assert handle.lseek(0, os.SEEK_END) == 12  # uses size() via fstat
     handle.close()
 
 
-def test_file_close_error(wired) -> None:  # type: ignore[no-untyped-def]
+def test_file_close_error(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -626,19 +649,19 @@ def test_file_close_error(wired) -> None:  # type: ignore[no-untyped-def]
     handle.close()  # idempotent second call
 
 
-def test_dead_pooled_session_replaced(wired) -> None:  # type: ignore[no-untyped-def]
+def test_dead_pooled_session_replaced(wired: Wired) -> None:
     ctx, _root, _server = wired
     ctx.stat(B + "hello.txt")
-    plugin = next(p for p in ctx.plugins if p.name == "sftp")
+    plugin = _sftp(ctx)
     # Kill the pooled session; the next use discards it and reconnects.
-    for clients in plugin._idle.values():
-        for client in clients:
+    for entries in plugin._idle.values():
+        for _since, client in entries:
             client.close()
     assert ctx.stat(B + "hello.txt").st_size == 12
     # Same via the open() checkout path.
     ctx.open(B + "hello.txt", "r").close()
-    for clients in plugin._idle.values():
-        for client in clients:
+    for entries in plugin._idle.values():
+        for _since, client in entries:
             client.close()
     ctx.open(B + "hello.txt", "r").close()
 
@@ -700,14 +723,14 @@ def test_openssh_tier_no_binary(monkeypatch: pytest.MonkeyPatch) -> None:
         ctx.free()
 
 
-def test_mkdir_into_missing_parent(wired) -> None:  # type: ignore[no-untyped-def]
+def test_mkdir_into_missing_parent(wired: Wired) -> None:
     ctx, _root, _server = wired
     with pytest.raises(GError) as caught:
         ctx.mkdir(B + "nope/child", 0o755)
     assert caught.value.code == errno.ENOENT
 
 
-def test_mkdir_failure_without_existing_path(wired) -> None:  # type: ignore[no-untyped-def]
+def test_mkdir_failure_without_existing_path(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -718,14 +741,14 @@ def test_mkdir_failure_without_existing_path(wired) -> None:  # type: ignore[no-
     assert caught.value.code != errno.EEXIST
 
 
-def test_session_closed_on_hard_failure(wired) -> None:  # type: ignore[no-untyped-def]
+def test_session_closed_on_hard_failure(wired: Wired) -> None:
     ctx, _root, server = wired
     server.sftp.faults.append("drop")  # the connection dies mid-request
     with pytest.raises(GError):
         ctx.stat(B + "hello.txt")
 
 
-def test_open_hard_failure_returns_session(wired) -> None:  # type: ignore[no-untyped-def]
+def test_open_hard_failure_returns_session(wired: Wired) -> None:
     ctx, _root, server = wired
     server.sftp.faults.append("drop")
     with pytest.raises(GError):
@@ -758,7 +781,7 @@ def test_checksum_check_file_unsupported_falls_back(
         ctx.free()
 
 
-def test_download_source_missing(wired, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_download_source_missing(wired: Wired, tmp_path: Path) -> None:
     ctx, _root, _server = wired
     params = ctx.transfer_parameters()
     params.overwrite = True
@@ -767,7 +790,7 @@ def test_download_source_missing(wired, tmp_path: Path) -> None:  # type: ignore
     assert caught.value.code == errno.ENOENT
 
 
-def test_download_open_error(wired, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_download_open_error(wired: Wired, tmp_path: Path) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -778,7 +801,7 @@ def test_download_open_error(wired, tmp_path: Path) -> None:  # type: ignore[no-
         ctx.filecopy(params, B + "hello.txt", "file://" + str(tmp_path / "o"))
 
 
-def test_upload_source_missing(wired) -> None:  # type: ignore[no-untyped-def]
+def test_upload_source_missing(wired: Wired) -> None:
     ctx, _root, _server = wired
     params = ctx.transfer_parameters()
     params.overwrite = True
@@ -788,21 +811,20 @@ def test_upload_source_missing(wired) -> None:  # type: ignore[no-untyped-def]
 
 
 def test_upload_source_open_error_without_errno(
-    wired, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:  # type: ignore[no-untyped-def]
-    from xgfalclient.plugins.sftp import plugin as sftp_plugin
+    wired: Wired, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
 
     ctx, _root, _server = wired
     src = tmp_path / "src"
     src.write_bytes(b"data")
     real_open = os.open
 
-    def refusing_open(path: str, *args: object, **kwargs: object) -> int:
+    def refusing_open(path: str, *args: Any, **kwargs: Any) -> int:
         if path == str(src):
             raise OSError("refused")
-        return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+        return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(sftp_plugin.os, "open", refusing_open)
+    monkeypatch.setattr(os, "open", refusing_open)
     params = ctx.transfer_parameters()
     params.overwrite = True
     with pytest.raises(GError, match="Could not open source: refused") as caught:
@@ -810,7 +832,7 @@ def test_upload_source_open_error_without_errno(
     assert caught.value.code == errno.EIO
 
 
-def test_upload_remote_open_error(wired, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+def test_upload_remote_open_error(wired: Wired, tmp_path: Path) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -829,7 +851,81 @@ def test_has_paramiko_probe() -> None:
     assert isinstance(_has_paramiko(), bool)
 
 
-def test_file_size_cached_and_fstat_error(wired) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize(
+    ("release", "usable"),
+    [
+        ("3.3.1", False),  # before strict KEX: Terrapin-vulnerable
+        ("3.4.0", True),
+        ("3.10.0rc1", True),
+        ("4.0.0", True),
+        ("2.12.0", False),
+        ("unknown", False),
+    ],
+)
+def test_has_paramiko_requires_strict_kex_release(
+    monkeypatch: pytest.MonkeyPatch, release: str, usable: bool
+) -> None:
+    import importlib.metadata
+    import importlib.util
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: release)
+    assert sftp_plugin._has_paramiko() is usable
+
+
+def test_has_paramiko_absent_or_without_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.metadata
+    import importlib.util
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    assert sftp_plugin._has_paramiko() is False
+
+    def missing(name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(importlib.metadata, "version", missing)
+    assert sftp_plugin._has_paramiko() is False
+
+
+def test_python_tier_is_a_supported_quiet_transport(wired: Wired) -> None:
+    import warnings
+
+    ctx, _root, _server = wired
+    # A supported tier: no warning on the first connection, nor on a second
+    # one (a fresh context, so not a pooled session).
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert ctx.stat(B + "hello.txt").st_size == 12
+    other = xgfalclient.creat_context()
+    try:
+        for name, value in (("USER", "alice"), ("PASSWORD", "secret"), ("TRANSPORT", "python")):
+            other.set_opt_string("SFTP PLUGIN", name, value)
+        other.set_opt_string(
+            "SFTP PLUGIN", "KNOWN_HOSTS", ctx.get_opt_string("SFTP PLUGIN", "KNOWN_HOSTS")
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert other.stat(B + "hello.txt").st_size == 12
+    finally:
+        other.free()
+
+
+def test_python_tier_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # auto with a password and no usable paramiko falls back to the python tier.
+    monkeypatch.setattr(sftp_plugin, "_has_paramiko", lambda: False)
+    monkeypatch.setattr(ssh, "connect", lambda endpoint, auth, **kw: _Refused())
+    plugin = _plugin()
+    endpoint = Endpoint(host="h", port=22, user="u", password="pw")
+    assert plugin._tier(endpoint) == "python"
+    assert isinstance(plugin._connect_stream("python", endpoint), _Refused)
+
+
+class _Refused:
+    """A stand-in stream: the tier choice is under test, not the connection."""
+
+
+def test_file_size_cached_and_fstat_error(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -845,7 +941,7 @@ def test_file_size_cached_and_fstat_error(wired) -> None:  # type: ignore[no-unt
     handle2.close()
 
 
-def test_file_size_unknown_to_the_server(wired, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
+def test_file_size_unknown_to_the_server(wired: Wired, monkeypatch: pytest.MonkeyPatch) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
     from xgfalclient.plugins.sftp.protocol import Attrs
     from xgfalclient.testing import sftp as tsftp
@@ -861,7 +957,7 @@ def test_file_size_unknown_to_the_server(wired, monkeypatch: pytest.MonkeyPatch)
     handle.close()
 
 
-def test_write_file_double_close(wired) -> None:  # type: ignore[no-untyped-def]
+def test_write_file_double_close(wired: Wired) -> None:
     ctx, _root, _server = wired
     handle = ctx.open(B + "wc.bin", "w")
     handle.write(b"data")
@@ -869,7 +965,7 @@ def test_write_file_double_close(wired) -> None:  # type: ignore[no-untyped-def]
     handle.close()  # idempotent
 
 
-def test_write_error_surfaces_on_write(wired) -> None:  # type: ignore[no-untyped-def]
+def test_write_error_surfaces_on_write(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -885,7 +981,7 @@ def test_write_error_surfaces_on_write(wired) -> None:  # type: ignore[no-untype
         handle.close()
 
 
-def test_pwrite_error_surfaces(wired) -> None:  # type: ignore[no-untyped-def]
+def test_pwrite_error_surfaces(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -901,7 +997,9 @@ def test_pwrite_error_surfaces(wired) -> None:  # type: ignore[no-untyped-def]
         handle.close()
 
 
-def _wire_ctx(monkeypatch, tmp_path, server):  # type: ignore[no-untyped-def]
+def _wire_ctx(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, server: SSHServer
+) -> xgfalclient.Gfal2Context:
     real = ssh.connect
     monkeypatch.setattr(ssh, "connect", lambda ep, auth, **kw: real(ep, auth, sock=server.pair()))
     ctx = xgfalclient.creat_context()
@@ -912,7 +1010,7 @@ def _wire_ctx(monkeypatch, tmp_path, server):  # type: ignore[no-untyped-def]
     return ctx
 
 
-def test_checksum_by_read_open_error(wired) -> None:  # type: ignore[no-untyped-def]
+def test_checksum_by_read_open_error(wired: Wired) -> None:
     from xgfalclient.plugins.sftp import protocol as fx
 
     ctx, _root, server = wired
@@ -954,7 +1052,7 @@ def test_open_dropped_mid_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         ctx.free()
 
 
-def test_pluginfile_close_idempotent(wired) -> None:  # type: ignore[no-untyped-def]
+def test_pluginfile_close_idempotent(wired: Wired) -> None:
     # The FileType wrapper guards re-close, so exercise the PluginFile directly.
     ctx, _root, _server = wired
     reader = ctx.open(B + "hello.txt", "r")._file
@@ -964,3 +1062,101 @@ def test_pluginfile_close_idempotent(wired) -> None:  # type: ignore[no-untyped-
     writer.write(b"data")
     writer.close()
     writer.close()  # second call returns immediately
+
+
+# -- handles, packet limits and the pool's bounds -------------------------------
+
+
+def test_failed_write_still_closes_the_remote_handle(wired: Wired) -> None:
+    from xgfalclient.plugins.sftp import protocol as fx
+
+    ctx, _root, server = wired
+    handle = ctx.open(B + "w.bin", "w")
+    server.sftp.inject(fx.WRITE, fx.FX_FAILURE, "full")
+    handle.write(b"x" * 10)  # pipelined: the refusal is only seen on close()
+    with pytest.raises(GError, match="Could not write"):
+        handle.close()
+    # The server must not keep the handle open for the life of the pooled session.
+    kinds = [kind for kind, _ in server.sftp.log]
+    assert kinds[-1] == fx.CLOSE, "no SSH_FXP_CLOSE was sent after the failed write"
+    plugin = _sftp(ctx)
+    assert sum(len(v) for v in plugin._idle.values()) == 1  # still a healthy session
+
+
+def test_rdwr_pwrite_is_split_at_max_write(wired: Wired) -> None:
+    from xgfalclient.plugins.sftp import protocol as fx
+
+    ctx, root, server = wired
+    # A server announcing 4 KiB writes may refuse (or drop the session on) a
+    # longer packet; one pwrite of 10000 bytes must go out as three WRITEs.
+    server.sftp.limits = (8192, 4096, 4096, 0)
+    payload = os.urandom(10_000)
+    handle = ctx.open(B + "rw.bin", "rw")
+    assert handle.pwrite(payload, 3) == len(payload)
+    handle.close()
+    assert (root / "rw.bin").read_bytes()[3:] == payload
+    assert sum(1 for kind, _ in server.sftp.log if kind == fx.WRITE) == 3
+
+
+def test_pool_keeps_at_most_max_idle(wired: Wired) -> None:
+    ctx, _root, _server = wired
+    ctx.set_opt_integer("SFTP PLUGIN", "MAX_IDLE", 2)
+    handles = [ctx.open(B + "hello.txt", "r") for _ in range(4)]
+    plugin = _sftp(ctx)
+    clients = [_session(h) for h in handles]
+    for handle in handles:
+        handle.close()
+    assert sum(len(v) for v in plugin._idle.values()) == 2
+    # The surplus is closed, not just forgotten; the most recently returned are kept.
+    assert [c.alive for c in clients] == [False, False, True, True]
+
+
+def test_pool_drops_sessions_idle_too_long(wired: Wired) -> None:
+    ctx, _root, server = wired
+    ctx.set_opt_integer("SFTP PLUGIN", "MAX_IDLE_SECONDS", 30)
+    now = [1000.0]
+    with pytest.MonkeyPatch.context() as patch:
+        # The plugin's clock only: patching time.monotonic itself would move every thread's.
+        patch.setattr(sftp_plugin, "time", SimpleNamespace(monotonic=lambda: now[0]))
+        ctx.stat(B + "hello.txt")
+        plugin = _sftp(ctx)
+        (pooled,) = [entry for entries in plugin._idle.values() for entry in entries]
+        now[0] += 29
+        ctx.stat(B + "hello.txt")  # still fresh: reused
+        assert server.sftp.sessions == 1
+        now[0] += 31
+        ctx.stat(B + "hello.txt")  # idle for 31 s: closed, and a new one connected
+        assert server.sftp.sessions == 2
+        assert not pooled[1].alive
+
+
+def test_pool_disabled_with_max_idle_zero(wired: Wired) -> None:
+    ctx, _root, server = wired
+    ctx.set_opt_integer("SFTP PLUGIN", "MAX_IDLE", 0)
+    ctx.stat(B + "hello.txt")
+    ctx.stat(B + "hello.txt")
+    plugin = _sftp(ctx)
+    assert not any(plugin._idle.values())
+    assert server.sftp.sessions == 2
+
+
+def test_write_file_on_a_dead_session_is_closed_not_pooled(wired: Wired) -> None:
+    ctx, _root, server = wired
+    handle = ctx.open(B + "w.bin", "w")
+    plugin = _sftp(ctx)
+    client = _session(handle)
+    server.sftp.faults.append("drop")  # the server hangs up on the WRITE
+    handle.write(b"x" * 10)
+    with pytest.raises(GError) as caught:
+        handle.close()
+    assert caught.value.code == errno.ECONNRESET
+    assert not client.alive and not any(plugin._idle.values())
+    handle.close()  # already closed: nothing more to report
+
+
+def test_pool_without_idle_expiry(wired: Wired) -> None:
+    ctx, _root, server = wired
+    ctx.set_opt_integer("SFTP PLUGIN", "MAX_IDLE_SECONDS", 0)
+    ctx.stat(B + "hello.txt")
+    ctx.stat(B + "hello.txt")
+    assert server.sftp.sessions == 1

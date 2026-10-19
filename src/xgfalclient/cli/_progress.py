@@ -5,6 +5,11 @@
 Adapted from gfal2-util 1.9.1's ``progress.py`` (Apache-2.0, (c) CERN): the
 layout, units and rounding are the same; the thread handling is simpler (the
 final line is drawn under the lock, so the redraw thread cannot interleave).
+
+Units are powers of 1024 printed with the decimal-looking ``KB``/``MB``
+suffixes gfal2-util uses; "fixing" them would change output people compare
+against gfal2-util's. The bar is drawn only when stdout is a terminal
+(``gfal-copy`` decides), so nothing here checks.
 """
 
 from __future__ import annotations
@@ -31,7 +36,12 @@ def _width() -> int:
 
 
 def rate_str(rate: float) -> str:
-    """``512B/s``, ``1.21K/s``, ``12.3M/s``, ``123G/s``: three significant digits."""
+    """``512B/s``, ``1.21K/s``, ``12.3M/s``, ``123G/s``: three significant digits.
+
+    Plain bytes are never given decimals (``degree == 0``), and from 100
+    upwards there are none either; Python's ``round`` (half to even) is
+    gfal2-util's rounding too.
+    """
     symbols = ["B", "K", "M", "G", "T", "P"]
     degree = 0
     while float(rate) >= 1024.0 and degree < len(symbols) - 1:
@@ -49,9 +59,16 @@ def size_str(size: float) -> str:
 
 
 class Progress:
-    """One file's progress bar; :meth:`update` from the monitor callback."""
+    """One file's progress bar; :meth:`update` from the monitor callback.
+
+    Lifecycle: :meth:`start` once, :meth:`update` any number of times from
+    any thread, :meth:`stop` once (further calls are ignored). ``lock``
+    guards ``status`` and every write to the terminal, so the redraw thread
+    and the final line never interleave.
+    """
 
     def __init__(self, label: str) -> None:
+        """A bar labelled ``label`` (``Copying <url>``), not yet drawn."""
         self.label = label
         self.started = False
         self.stopped = False
@@ -62,6 +79,7 @@ class Progress:
         self.thread: threading.Thread | None = None
 
     def start(self) -> None:
+        """Start the redraw thread; a second ``start`` is a ``RuntimeError`` (a caller bug)."""
         with self.lock:
             # stop() does nothing before start(), so stopped implies started.
             if self.started:
@@ -72,6 +90,7 @@ class Progress:
         self.thread.start()
 
     def _run(self) -> None:
+        """The redraw loop: every :data:`INTERVAL` until :meth:`stop`; a daemon, never joined."""
         while True:
             with self.lock:
                 if self.stopped:
@@ -80,6 +99,7 @@ class Progress:
             time.sleep(INTERVAL)
 
     def _elapsed(self) -> int:
+        """Whole seconds since :meth:`start` (monotonic, so a clock change cannot skew it)."""
         return int(time.monotonic() - self.start_time)
 
     def _update(self) -> None:
@@ -126,6 +146,13 @@ class Progress:
         rate: float | None = None,
         time_elapsed: int | None = None,
     ) -> None:
+        """Replace what the next redraw shows (gfal2-util's ``update`` signature).
+
+        With the size so far, the total and the elapsed time, the rate and
+        percentage are computed from them (an average, as gfal2-util shows);
+        otherwise a given ``rate`` (the monitor callback's instantaneous
+        one) is shown as is. Zero or None values are simply left out.
+        """
         status: dict[str, Any] = {}
         if curr_size:
             status["curr_size"] = curr_size

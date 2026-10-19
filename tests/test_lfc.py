@@ -7,6 +7,7 @@ import os
 import stat
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -16,7 +17,7 @@ from xgfalclient import events as ev
 from xgfalclient.errors import ECOMM, GError
 from xgfalclient.plugins.lfc import LFCPlugin
 from xgfalclient.plugins.lfc import plugin as lfc_plugin
-from xgfalclient.plugins.lfc.client import CnsError
+from xgfalclient.plugins.lfc.client import CnsError, Server
 from xgfalclient.testing.lfc import USER_DN, Hangup, LFCServer, Raw
 from xgfalclient.testing.pki import PKI
 
@@ -51,8 +52,8 @@ def plugin_of(context: xgfalclient.Gfal2Context) -> LFCPlugin:
     return found
 
 
-def user_file(lfc: LFCServer, path: str, **fields: object) -> None:
-    lfc.add_file(path, uid=101, gid=101, **fields)  # type: ignore[arg-type]
+def user_file(lfc: LFCServer, path: str, **fields: Any) -> None:
+    lfc.add_file(path, uid=101, gid=101, **fields)
 
 
 # -- dispatch and URLs -----------------------------------------------------------------
@@ -138,6 +139,7 @@ def test_stat_mkdir_listdir(lctx: xgfalclient.Gfal2Context, lfc: LFCServer) -> N
     assert [(entry.d_name, entry.d_type) for entry in entries] == [("f", 8)]
     directory = lctx.opendir(lfc.url("/grid/a"))
     dirent, st = directory.readpp()
+    assert dirent is not None and st is not None
     assert (dirent.d_name, st.st_size) == ("f", 5)
 
 
@@ -170,11 +172,11 @@ def test_mkdir_rec_race(
     real = plugin._mkdir
     calls: list[str] = []
 
-    def racing(server: object, path: str, mode: int) -> None:
+    def racing(server: Server, path: str, mode: int) -> None:
         calls.append(path)
         if path == "/grid/r/leaf" and len(calls) > 1:
-            real(server, path, mode)  # type: ignore[arg-type]
-        real(server, path, mode)  # type: ignore[arg-type]
+            real(server, path, mode)
+        real(server, path, mode)
 
     monkeypatch.setattr(plugin, "_mkdir", racing)
     lctx.mkdir_rec(lfc.url("/grid/r/leaf"), 0o755)
@@ -555,6 +557,44 @@ def test_copy_registers(with_mock: xgfalclient.Gfal2Context, lfc: LFCServer) -> 
     with_mock.filecopy(params, source, lfc.url("/grid/copied"))
     assert lfc.lookup("/grid/copied").replicas[0].sfn == source
     assert ev.TRANSFER_TYPE in seen
+
+
+@pytest.mark.parametrize("prefix", ["lfn:", "lfn://"])
+def test_copy_creates_the_parent_of_an_lfn_destination(
+    with_mock: xgfalclient.Gfal2Context,
+    lfc: LFCServer,
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+) -> None:
+    # create_parent asks the core for url.parent() of "lfn:/grid/new/dir/f"
+    # (or gfal2's "lfn:///grid/..." spelling): that is "lfn:/grid/new/dir",
+    # not "lfn://rid/new/dir" - which the catalogue reads as /rid/new/dir.
+    monkeypatch.setenv("LFC_HOST", lfc.host)
+    monkeypatch.setenv("LFC_PORT", str(lfc.port))
+    params = with_mock.transfer_parameters()
+    params.create_parent = True
+    source = mock_source()
+    with_mock.filecopy(params, source, prefix + "/grid/new/dir/f")
+    assert lfc.lookup("/grid/new/dir/f").replicas[0].sfn == source
+    assert sorted(with_mock.listdir(lfc.url("/"))) == ["grid"]
+
+
+@pytest.mark.parametrize("prefix", ["lfn:", "lfn://"])
+def test_core_parent_climb_over_lfn_urls(
+    lctx: xgfalclient.Gfal2Context,
+    lfc: LFCServer,
+    monkeypatch: pytest.MonkeyPatch,
+    prefix: str,
+) -> None:
+    # The core's own mkdir -p (gfal2_mkdir_rec, used for any plugin without a
+    # native one) climbs with url.parent(): over "lfn:/grid/a/b/c" it must
+    # reach "lfn:/grid/a", never "lfn://rid/a" - which the catalogue reads as
+    # /rid/a, outside the namespace asked for.
+    monkeypatch.setenv("LFC_HOST", lfc.host)
+    monkeypatch.setenv("LFC_PORT", str(lfc.port))
+    lctx._mkdir_parents(prefix + "/grid/a/b/c", 0o755)
+    assert lctx.stat(lfc.url("/grid/a/b/c")).is_dir()
+    assert sorted(lctx.listdir(lfc.url("/"))) == ["grid"]
 
 
 # -- GUIDs ---------------------------------------------------------------------------------

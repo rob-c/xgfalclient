@@ -8,16 +8,24 @@ import stat
 import struct
 import time
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from xgfalclient.errors import GError
 from xgfalclient.plugins.lfc import csec, wire
-from xgfalclient.plugins.lfc.client import CnsError, Connection, Reply, Server, _ids, socket_error
+from xgfalclient.plugins.lfc.client import (
+    CnsError,
+    Connection,
+    Reply,
+    Server,
+    ServerOptions,
+    _ids,
+    socket_error,
+)
 from xgfalclient.plugins.lfc.csec import GSIMechanism, IDMechanism, TokenLink
 from xgfalclient.plugins.lfc.wire import Packer
-from xgfalclient.testing.lfc import USER_DN, Hangup, LFCServer, Raw, _Connection, _proxy_owner
+from xgfalclient.testing.lfc import USER_DN, Hangup, LFCServer, Raw, _Connection
 from xgfalclient.testing.pki import PKI
 
 GUID = "12345678-1234-1234-1234-123456789abc"
@@ -31,7 +39,7 @@ def lfc(pki: PKI) -> Iterator[LFCServer]:
 
 
 def _server(lfc: LFCServer, mech: csec.Mechanism, sessions: bool = True) -> Server:
-    return Server(lfc.host, lfc.port, lambda: [mech], sessions=sessions, timeout=10)
+    return Server(lfc.host, lfc.port, lambda: [mech], ServerOptions(sessions=sessions, timeout=10))
 
 
 @pytest.fixture
@@ -63,8 +71,8 @@ def status(server: Server, kind: int, body: Packer | bytes, magic: int = wire.MA
     return ask(server, kind, body, magic).status
 
 
-def mine(lfc: LFCServer, path: str, **fields: object) -> None:
-    lfc.add_file(path, uid=101, gid=101, **fields)  # type: ignore[arg-type]
+def mine(lfc: LFCServer, path: str, **fields: Any) -> None:
+    lfc.add_file(path, uid=101, gid=101, **fields)
 
 
 # -- paths --------------------------------------------------------------------------------
@@ -595,7 +603,7 @@ def test_reply_timeout(lfc: LFCServer) -> None:
 
     thread = threading.Thread(target=silent, daemon=True)
     thread.start()
-    server = Server("127.0.0.1", port, lambda: [IDMechanism(0, 0, "r")], timeout=0.2)
+    server = Server("127.0.0.1", port, lambda: [IDMechanism(0, 0, "r")], ServerOptions(timeout=0.2))
     with pytest.raises(GError) as info:
         server.ping()
     assert info.value.code == errno.ETIMEDOUT
@@ -605,10 +613,10 @@ def test_reply_timeout(lfc: LFCServer) -> None:
 
 def test_connect_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     def slow(self: socket.socket, address: object) -> None:
-        raise socket.timeout("timed out")
+        raise TimeoutError("timed out")
 
     monkeypatch.setattr(socket.socket, "connect", slow)
-    server = Server("127.0.0.1", 1, lambda: [], retries=0)
+    server = Server("127.0.0.1", 1, lambda: [], ServerOptions(retries=0))
     with pytest.raises(GError) as info:
         server.ping()
     assert info.value.code == errno.ETIMEDOUT
@@ -639,7 +647,9 @@ def test_timeout_on_a_pooled_connection_is_not_retried(
 ) -> None:
     from xgfalclient.testing import lfc as fake
 
-    server = Server(lfc.host, lfc.port, lambda: [IDMechanism(0, 0, "root")], timeout=0.2)
+    server = Server(
+        lfc.host, lfc.port, lambda: [IDMechanism(0, 0, "root")], ServerOptions(timeout=0.2)
+    )
     server.ping()
 
     def slow(*args: object) -> int:
@@ -721,13 +731,6 @@ def test_empty_directory(lfc: LFCServer, root: Server) -> None:
     assert root.listdir("/grid/empty") == []
 
 
-def test_proxy_owner() -> None:
-    assert _proxy_owner("/DC=org/CN=Jo/CN=123/CN=proxy") == "/DC=org/CN=Jo"
-    assert _proxy_owner("/DC=org/CN=Jo/CN=limited proxy") == "/DC=org/CN=Jo"
-    assert _proxy_owner("/CN=42") == "/CN=42"
-    assert _proxy_owner("/DC=org/OU=People") == "/DC=org/OU=People"
-
-
 def test_lookup_and_url(lfc: LFCServer) -> None:
     assert lfc.url("/x") == f"lfc://localhost:{lfc.port}/x"
     with pytest.raises(KeyError):
@@ -737,7 +740,7 @@ def test_lookup_and_url(lfc: LFCServer) -> None:
 def test_ipv6_listener(pki: PKI) -> None:
     try:
         server = LFCServer(host="::1")
-    except OSError:  # pragma: no cover - a host without IPv6 loopback
+    except OSError:  # environmental: a host without an IPv6 loopback
         pytest.skip("no IPv6 loopback")
     with server:
         client = Server("::1", server.port, lambda: [IDMechanism(0, 0, "root")])
@@ -780,4 +783,4 @@ def test_connection_close_ignores_a_failing_socket() -> None:
             raise OSError(errno.EBADF, "already gone")
 
     sock: Any = Unclosable()
-    _Connection(None, sock, "peer").close()  # type: ignore[arg-type]
+    _Connection(cast(LFCServer, None), sock, "peer").close()

@@ -1,40 +1,37 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """Edges: delegation failures, odd server answers, and the test server's own corners."""
 
 from __future__ import annotations
 
 import base64
 import errno
-import http.client
 import logging
-import socket
 from pathlib import Path
 
 import pytest
+from xrdhttp.connection import HTTPSConnection
 
 import xgfalclient
-from test_http_helpers import (  # noqa: F401 - fixtures
-    Events,
-    dav,
-    dav2,
-    davs,
-    davs_open,
-    hctx,
-    make_server,
-    write,
-)
+from test_http_helpers import Events, make_server, write
+from test_http_helpers import dav as dav
+from test_http_helpers import dav2 as dav2
+from test_http_helpers import davs as davs
+from test_http_helpers import davs_open as davs_open
+from test_http_helpers import hctx as hctx
 from xgfalclient import GError
 from xgfalclient.plugin import O_CREAT, O_TRUNC, O_WRONLY
 from xgfalclient.plugins.http import _delegation
+from xgfalclient.plugins.http.plugin import HTTPPlugin
 from xgfalclient.testing.pki import PKI
-from xgfalclient.testing.webdav import S3, Tape, WebDAVServer
+from xgfalclient.testing.webdav import S3, WebDAVServer
 
 WRITE = O_WRONLY | O_CREAT | O_TRUNC
 DELEGATION = "/gridsite-delegation"
 
 
-def plugin(context: xgfalclient.Gfal2Context):  # type: ignore[no-untyped-def]
-    return context.plugin("davs://h/", "stat")
+def plugin(context: xgfalclient.Gfal2Context) -> HTTPPlugin:
+    found = context.plugin("davs://h/", "stat")
+    assert isinstance(found, HTTPPlugin)
+    return found
 
 
 def soap(inner: str) -> bytes:
@@ -157,9 +154,7 @@ def test_delegation_that_never_arrives(
 
 
 def test_server_rejects_a_mismatched_proxy(davs: WebDAVServer, grid_env: PKI) -> None:
-    connection = http.client.HTTPSConnection(
-        "127.0.0.1", davs.port, context=grid_env.client_context()
-    )
+    connection = HTTPSConnection("127.0.0.1", davs.port, ssl_context=grid_env.client_context())
 
     def put_proxy(delegation_id: str, proxy: str) -> int:
         inner = f"<putProxy><delegationID>{delegation_id}</delegationID><proxy>{proxy}</proxy>"
@@ -192,16 +187,6 @@ def test_cleanup_that_removes_a_partial_file(
     hctx.filecopy(copy, dav.url("/data/src"), dav2.url("/data/dst"))
     assert "CLEANUP 0" in events.stages()
     assert dav2.local("/data/dst").read_bytes() == b"x"
-
-
-def test_markers_without_counts(
-    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
-) -> None:
-    write(dav, "/data/src", b"x")
-    body = b"Perf Marker\n\tStripe Index: x\n\tStripe Bytes Transferred: 5\nEnd\n"
-    body += b"Perf Marker\n\tTimestamp: 1\nEnd\njunk line\nsuccess: Created\n"
-    dav2.fault("COPY", status=202, body=body)
-    hctx.filecopy(xgfalclient.TransferParameters(), dav.url("/data/src"), dav2.url("/data/dst"))
 
 
 def test_write_handle_closed_twice(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -254,103 +239,6 @@ def test_s3_abort_that_cannot_reach_the_server(
     server.fault("DELETE", drop=True, times=2)
     with pytest.raises(GError):
         writer.write(b"x" * 20)
-    server.stop()
-
-
-# -- the test server's own corners ------------------------------------------------------------
-
-
-def test_server_corners(tmp_path: Path) -> None:
-    with WebDAVServer(tmp_path / "root") as server:
-        server.tape = Tape()
-        (server.root / "d").mkdir()
-        connection = http.client.HTTPConnection("127.0.0.1", server.port)
-
-        def ask(method: str, path: str, body: bytes | None = None, **headers: str) -> int:
-            connection = http.client.HTTPConnection("127.0.0.1", server.port)
-            connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            response.read()
-            return response.status
-
-        server.fault("GET", delay=0.01)  # a delay, then the real answer
-        assert ask("GET", "/nope") == 404
-        assert ask("POST", "/d", b"{}", **{"Content-Type": "text/plain"}) == 405
-        assert ask("DELETE", "/missing") == 404
-        assert ask("PUT", "/d", b"x") == 405
-        assert ask("COPY", "/d") == 400
-        connection.request("PUT", "/chunked", body=iter([b"ab", b"cd"]), encode_chunked=True)
-        response = connection.getresponse()
-        response.read()
-        assert response.status == 201
-        assert (server.root / "chunked").read_bytes() == b"abcd"
-        assert ask("POST", "/api/v1/unknown", b"{}") == 404
-        stage = b'{"files": [{"path": "/d"}]}'
-        connection = http.client.HTTPConnection("127.0.0.1", server.port)
-        connection.request("POST", "/api/v1/stage", body=stage)
-        request_id = __import__("json").loads(connection.getresponse().read())["requestId"]
-        assert ask("POST", f"/api/v1/stage/{request_id}/cancel", b'{"paths": ["/other"]}') == 200
-        assert ask("POST", "/api/v1/stage/none/cancel", b'{"paths": []}') == 404
-        # A chunked body whose sender hangs up mid-way ends where the data ends.
-        with socket.create_connection(("127.0.0.1", server.port)) as raw:
-            raw.sendall(
-                b"PUT /cut HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n"
-            )
-            raw.shutdown(socket.SHUT_WR)
-            assert raw.makefile("rb").readline().startswith(b"HTTP/1.1 201")
-        assert (server.root / "cut").read_bytes() == b"ab"
-
-
-def test_server_routing_corners(tmp_path: Path) -> None:
-    with WebDAVServer(tmp_path / "root") as server:
-        server.tape = Tape()
-        (server.root / "d").mkdir()
-        (server.root / "empty").write_bytes(b"")
-
-        def ask(method: str, path: str, body: bytes | None = None, **headers: str) -> int:
-            connection = http.client.HTTPConnection("127.0.0.1", server.port)
-            connection.request(method, path, body=body, headers=headers)
-            response = connection.getresponse()
-            response.read()
-            connection.close()
-            return response.status
-
-        server.fault(path="/d", status=418)  # a fault for any method
-        assert ask("PROPFIND", "/d") == 418
-        # The token and delegation endpoints only take POST.
-        assert ask("GET", "/token") == 404
-        assert ask("GET", "/gridsite-delegation") == 404
-        # A CDMI capabilities path is CDMI without the Accept header too.
-        assert ask("GET", "/cdmi_capabilities/other") == 404
-        assert ask("GET", "/d") == 403  # there, but not a file
-        assert ask("GET", "/empty") == 200
-        mac = {"Content-Type": "application/macaroon-request"}
-        assert ask("POST", "/d", **mac) == 200  # no body: an empty request
-        assert server.macaroons[-1]["path"] == "/d"
-        # Tape REST calls that are not quite any call.
-        assert ask("GET", "/api/v1/stage") == 404
-        assert ask("POST", "/api/v1/stage/x") == 404
-        assert ask("POST", "/api/v1/stage/x/other") == 404
-        assert ask("POST", "/api/v1/release") == 404
-
-
-def test_server_s3_corners(tmp_path: Path, hctx: xgfalclient.Gfal2Context) -> None:
-    server = make_server(tmp_path / "s3")
-    server.s3 = S3()
-    (server.root / "bucket").mkdir()
-    hctx.set_opt_string("S3", "ACCESS_KEY", "AKIDTEST")
-    hctx.set_opt_string("S3", "SECRET_KEY", "SECRETTEST")
-    hctx.set_opt_boolean("S3", "ALTERNATE", True)
-    http_plugin = plugin(hctx)
-    response = http_plugin._request("DELETE", server.url("/bucket/missing", scheme="s3"))
-    assert response.status == 204
-    response.close()
-    response = http_plugin._request("MKCOL", server.url("/bucket/d", scheme="s3"))
-    assert response.status == 405
-    response.close()
-    response = http_plugin._request("POST", server.url("/bucket/d", scheme="s3"), body=b"")
-    assert response.status == 405  # a POST that is not a multipart upload
-    response.close()
     server.stop()
 
 

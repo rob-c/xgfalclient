@@ -1,4 +1,7 @@
-"""``gfal2_util.legacy``: register, unregister and list an LFC entry's replicas."""
+"""``gfal2_util.legacy``: register, unregister and list an LFC entry's replicas.
+
+The class docstring below is gfal2-util's own wording, kept as is.
+"""
 
 from __future__ import annotations
 

@@ -1,7 +1,7 @@
 """Kerberos against a real MIT KDC: both backends, three kinds of credential cache.
 
 A throwaway AlmaLinux 9 container (``tests/krb5_interop/Dockerfile``: MIT
-krb5 1.21, sssd's KCM, python3-gssapi, Python 3.9) creates realm
+krb5 1.21, sssd's KCM, python-gssapi, AppStream Python 3.11) creates realm
 ``XGFAL.TEST`` with ``user@XGFAL.TEST`` and ``host/kdc.xgfal.test`` in
 ``/etc/krb5.keytab``, runs ``kinit`` into a ``FILE:``, ``KCM:`` or ``DIR:``
 default cache, and then ``driver.py`` - with this checkout's ``src``
@@ -57,15 +57,28 @@ def build_image() -> None:
 def run_driver(ccache: str) -> dict[str, Any]:
     done = subprocess.run(
         [
-            "docker", "run", "--rm", "-h", HOST,
-            "-v", f"{ROOT / 'src'}:/src:ro", "-v", f"{HERE}:/k:ro",
-            IMAGE, "/k/run.sh", ccache,
+            "docker",
+            "run",
+            "--rm",
+            "-h",
+            HOST,
+            "-v",
+            f"{ROOT / 'src'}:/src:ro",
+            "-v",
+            f"{HERE}:/k:ro",
+            IMAGE,
+            "/k/run.sh",
+            ccache,
         ],
-        capture_output=True, text=True, timeout=600, check=False,
-    )  # fmt: skip
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
     lines = done.stdout.strip().splitlines()
     assert done.returncode == 0 and lines, done.stderr
-    return json.loads(lines[-1])  # type: ignore[no-any-return]
+    report: dict[str, Any] = json.loads(lines[-1])
+    return report
 
 
 @pytest.fixture(scope="module")
@@ -76,7 +89,7 @@ def image() -> None:
 @pytest.mark.parametrize("ccache", CCACHES)
 def test_mit_kdc(image: None, ccache: str) -> None:
     results = run_driver(ccache)
-    assert results["_python"].startswith("3.9")
+    assert results["_python"].startswith("3.11")
     assert results["_ccache"].split(": ", 1)[1].split(":")[0] == ccache.upper()
     assert results["_backend"] == "gssapi"  # installed, so preferred
     failed = {name: r["detail"] for name, r in results.items() if name[0] != "_" and not r["ok"]}
@@ -141,14 +154,29 @@ def test_macos_heimdal(image: None, library: str, mode: str, tmp_path: Path) -> 
     out = Path(tempfile.mkdtemp(dir=tmp_path))
     subprocess.run(
         [
-            "docker", "run", "-d", "--rm", "--name", name, "-h", HOST,
-            "-p", f"{port}:88/tcp", "-v", f"{HERE}:/k:ro", "-v", f"{out}:/out",
-            IMAGE, "sh", "-c",
+            "docker",
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            name,
+            "-h",
+            HOST,
+            "-p",
+            f"{port}:88/tcp",
+            "-v",
+            f"{HERE}:/k:ro",
+            "-v",
+            f"{out}:/out",
+            IMAGE,
+            "sh",
+            "-c",
             "CCACHE_LINE= /k/kdc.sh && cp /etc/krb5.keytab /out/host.keytab"
             " && chmod 644 /out/host.keytab && sleep 300",
         ],
-        check=True, capture_output=True,
-    )  # fmt: skip
+        check=True,
+        capture_output=True,
+    )
     try:
         for _ in range(100):
             if (out / "host.keytab").exists():
@@ -163,16 +191,24 @@ def test_macos_heimdal(image: None, library: str, mode: str, tmp_path: Path) -> 
         for _ in range(20):  # the KDC may still be starting
             kinit = subprocess.run(
                 ["kinit", "--password-file=STDIN", "user@XGFAL.TEST"],
-                input="userpw\n", env=env, capture_output=True, text=True, check=False,
-            )  # fmt: skip
+                input="userpw\n",
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
             if kinit.returncode == 0:
                 break
             time.sleep(0.5)
         assert kinit.returncode == 0, kinit.stderr
         done = subprocess.run(
             [sys.executable, "-c", MAC_SCRIPT, mode, cache, f"FILE:{out / 'host.keytab'}"],
-            env=env, capture_output=True, text=True, timeout=120, check=False,
-        )  # fmt: skip
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
         assert done.returncode == 0, done.stderr
         assert done.stdout.strip() == "gssapi"
     finally:

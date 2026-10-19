@@ -50,9 +50,13 @@ def run(capsys: pytest.CaptureFixture[str]) -> Run:
     return _run
 
 
+#: XRootD's GSI delegation switch, in XRootD's mixed-case spelling.
+GSI_DELEGATION = "XrdSecGSIDELEGPROXY"
+
+
 def test_copy_exports_gsi_delegation(run: Run) -> None:
     assert run("--help")[0] == 0
-    assert os.environ["XrdSecGSIDELEGPROXY"] == "1"  # noqa: SIM112
+    assert os.environ[GSI_DELEGATION] == "1"
 
 
 @pytest.fixture
@@ -176,10 +180,26 @@ def test_copy_knobs(
 
     monkeypatch.setattr(Gfal2Context, "free", spy)
     code, _, _ = run(
-        "-n", "4", "--tcp-buffersize", "65536", "-s", "SRC", "-S", "DST", "-T", "60",
-        "--disable-cleanup", "--no-delegation", "--evict", "--scitag", "65",
-        "--copy-mode", "push", url(tree / "a.txt"), url(tree / "o"),
-    )  # fmt: skip
+        "-n",
+        "4",
+        "--tcp-buffersize",
+        "65536",
+        "-s",
+        "SRC",
+        "-S",
+        "DST",
+        "-T",
+        "60",
+        "--disable-cleanup",
+        "--no-delegation",
+        "--evict",
+        "--scitag",
+        "65",
+        "--copy-mode",
+        "push",
+        url(tree / "a.txt"),
+        url(tree / "o"),
+    )
     assert code == 0
     transfer = params[-1]
     assert (transfer.nbstreams, transfer.tcp_buffersize, transfer.timeout) == (4, 65536, 60)
@@ -545,12 +565,12 @@ def _bar(status: dict[str, Any] | None, width: int = 80) -> str:
     original = sys.stdout
     sys.stdout = out
     original_width = progress._width
-    progress._width = lambda: width  # type: ignore[assignment]
+    progress._width = lambda: width
     try:
         bar._update()
     finally:
         sys.stdout = original
-        progress._width = original_width  # type: ignore[assignment]
+        progress._width = original_width
     return out.getvalue()
 
 

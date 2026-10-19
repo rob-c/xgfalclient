@@ -1,18 +1,20 @@
-# ruff: noqa: E501 - the driver embedded below is a script, kept readable as one
 """The sftp plugin against a real OpenSSH sshd, side by side with real gfal2.
 
 The already-running ``xgfal-sftp-ref`` container (``gfal-ref:latest``:
 AlmaLinux 9, OpenSSH 9.9, gfal2 2.23.5 with ``gfal2-plugin-sftp``, Python 3.9)
 runs sshd with user ``alice`` (password ``secret``, an ed25519 and an RSA
-key). A second container on the same docker network (``xgfal-sftp-net``) runs
-a driver that performs the same operations through ``gfal2`` and through
-``xgfalclient`` (bind-mounted), for every transport tier, and reports both.
+key). Two more containers on the same docker network (``xgfal-sftp-net``) run
+a driver that performs the same operations through ``gfal2`` (on the system
+Python 3.9) and through ``xgfalclient`` (bind-mounted with the host's
+``xrdclient``, on AppStream Python 3.11 in an image derived for it, see
+:mod:`_interop_image`), for every transport tier, and report both.
 
 Each answer is compared; the deliberate differences are in :data:`KNOWN`
 (proper errno instead of the raw SFTP status gfal2 leaks, ``.``/``..`` left
-out of listings, a real ``lstat``, a working checksum). The three xgfalclient tiers - ``openssh`` (key/agent only),
-``python`` and (if importable) ``paramiko`` - are all exercised: openssh with
-key auth, python/paramiko with password and key.
+out of listings, a real ``lstat``, a working checksum). The three
+xgfalclient tiers - ``openssh`` (key/agent only), ``python`` and (if
+importable) ``paramiko`` - are all exercised: openssh with key auth,
+python/paramiko with password and key.
 
 Skipped unless ``XGFAL_INTEROP=1``. Run as a script for a report::
 
@@ -27,8 +29,11 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
+
+from _interop_image import GFAL2_PYTHON, XGFAL_PYTHON, library_mounts, xgfal_image, xrdclient_src
 
 pytestmark = [
     pytest.mark.interop,
@@ -57,17 +62,22 @@ KNOWN = {
     "lstat link": "gfal2 aliases lstat to stat; this plugin does a real lstat",
 }
 
+#: One side per run: ``gfal2`` on the system python3 (keep to 3.9 syntax), or
+#: ``xgfal``'s tiers on python3.11, so that each imports only what it can.
 DRIVER = r"""
-import importlib, json, os, sys
-sys.path.insert(0, "/src/src")
-import xgfalclient
-real = importlib.import_module("gfal2")
+import json, os, sys
+SIDE = sys.argv[1]
+if SIDE == "xgfal":
+    sys.path[:0] = ["/src/src", "/src/xrd"]
+    import xgfalclient as lib
+else:
+    import gfal2 as lib
 HOST = os.environ["IHOST"]
 
 def run(fn):
     try:
         return ["ok", fn()]
-    except (real.GError, xgfalclient.GError) as exc:
+    except lib.GError as exc:
         return ["err", exc.code]
 
 def configure(ctx, tier):
@@ -123,7 +133,9 @@ def ops(mod, ctx, base, home):
         ("access", lambda: ctx.access(base + "/hello.txt", os.R_OK)),
         ("access missing", lambda: ctx.access(base + "/missing", os.F_OK)),
         ("upload", lambda: copy("file://" + local + ".src", base + "/up.txt")),
-        ("download", lambda: copy(base + "/up.txt", "file://" + local + ".back") and open(local + ".back").read()),
+        ("download", lambda: (
+            copy(base + "/up.txt", "file://" + local + ".back") and open(local + ".back").read()
+        )),
         ("roundtrip size", lambda: [ctx.stat(base + "/up.txt").st_size]),
     ]
     out = {}
@@ -138,23 +150,26 @@ report = {"tiers": {}}
 home = "/home/alice"
 # gfal2 reference (its single sftp implementation), in its own subdirectory.
 # No userinfo in the URL: both stacks take the user from the USER option.
-gctx = configure(real.creat_context(), "password-py")
-gctx.set_opt_string("SFTP PLUGIN", "PASSWORD", "secret")
-report["gfal2"] = ops(real, gctx, "sftp://%s%s/real" % (HOST, home), home)
+if SIDE != "xgfal":
+    gctx = configure(lib.creat_context(), "password-py")
+    gctx.set_opt_string("SFTP PLUGIN", "PASSWORD", "secret")
+    url = "sftp://%s%s/real" % (HOST, home)
+    print("XGFALJSON" + json.dumps({"gfal2": ops(lib, gctx, url, home)}))
+    sys.exit(0)
 
 tiers = ["openssh", "password-py", "key-py"]
 try:
-    import paramiko  # noqa: F401
+    import paramiko
     tiers += ["password-pmk", "key-pmk"]
     report["paramiko"] = True
 except Exception:
     report["paramiko"] = False
 
 for tier in tiers:
-    ctx = configure_xgfal(xgfalclient.creat_context(), tier)
+    ctx = configure_xgfal(lib.creat_context(), tier)
     sub = tier.replace("-", "_")
     d = "sftp://%s%s/%s" % (HOST, home, sub)
-    report["tiers"][tier] = ops(xgfalclient, ctx, d, home)
+    report["tiers"][tier] = ops(lib, ctx, d, home)
 
 print("XGFALJSON" + json.dumps(report))
 """
@@ -186,9 +201,13 @@ def _copy_key(tmp: Path) -> Path:
     return keydir
 
 
-def _drive(tmp_path: Path) -> dict:
-    _run_setup_on_ref()
-    keydir = _copy_key(tmp_path)
+def _run_side(side: str, keydir: Path) -> dict[str, Any]:
+    """One side of the driver in a client container of its own: its report."""
+    if side == "xgfal":
+        # paramiko is the optional third tier; the derived image carries it.
+        image, python = xgfal_image(IMAGE, ("paramiko>=3.4",)), XGFAL_PYTHON
+    else:
+        image, python = IMAGE, GFAL2_PYTHON
     proc = subprocess.run(
         [
             "docker",
@@ -203,19 +222,32 @@ def _drive(tmp_path: Path) -> dict:
             # would shadow the real gfal2 and compare this package with itself.
             f"{ROOT / 'src' / 'xgfalclient'}:/src/src/xgfalclient:ro",
             "-v",
+            f"{xrdclient_src()}:/src/xrd:ro",
+            *library_mounts(),
+            "-v",
             f"{keydir}:/keys:ro",
-            IMAGE,
-            "python3",
+            image,
+            python,
             "-c",
             DRIVER,
+            side,
         ],
         capture_output=True,
         text=True,
         timeout=300,
     )
     if "XGFALJSON" not in proc.stdout:
-        raise AssertionError(f"driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-    return json.loads(proc.stdout.split("XGFALJSON", 1)[1])
+        raise AssertionError(
+            f"{side} driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+    report: dict[str, Any] = json.loads(proc.stdout.split("XGFALJSON", 1)[1])
+    return report
+
+
+def _drive(tmp_path: Path) -> dict[str, Any]:
+    _run_setup_on_ref()
+    keydir = _copy_key(tmp_path)
+    return {**_run_side("gfal2", keydir), **_run_side("xgfal", keydir)}
 
 
 def test_sftp_interop(tmp_path: Path) -> None:

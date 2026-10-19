@@ -36,12 +36,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-__all__ = ["Layout", "Reader", "READER", "layout", "load"]
+__all__ = ["READER", "Layout", "Reader", "layout", "load"]
 
 
 @dataclass(frozen=True)
 class Layout:
-    """Where ``d_type`` and ``d_name`` sit in a ``struct dirent``, and the calls to use."""
+    """Where ``d_type`` and ``d_name`` sit in a ``struct dirent``, and the calls to use.
+
+    Offsets rather than a ``ctypes.Structure`` because only two fields are
+    read, and ``d_name``'s declared size differs by platform (256 on Linux,
+    1024 on macOS) while the record actually returned is ``d_reclen`` bytes:
+    a Structure of the declared size would read past short records.
+    """
 
     type_offset: int
     name_offset: int
@@ -51,7 +57,11 @@ class Layout:
 
 
 def layout(system: str, pointer_size: int, has: Callable[[str], bool]) -> Layout | None:
-    """The layout for ``system`` (a :data:`sys.platform`), given which symbols libc ``has``."""
+    """The layout for ``system`` (a :data:`sys.platform`), given which symbols libc ``has``.
+
+    Pure (no libc is touched) so that every platform's branch is tested on
+    any one platform.
+    """
     if system.startswith("linux"):
         if has("readdir64"):
             return Layout(18, 19, "opendir", "readdir64")
@@ -69,6 +79,12 @@ class Reader:
     """``opendir``/``readdir``/``closedir`` from one library, read with one :class:`Layout`."""
 
     def __init__(self, lib: Any, shape: Layout) -> None:
+        """Bind the three calls and declare their C signatures.
+
+        ``argtypes``/``restype`` matter: without them ``ctypes`` would pass and
+        return ``int``, truncating the 64-bit ``DIR *`` on most platforms.
+        ``AttributeError`` if a symbol is missing (see :func:`load`).
+        """
         self._layout = shape
         self._opendir = getattr(lib, shape.opendir)
         self._opendir.argtypes = [ctypes.c_char_p]
@@ -107,11 +123,13 @@ class Reader:
 
 
 def _raise(path: str) -> None:
+    """Raise the ``OSError`` for the ``errno`` the last libc call left for ``path``."""
     code = ctypes.get_errno()
     raise OSError(code, os.strerror(code), path)
 
 
 def _open() -> Any:
+    """The process's own C library (``dlopen(NULL)``), or None where that is impossible."""
     try:
         return ctypes.CDLL(None, use_errno=True)
     except (OSError, TypeError):  # TypeError: no NULL handle (Windows)
@@ -119,7 +137,11 @@ def _open() -> Any:
 
 
 def load(system: str, pointer_size: int, opener: Callable[[], Any] = _open) -> Reader | None:
-    """A :class:`Reader` for this platform, or ``None`` to fall back to :func:`os.scandir`."""
+    """A :class:`Reader` for this platform, or ``None`` to fall back to :func:`os.scandir`.
+
+    ``opener`` is injectable so tests can simulate a missing libc or symbol;
+    every failure means "fall back", never an exception at import time.
+    """
     lib = opener()
     if lib is None:
         return None

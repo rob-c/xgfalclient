@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """The bulk data path: bodies read straight off the socket, and TLS uploads in big blocks."""
 
 from __future__ import annotations
@@ -10,11 +9,15 @@ from pathlib import Path
 import pytest
 
 import xgfalclient
-from test_http_helpers import dav, davs, hctx, write  # noqa: F401 - fixtures
+from test_http_helpers import dav as dav
+from test_http_helpers import davs as davs
+from test_http_helpers import hctx as hctx
+from test_http_helpers import write
 from xgfalclient import GError
 from xgfalclient.errors import ECOMM
-from xgfalclient.plugins.http import _copy
+from xgfalclient.plugins.http import _ranged
 from xgfalclient.plugins.http._client import FileBody, TransportError
+from xgfalclient.plugins.http.plugin import HTTPPlugin
 from xgfalclient.testing.pki import PKI
 from xgfalclient.testing.webdav import WebDAVServer
 
@@ -29,9 +32,11 @@ def file_url(path: Path) -> str:
 def server(request: pytest.FixtureRequest, tmp_path: Path) -> WebDAVServer:
     """Both transports: a plain socket and a TLS one take different read paths."""
     if request.param == "dav":
-        return request.getfixturevalue("dav")  # type: ignore[no-any-return]
+        plain: WebDAVServer = request.getfixturevalue("dav")
+        return plain
     request.getfixturevalue("grid_env")
-    return request.getfixturevalue("davs")  # type: ignore[no-any-return]
+    secure: WebDAVServer = request.getfixturevalue("davs")
+    return secure
 
 
 def test_round_trip(hctx: xgfalclient.Gfal2Context, server: WebDAVServer, tmp_path: Path) -> None:
@@ -48,8 +53,9 @@ def test_direct_reads_in_pieces(hctx: xgfalclient.Gfal2Context, server: WebDAVSe
     data = b"first line\n" + os.urandom(MB + 5)
     write(server, "/data/f", data)
     plugin = hctx.plugin(server.url("/data/f"), "stat")
+    assert isinstance(plugin, HTTPPlugin)
     buffer = bytearray(200_000)
-    with plugin._get(server.url("/data/f"), {}) as response:  # type: ignore[attr-defined]
+    with plugin._get(server.url("/data/f"), {}) as response:
         # A buffered read first leaves http.client holding some of the body.
         got = bytearray(response.readline())
         while True:
@@ -59,7 +65,7 @@ def test_direct_reads_in_pieces(hctx: xgfalclient.Gfal2Context, server: WebDAVSe
             got += buffer[:count]
     assert bytes(got) == data
     # Read to the end, the connection went back to the pool for the next request.
-    assert plugin.client.idle_count() == 1  # type: ignore[attr-defined]
+    assert plugin.client.idle_count() == 1
     assert plugin.stat(server.url("/data/f")).st_size == len(data)
 
 
@@ -70,23 +76,24 @@ def test_parallel_download_over_tls_uses_two_streams(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", MB)
     data = os.urandom(3 * MB + 17)
     write(davs, "/data/big", data)
     hctx.filecopy(davs.url("/data/big"), file_url(tmp_path / "big"))
     assert (tmp_path / "big").read_bytes() == data
     ranges = [r.header("Range") for r in davs.requests if r.method == "GET"]
-    assert len(ranges) == _copy.TLS_STREAMS
-    assert _copy._default_streams("https://h/f") == _copy.TLS_STREAMS
-    assert _copy._default_streams("dav://h/f") == _copy.DEFAULT_STREAMS
+    assert len(ranges) == _ranged.TLS_STREAMS
+    assert _ranged._default_streams("https://h/f") == _ranged.TLS_STREAMS
+    assert _ranged._default_streams("dav://h/f") == _ranged.DEFAULT_STREAMS
 
 
 def test_body_cut_short(hctx: xgfalclient.Gfal2Context, server: WebDAVServer) -> None:
     body = os.urandom(MB)
     server.fault("GET", status=200, body=body, truncate=300_000)
     plugin = hctx.plugin(server.url("/data/f"), "stat")
+    assert isinstance(plugin, HTTPPlugin)
     buffer = bytearray(MB)
-    with plugin._get(server.url("/data/f"), {}) as response:  # type: ignore[attr-defined]
+    with plugin._get(server.url("/data/f"), {}) as response:
         got = 0
         with pytest.raises(TransportError) as caught:
             while True:
@@ -104,8 +111,7 @@ def test_tls_upload_of_a_short_file(
     source = tmp_path / "up"
     source.write_bytes(b"x" * 1000)
     plugin = hctx.plugin(davs.url("/data/f"), "stat")
+    assert isinstance(plugin, HTTPPlugin)
     with source.open("rb") as handle, pytest.raises(GError) as caught:
-        plugin._put_file(  # type: ignore[attr-defined]
-            davs.url("/data/f"), FileBody(handle, 0, 2000), 2000
-        )
+        plugin._put_file(davs.url("/data/f"), FileBody(handle, 0, 2000), 2000)
     assert caught.value.code == errno.EIO and "Short read" in caught.value.message

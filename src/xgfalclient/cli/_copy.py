@@ -15,16 +15,24 @@ One thing is done differently: a copy onto a character device, FIFO or
 socket (``-``, ``/dev/null``) is streamed here, through ``ctx.open``, rather
 than handed to ``filecopy``, whose overwrite check would refuse the existing
 "file" - or, with ``-f``, try to delete it.
+
+Reading order: :meth:`_Copier.run` builds the list of ``(source,
+destination)`` jobs, :meth:`_Copier.copy` decides what one job means
+(file, directory, skip, refuse), and :meth:`_Copier.copy_file` builds the
+``TransferParameters`` from the options and runs the copy with its progress
+bar. Output lines (``Copying N bytes a => b``, ``Mkdir``, ``Skipping``,
+``ERROR (n): ...``) are gfal2-util's and are parsed by scripts.
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
 import stat
 import sys
-from typing import IO
+from typing import IO, TYPE_CHECKING
 
 from ..errors import GError, from_oserror
 from ..events import GfaltEvent
@@ -33,13 +41,16 @@ from ..types import Stat
 from . import _base as base
 from ._base import Command, Spec, arg, out, output, surl
 
+if TYPE_CHECKING:
+    from ._progress import Progress
+
 __all__ = ["SPECS", "STDOUT_URL"]
 
 _log = logging.getLogger(__name__)
 
 #: What ``-`` means as a destination.
 STDOUT_URL = "file:///dev/stdout"
-#: Bytes per read when streaming to a special file.
+#: Bytes per read when streaming to a special file (see :meth:`_Copier.stream`).
 CHUNK = 1 << 20
 
 #: ``--copy-mode`` to ``(ENABLE_REMOTE_COPY, ENABLE_FALLBACK_TPC_COPY, DEFAULT_COPY_MODE)``;
@@ -58,7 +69,15 @@ def _is_special(info: Stat) -> bool:
 
 
 class _Copier:
+    """One ``gfal-copy`` run over all its jobs.
+
+    ``transferred`` holds the latest byte count the monitor callback (or
+    the special-file stream) reported for the file being copied, for the
+    machine-readable report; None until something was reported.
+    """
+
     def __init__(self, cmd: Command) -> None:
+        """Bind to the invocation (options and context); nothing is copied yet."""
         self.cmd = cmd
         self.params = cmd.params
         self.context = cmd.context
@@ -67,43 +86,61 @@ class _Copier:
     # -- the plan ------------------------------------------------------------------
 
     def run(self) -> int:
+        """Build the jobs and run them in order; the command's status (1 for a usage error).
+
+        A chain ``src dst1 dst2`` copies ``src`` to ``dst1`` and then the
+        copy just made onwards: when ``dst1`` is a directory the next
+        source is ``dst1/<basename>``, which is why each destination is
+        stat-ed while planning (skipped with ``--just-copy``, which promises
+        no checks). ``--from-file`` sources all go to the first destination.
+        """
+        jobs = self._plan()
+        if jobs is None:
+            return 1
+        for source, destination in jobs:
+            self._run_job(source, destination)
+        return 0
+
+    def _plan(self) -> list[tuple[str, str]] | None:
+        """The ``(source, destination)`` jobs, or None after reporting a usage error."""
         params = self.params
         if params.from_file and params.src:
-            output.error(
-                ValueError("Use either --from-file or a positional source, not both"), code=1
-            )
-            output.message(
+            _usage_error(
+                "Use either --from-file or a positional source, not both",
                 "Cannot combine '--from-file' with a source in the positional arguments\n",
-                stderr=True,
             )
-            return 1
-        jobs: list[tuple[str, str]] = []
+            return None
         if params.from_file:
             with open(params.from_file) as handle:
                 sources = [line.strip() for line in handle]
-            jobs = [(source, params.dst[0]) for source in sources if source]
-        elif params.src:
-            source = params.src
-            for destination in params.dst:
-                jobs.append((source, destination))
-                if not params.just_copy and self._is_dir(destination):
-                    source = destination + "/" + os.path.basename(source)
-                else:
-                    source = destination
-        else:
-            output.error(ValueError("Provide a source URL or use --from-file"), code=1)
-            output.message("Missing source\n", stderr=True)
-            return 1
-        for source, destination in jobs:
-            if destination == "-":
-                destination = STDOUT_URL
-            if params.just_copy:
-                self.copy_file(source, destination, 0, special=destination == STDOUT_URL)
+            return [(source, params.dst[0]) for source in sources if source]
+        if params.src:
+            return self._chain(params.src)
+        _usage_error("Provide a source URL or use --from-file", "Missing source\n")
+        return None
+
+    def _chain(self, source: str) -> list[tuple[str, str]]:
+        """``src dst1 dst2...`` as hops, each from the copy the previous one made."""
+        jobs: list[tuple[str, str]] = []
+        for destination in self.params.dst:
+            jobs.append((source, destination))
+            if not self.params.just_copy and self._is_dir(destination):
+                source = destination + "/" + os.path.basename(source)
             else:
-                self.copy(source, destination)
-        return 0
+                source = destination
+        return jobs
+
+    def _run_job(self, source: str, destination: str) -> None:
+        """One planned job: straight to the copy with ``--just-copy``, else checked first."""
+        if destination == "-":
+            destination = STDOUT_URL
+        if self.params.just_copy:
+            self.copy_file(source, destination, 0, special=destination == STDOUT_URL)
+        else:
+            self.copy(source, destination)
 
     def _is_dir(self, url: str) -> bool:
+        """Whether ``url`` is an existing directory; any failure to stat means no."""
         try:
             return self.context.stat(url).is_dir()
         except GError:
@@ -120,7 +157,11 @@ class _Copier:
     # -- one item --------------------------------------------------------------------
 
     def _destination(self, url: str) -> tuple[bool, bool, bool]:
-        """``(exists, is_dir, is_special)``."""
+        """``(exists, is_dir, is_special)``.
+
+        Only a local (``file:``) destination can be special: a remote
+        storage never holds a device or FIFO worth writing into.
+        """
         if url == STDOUT_URL:
             return True, False, True
         try:
@@ -130,6 +171,15 @@ class _Copier:
         return True, info.is_dir(), url.startswith("file:") and _is_special(info)
 
     def copy(self, source: str, destination: str) -> None:
+        """One job, with gfal2-util's checks: overwrite, directory over file, recursion.
+
+        Order matters and is gfal2-util's: an existing destination file is
+        refused without ``-f`` before anything else (an LFC destination only
+        warns, since copying there adds a replica); a directory source into
+        a missing destination creates it and recurses even without ``-r``;
+        into an existing directory it needs ``-r``. A file copied into a
+        directory lands at ``dir/<basename>``.
+        """
         output.identify("copy", source=source, target=destination)
         try:
             info = self.context.stat(source)
@@ -138,31 +188,10 @@ class _Copier:
             return
         source_dir = info.is_dir()
         exists, dest_dir, special = self._destination(destination)
-        if exists and not dest_dir and not special and not self.params.force:
-            if destination.startswith(("lfc://", "lfn://", "guid://")):
-                _log.warning("Destination exists, but it is an LFC, so try to add a new replica")
-            else:
-                self.failure(
-                    f"Destination {destination} exists and overwrite is not set", errno.EEXIST
-                )
-                return
-        if exists and not dest_dir and source_dir:
-            self.failure("Can not copy a directory over a file", errno.EISDIR)
+        if exists and not dest_dir and self._refuses_file(destination, source_dir, special):
             return
-        if source_dir and not exists:
-            try:
-                self.mkdir(destination)
-            except GError as exc:
-                self.failure(f"Could not create the directory: {exc.user_message}", exc.code)
-                return
-            self.copy_tree(source, destination)
-            return
-        if source_dir:  # onto an existing directory
-            if self.params.recursive:
-                self.copy_tree(source, destination)
-            else:
-                output.record(status="skipped")
-                out(f"Skipping {source}\n")
+        if source_dir:
+            self._copy_directory(source, destination, exists)
             return
         if dest_dir:
             destination = (destination if destination.endswith("/") else destination + "/") + (
@@ -170,7 +199,43 @@ class _Copier:
             )
         self.copy_file(source, destination, info.st_size, special=special)
 
+    def _refuses_file(self, destination: str, source_dir: bool, special: bool) -> bool:
+        """Whether the existing, non-directory ``destination`` stops the job (reported).
+
+        Without ``-f`` an ordinary file is refused (an LFC destination only
+        warns, since copying there adds a replica); a directory source is
+        never copied over a file.
+        """
+        if not special and not self.params.force:
+            if destination.startswith(("lfc://", "lfn://", "guid://")):
+                _log.warning("Destination exists, but it is an LFC, so try to add a new replica")
+            else:
+                self.failure(
+                    f"Destination {destination} exists and overwrite is not set", errno.EEXIST
+                )
+                return True
+        if source_dir:
+            self.failure("Can not copy a directory over a file", errno.EISDIR)
+            return True
+        return False
+
+    def _copy_directory(self, source: str, destination: str, exists: bool) -> None:
+        """A directory source: into a new directory always, an existing one with ``-r``."""
+        if not exists:
+            try:
+                self.mkdir(destination)
+            except GError as exc:
+                self.failure(f"Could not create the directory: {exc.user_message}", exc.code)
+                return
+            self.copy_tree(source, destination)
+        elif self.params.recursive:
+            self.copy_tree(source, destination)
+        else:
+            output.record(status="skipped")
+            out(f"Skipping {source}\n")
+
     def mkdir(self, url: str) -> None:
+        """Print ``Mkdir <url>`` and ``mkdir -p`` it (under ``--dry-run``, only print)."""
         output.identify("mkdir", url=url)
         out(f"Mkdir {url}\n")
         if not self.params.dry_run:
@@ -178,6 +243,7 @@ class _Copier:
         output.record(status="planned" if self.params.dry_run else "succeeded")
 
     def copy_tree(self, source: str, destination: str) -> None:
+        """Copy each entry of directory ``source`` into ``destination`` (via :meth:`copy`)."""
         names = self.context.listdir(source)
         source_base = source if source.endswith("/") else source + "/"
         dest_base = destination if destination.endswith("/") else destination + "/"
@@ -188,8 +254,35 @@ class _Copier:
     # -- the copy itself ---------------------------------------------------------------
 
     def parameters(self, size: int) -> TransferParameters:
+        """Fresh ``TransferParameters`` for one file, from the command-line options.
+
+        Only options given are applied, so gfal2's defaults stand otherwise.
+        ``-K ALG[:VALUE]`` with ``--checksum-mode`` becomes ``set_checksum``
+        (whose validation can fail the copy, e.g. ``source`` mode without a
+        value). ``--copy-mode`` is not a transfer parameter in gfal2: it
+        changes the context's ``[HTTP PLUGIN]`` options, as gfal2-util does,
+        and so applies to every later copy of this run too.
+        """
         params = self.params
         transfer = self.context.transfer_parameters()
+        self._set_values(transfer)
+        self._set_switches(transfer)
+        if params.checksum:
+            from ..enums import checksum_mode
+
+            parts = params.checksum.split(":")
+            value = parts[1] if len(parts) > 1 else ""
+            mode = checksum_mode.names[params.checksum_mode]
+            transfer.set_checksum(mode, parts[0], value)
+        if params.copy_mode:
+            self._set_copy_mode(params.copy_mode)
+
+        self._callbacks(transfer, size)
+        return transfer
+
+    def _set_values(self, transfer: TransferParameters) -> None:
+        """The valued options: ``-n``, ``-T``, ``-s``, ``-S``, ``--tcp-buffersize``, ``--scitag``"""
+        params = self.params
         if params.nbstreams:
             transfer.nbstreams = params.nbstreams
         if params.transfer_timeout:
@@ -198,10 +291,16 @@ class _Copier:
             transfer.src_spacetoken = params.src_spacetoken
         if params.dst_spacetoken:
             transfer.dst_spacetoken = params.dst_spacetoken
-        if params.parent:
-            transfer.create_parent = True
         if params.tcp_buffersize:
             transfer.tcp_buffersize = params.tcp_buffersize
+        if params.scitag is not None:
+            transfer.scitag = params.scitag
+
+    def _set_switches(self, transfer: TransferParameters) -> None:
+        """The on/off options (``-p``, ``-f``, ``--just-copy``, ``--disable-cleanup``...)."""
+        params = self.params
+        if params.parent:
+            transfer.create_parent = True
         if params.force:
             transfer.overwrite = True
         if params.just_copy:
@@ -212,30 +311,26 @@ class _Copier:
             transfer.proxy_delegation = False
         if params.evict:
             transfer.evict = True
-        if params.scitag is not None:
-            transfer.scitag = params.scitag
-        if params.checksum:
-            from ..enums import checksum_mode
 
-            parts = params.checksum.split(":")
-            value = parts[1] if len(parts) > 1 else ""
-            mode = checksum_mode.names[params.checksum_mode]
-            transfer.set_checksum(mode, parts[0], value)
-        if params.copy_mode:
-            remote, fallback, default = _COPY_MODES[params.copy_mode]
-            self.context.set_opt_boolean("HTTP PLUGIN", "ENABLE_REMOTE_COPY", remote)
-            if fallback is not None:
-                self.context.set_opt_boolean("HTTP PLUGIN", "ENABLE_FALLBACK_TPC_COPY", fallback)
-            self.context.set_opt_string("HTTP PLUGIN", "DEFAULT_COPY_MODE", default)
-
-        self._callbacks(transfer, size)
-        return transfer
+    def _set_copy_mode(self, copy_mode: str) -> None:
+        """``--copy-mode``: the context's ``[HTTP PLUGIN]`` options, as gfal2-util sets them."""
+        remote, fallback, default = _COPY_MODES[copy_mode]
+        self.context.set_opt_boolean("HTTP PLUGIN", "ENABLE_REMOTE_COPY", remote)
+        if fallback is not None:
+            self.context.set_opt_boolean("HTTP PLUGIN", "ENABLE_FALLBACK_TPC_COPY", fallback)
+        self.context.set_opt_string("HTTP PLUGIN", "DEFAULT_COPY_MODE", default)
 
     def _callbacks(self, transfer: TransferParameters, size: int) -> None:
+        """Attach the event and monitor callbacks: report records, ``-v`` lines, the bar.
+
+        With ``-v`` every event is printed as ``event: <str(event)>`` and
+        every progress report as ``monitor: ...``, gfal2-util's debug lines.
+        """
         verbose = self.params.verbose
         report = output.current()
 
         def event_callback(event: GfaltEvent) -> None:
+            """Record the event in the report and, with ``-v``, print it."""
             if report is not None:
                 report.record(
                     "event",
@@ -252,6 +347,12 @@ class _Copier:
         def monitor_callback(
             src: str, dst: str, average: int, instant: int, transferred: int, elapsed: int
         ) -> None:
+            """Record progress and redraw the bar.
+
+            Six parameters because this is gfal2's ``monitor_callback``
+            signature (source, destination, average and instantaneous
+            rate, bytes, seconds); it cannot be grouped.
+            """
             self.transferred = transferred
             if report is not None:
                 report.record(
@@ -273,19 +374,19 @@ class _Copier:
         transfer.monitor_callback = monitor_callback
 
     def copy_file(self, source: str, destination: str, size: int, *, special: bool) -> None:
+        """Copy one file, with a progress bar on a terminal or a ``Copying ...`` line otherwise.
+
+        ``-f`` retries once after removing the destination when the copy
+        reports ``EEXIST``: some plugins (HTTP third-party copies) find the
+        existing destination only at copy time. If the unlink then finds
+        nothing (``ENOENT``) the ``EEXIST`` was about something else and is
+        reported as it was. Failures go through :meth:`failure`.
+        """
         output.identify("copy", source=source, target=destination)
         self.transferred = None
         transfer = self.parameters(size)
         params = self.params
-        bar = None
-        if not params.dry_run and not params.verbose and base.stdout_isatty():
-            from ._progress import Progress
-
-            bar = Progress(f"Copying {source}")
-            bar.update(total_size=size)
-            bar.start()
-        else:
-            out(f"Copying {size} bytes {source} => {destination}\n")
+        bar = self._progress(source, destination, size)
         self.cmd.progress_bar = bar
         try:
             if not params.dry_run:
@@ -293,25 +394,12 @@ class _Copier:
                     self.stream(source, destination)
                 else:
                     self.context.filecopy(transfer, source, destination)
-            if bar is not None:
-                bar.stop(True)
-                out("\n")
+            _stop(bar, True)
         except GError as exc:
-            if bar is not None:
-                bar.stop(False)
-                out("\n")
-            if exc.code == errno.EEXIST and params.force:
-                try:
-                    self.context.unlink(destination)
-                except GError as gone:
-                    # Nothing there, so the EEXIST was not the destination's (a 409
-                    # for a missing parent): report it, not the unlink's ENOENT.
-                    # gfal2 numbers that 409 with a stale errno, so seldom gets here.
-                    if gone.code != errno.ENOENT:
-                        raise
-                else:
-                    self.copy_file(source, destination, size, special=special)
-                    return
+            _stop(bar, False)
+            if exc.code == errno.EEXIST and params.force and self._unlinked(destination):
+                self.copy_file(source, destination, size, special=special)
+                return
             self.failure(exc.user_message, exc.code)
             return
         output.record(
@@ -320,35 +408,72 @@ class _Copier:
             bytes_transferred=0 if params.dry_run else self.transferred,
         )
 
+    def _progress(self, source: str, destination: str, size: int) -> Progress | None:
+        """A started progress bar on a terminal; otherwise print ``Copying ...`` and None."""
+        params = self.params
+        if not params.dry_run and not params.verbose and base.stdout_isatty():
+            from ._progress import Progress
+
+            bar = Progress(f"Copying {source}")
+            bar.update(total_size=size)
+            bar.start()
+            return bar
+        out(f"Copying {size} bytes {source} => {destination}\n")
+        return None
+
+    def _unlinked(self, destination: str) -> bool:
+        """``-f``'s retry: remove ``destination``; False if nothing was there (``ENOENT``).
+
+        Nothing there means the ``EEXIST`` was not the destination's (a 409
+        for a missing parent): it is reported, not the unlink's ``ENOENT``.
+        gfal2 numbers that 409 with a stale errno, so seldom gets here.
+        """
+        try:
+            self.context.unlink(destination)
+        except GError as gone:
+            if gone.code != errno.ENOENT:
+                raise
+            return False
+        return True
+
     def stream(self, source: str, destination: str) -> None:
         """Copy onto a special file: read through the context, write to the device."""
-        reader = self.context.open(source, "r")
-        try:
+        with contextlib.ExitStack() as stack:
+            reader = self.context.open(source, "r")
+            stack.callback(reader.close)
             sink: IO[bytes]
             if destination == STDOUT_URL:
                 sys.stdout.flush()
                 sink = sys.stdout.buffer
             else:
                 try:
-                    sink = open(destination[len("file://") :], "wb")  # noqa: SIM115
+                    sink = stack.enter_context(open(destination[len("file://") :], "wb"))
                 except OSError as exc:
                     raise from_oserror(exc) from exc
-            try:
-                while True:
-                    data = reader.read_bytes(CHUNK)
-                    if not data:
-                        break
-                    sink.write(data)
-                    sink.flush()
-                    self.transferred = (self.transferred or 0) + len(data)
-            finally:
-                if destination != STDOUT_URL:
-                    sink.close()
-        finally:
-            reader.close()
+            while True:
+                data = reader.read_bytes(CHUNK)
+                if not data:
+                    break
+                sink.write(data)
+                sink.flush()
+                self.transferred = (self.transferred or 0) + len(data)
+
+
+def _usage_error(error: str, message: str) -> None:
+    """Report a usage error: ``error`` in the report (code 1), ``message`` on stderr."""
+    output.error(ValueError(error), code=1)
+    output.message(message, stderr=True)
+
+
+def _stop(bar: Progress | None, ok: bool) -> None:
+    """Stop the progress bar, if there is one, and end its line."""
+    if bar is not None:
+        bar.stop(ok)
+        out("\n")
 
 
 def copy(cmd: Command) -> int:
+    """``gfal-copy``: the command function; see :class:`_Copier`."""
     return _Copier(cmd).run()
 
 

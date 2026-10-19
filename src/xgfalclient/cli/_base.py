@@ -17,14 +17,34 @@ gfal2-util's ``CommandBase`` does:
 The exit statuses follow from that: whatever the command returns (``None``
 is 0), the ``GError`` code (255 if out of range), 255 when the command died
 of anything else, ``ETIMEDOUT`` on ``-t`` and ``EINTR`` on ``Ctrl-C``.
+These are gfal2-util's numbers, not the 130/141 of :mod:`xrdcore.cli`'s
+shared table, because scripts written for gfal2-util test them; only 0 and 1
+(:class:`xrdcore.cli.ExitCode` ``OK``/``FAILED``) and the quiet broken pipe
+(:func:`xrdcore.cli.silence_stdout`) are shared with the other tools.
 
 Interfaces and layout follow gfal2-util (Apache-2.0, (c) CERN); error display
 prioritises clear explanations while keeping the original numeric exit codes.
+
+Beyond gfal2-util, every command can also emit a versioned machine-readable
+report (``--json``/``--xml``) through :mod:`xrdcore.report` (xrdclient's
+``cli._output`` until 0.4.0, the same document every tool on the stack
+writes), the module imported here as ``output``: commands call ``output.identify``
+once and ``output.record`` per result, and human text goes through
+:func:`out` so that it is suppressed (or captured) when a report is asked
+for. The human output stays byte-for-byte gfal2-util's either way.
+
+A maintainer must not break: help text (it is gfal2-util's, and the man
+pages in ``share/man/man1`` are generated from these parsers -
+``tests/test_cli_man.py`` fails when they drift), the exit-status rules
+above, and the fact that a
+command function only ever sees a :class:`Command` - ``gfal2_util``
+subclasses depend on that shape.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import contextvars
 import errno
 import logging
@@ -33,10 +53,12 @@ import signal
 import sys
 import threading
 import traceback
-from collections.abc import Sequence
-from typing import IO, TYPE_CHECKING, Any, Callable, Optional, Union
+from collections.abc import Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, TextIO
 
-from xrdclient.cli import _output as output
+from xrdcore import log as xrdlog
+from xrdcore import report as output
+from xrdcore.cli import ExitCode, silence_stdout
 
 from .. import _log
 from ..errors import GError, from_oserror
@@ -69,12 +91,19 @@ TIMEOUT_GRACE = 30
 #: Seconds to wait for ``cancel()`` after ``Ctrl-C``.
 CANCEL_WAIT = 4.0
 
+#: One ``add_argument`` call: its positional flags and its keyword options.
 Argument = tuple[tuple[str, ...], dict[str, Any]]
-Runner = Callable[["Command"], Optional[int]]
+#: A command body: takes the invocation, answers its exit status (None is 0).
+Runner = Callable[["Command"], int | None]
 
 
 def arg(*flags: str, **options: Any) -> Argument:
-    """One ``add_argument`` call, as data."""
+    """One ``add_argument`` call, as data.
+
+    gfal2-util attaches these with an ``@arg`` decorator per option; a list
+    of them in a :class:`Spec` builds the identical parser without the
+    decorator machinery.
+    """
     return flags, options
 
 
@@ -95,6 +124,7 @@ class Spec:
         run: Runner,
         return_code: int = -1,
     ) -> None:
+        """``name`` is the bare command (``ls``); ``doc``'s first line is the ``--help`` blurb."""
         self.name = name
         self.__name__ = "execute_" + name
         self.__doc__ = self.doc = doc
@@ -105,6 +135,7 @@ class Spec:
         self.return_code = return_code
 
     def __call__(self, command: Command) -> int | None:
+        """Run the command body, as gfal2-util calls ``execute_<name>(self)``."""
         return self.run(command)
 
 
@@ -114,6 +145,11 @@ def out(text: str) -> None:
 
 
 def stat_record(info: Stat | None) -> dict[str, int] | None:
+    """``info``'s fields for a machine-readable report; None when no report is being made.
+
+    Skipping the work without a report keeps ``gfal-ls -l`` of a large
+    directory from building a dict per entry for nothing.
+    """
     from ..types import Stat
 
     if output.current() is None or info is None:
@@ -150,6 +186,7 @@ class _HelpFormatter(argparse.HelpFormatter):
     """
 
     def _format_action_invocation(self, action: argparse.Action) -> str:
+        """Every option string followed by the metavar, as argparse did before 3.13."""
         if not action.option_strings:
             (metavar,) = self._metavar_formatter(action, action.dest)(1)
             return str(metavar)
@@ -163,10 +200,12 @@ class _VersionAction(argparse.Action):
     """``-V``: the version, then the loaded plugins, one per line."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """A flag that takes no value, as gfal2-util's ``VersionAction``."""
         kwargs["nargs"] = 0
         super().__init__(*args, **kwargs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> None:
+        """Print and exit 0; the plugin list forces every plugin to load, as it must."""
         from .. import creat_context, get_version
 
         text = f"gfal2-util version {VERSION} (gfal2 {get_version()})"
@@ -183,6 +222,11 @@ class _VersionAction(argparse.Action):
 def build_parser(
     prog: str, command: str, doc: str, arguments: Sequence[Argument]
 ) -> argparse.ArgumentParser:
+    """gfal2-util's parser for ``command``: the common options, then the command's own.
+
+    Option order, wording and section titles are gfal2-util's on every
+    Python version, since scripts and the generated man pages depend on them.
+    """
     description = f"Gfal util {command.upper()} command. {doc}"
     if not description.endswith("."):
         description += "."
@@ -190,7 +234,9 @@ def build_parser(
         prog=prog, description=description, add_help=True, formatter_class=_HelpFormatter
     )
     parser._optionals.title = "optional arguments"  # Python 3.10+ says "options"
-    parser.color = False  # type: ignore[attr-defined]  # Python 3.14 colours help on a TTY
+    # Python 3.14 colours help on a TTY; the attribute is new there, so it is
+    # set through the instance dict, which earlier versions simply ignore.
+    vars(parser)["color"] = False
     parser.add_argument(
         "-V", "--version", action=_VersionAction, help="output version information and exit"
     )
@@ -253,11 +299,18 @@ def build_parser(
 # -D and friends
 # ---------------------------------------------------------------------------
 
-Value = Union[int, bool, str]
+#: A ``-D`` value after gfal2-util's guessing (see :func:`_value`).
+Value = int | bool | str
 
 
 def _value(text: str) -> Value:
-    """An option value: an integer, else a boolean, else the string."""
+    """An option value: an integer, else a boolean, else the string.
+
+    gfal2-util's guess, quirks included: ``1`` and ``0`` are integers (so
+    set with ``set_opt_integer``), and ``yes``/``no``/``y``/``n`` are
+    booleans though GLib would not read them as such - which is fine, since
+    they are then stored as GLib's ``true``/``false``.
+    """
     try:
         return int(text)
     except ValueError:
@@ -271,7 +324,12 @@ def _value(text: str) -> Value:
 
 
 def parse_definition(text: str) -> tuple[str, str, list[Value]]:
-    """``GROUP:KEY=VALUE[,VALUE...]`` into its parts; ``ValueError`` if malformed."""
+    """``GROUP:KEY=VALUE[,VALUE...]`` into its parts; ``ValueError`` if malformed.
+
+    The group ends at the *last* colon before ``=``, so a group name may
+    itself contain colons, and a value may contain ``=`` and ``:``. The
+    messages are gfal2-util's; :func:`main` prints them with status 1.
+    """
     equals = text.find("=")
     if equals == -1:
         raise ValueError(f"parameter '{text}' doesn't include value, use 'group:option=value'")
@@ -283,6 +341,7 @@ def parse_definition(text: str) -> tuple[str, str, list[Value]]:
 
 
 def _set_definition(context: Gfal2Context, group: str, key: str, values: list[Value]) -> None:
+    """Store one ``-D`` with the setter its value's type picks; several values make a list."""
     if len(values) > 1:
         context.set_opt_string_list(group, key, [str(value) for value in values])
         return
@@ -296,12 +355,20 @@ def _set_definition(context: Gfal2Context, group: str, key: str, values: list[Va
 
 
 def apply_options(context: Gfal2Context, params: argparse.Namespace) -> None:
-    """What the common options do to the context."""
+    """What the common options do to the context.
+
+    Every ``-D`` is parsed before any is applied, so a malformed one leaves
+    the context untouched. ``-t`` bounds the namespace and checksum
+    operations through the options (a copy's own limit is
+    ``--transfer-timeout``), as gfal2-util sets them.
+    """
     if params.definition:
         parsed = [parse_definition(item[0]) for item in params.definition]
         for group, key, values in parsed:
             _set_definition(context, group, key, values)
     for info in params.client_info or ():
+        # gfal2-util's split: a value containing "=" gives three parts, and
+        # then the whole text becomes a key with an empty value.
         parts = info.split("=", 2)
         if len(parts) == 2:
             context.add_client_info(parts[0], parts[1])
@@ -337,13 +404,32 @@ class _Formatter(logging.Formatter):
     """
 
     def __init__(self, tty: bool) -> None:
+        """Colour only when ``tty``: a log file or pipe gets plain ``LEVEL message``."""
         super().__init__("%(levelname)s %(message)s")
         self.tty = tty
 
     def formatMessage(self, record: logging.LogRecord) -> str:
+        """The record's line, with the coloured, padded level name on a terminal."""
         if not self.tty:
             return super().formatMessage(record)
         return f"{_TTY_LEVELS.get(record.levelno, record.levelname)} {record.getMessage()}"
+
+
+#: gfal2-util's ``-v`` scale: errors only, then warnings, info and debug.
+_VERBOSITY = (logging.ERROR, logging.WARNING, logging.INFO, logging.DEBUG)
+
+
+@contextlib.contextmanager
+def _log_stream(log_file: str | None) -> Iterator[TextIO]:
+    """Where ``-v`` output goes: ``--log-file``, truncated (gfal2-util opens it ``w+``), or stdout.
+
+    Stdout is the caller's and is left open; the file is closed on exit.
+    """
+    if not log_file:
+        yield sys.stdout
+        return
+    with open(log_file, "w+") as stream:
+        yield stream
 
 
 class _Logging:
@@ -351,34 +437,40 @@ class _Logging:
 
     A command normally owns its process, but ``main()`` may be called more
     than once in one (tests, wrappers), so everything touched is put back.
+    The handler itself is :func:`xrdcore.log.configure`'s, which also
+    redacts what it writes (a gfal2 debug line can carry a token); what is
+    gfal2-util's here is the scale, the stream (stdout, not stderr), the
+    ``LEVEL message`` format and the library threshold.
     """
 
     def __init__(self, verbose: int, log_file: str | None) -> None:
+        """Install the handler: no ``-v`` shows errors, then warnings, info, debug.
+
+        The library's own verbosity is raised to ``verbose`` for any ``-v``
+        count below three and to ``debug`` at three, as gfal2-util does, so
+        gfal2's INFO events reach a ``-vv`` handler. ``--log-file`` is
+        truncated, not appended to (gfal2-util opens it ``w+``).
+        """
         from .. import set_verbose, verbose_level
 
-        level = min(3, max(0, verbose))
-        self.value = logging.ERROR - level * 10
-        self.library_threshold = _log.threshold()
-        set_verbose(verbose_level.verbose if level < 3 else verbose_level.debug)
-        self.file: IO[str] | None = open(log_file, "w+") if log_file else None  # noqa: SIM115
-        stream = self.file if self.file is not None else sys.stdout
-        self.handler = logging.StreamHandler(stream)
-        self.handler.setLevel(self.value)
-        self.handler.setFormatter(_Formatter(_isatty(stream)))
-        self.root = logging.getLogger()
-        self.root_level = self.root.level
-        self.root.setLevel(self.value)
-        self.root.addHandler(self.handler)
+        # Everything to put back, undone in reverse by close(). The log file
+        # is opened first, so a --log-file that cannot be opened leaves
+        # nothing changed.
+        self.undo = contextlib.ExitStack()
+        stream = self.undo.enter_context(_log_stream(log_file))
+        level = xrdlog.verbosity_level(verbose, _VERBOSITY)
+        self.undo.callback(_log.set_threshold, _log.threshold())
+        set_verbose(verbose_level.debug if level == logging.DEBUG else verbose_level.verbose)
+        configured = xrdlog.configure(level, stream=stream, fmt=_Formatter(_isatty(stream)))
+        self.undo.callback(configured.close)
 
     def close(self) -> None:
-        self.root.removeHandler(self.handler)
-        self.root.setLevel(self.root_level)
-        _log.set_threshold(self.library_threshold)
-        if self.file is not None:
-            self.file.close()
+        """Put the root logger and the library threshold back; close the log file."""
+        self.undo.close()
 
 
 def _isatty(stream: Any) -> bool:
+    """``stream.isatty()``, False for a stream without one or already closed."""
     try:
         return bool(stream.isatty())
     except (AttributeError, ValueError):
@@ -386,6 +478,7 @@ def _isatty(stream: Any) -> bool:
 
 
 def stdout_isatty() -> bool:
+    """Whether stdout is a terminal (``--color=auto``, progress bars); a test hook."""
     return _isatty(sys.stdout)
 
 
@@ -405,6 +498,7 @@ class Command:
     """
 
     def __init__(self) -> None:
+        """Nothing is parsed or created yet; ``context`` exists once :meth:`execute` runs."""
         self.context: Gfal2Context
         self.progress_bar: Progress | None = None
         self.running = False
@@ -428,6 +522,13 @@ class Command:
         output.identify(report.command if report is not None else self.prog)
 
     def execute(self, func: Runner) -> int | None:
+        """Apply the common options, make the context and run ``func`` on a worker thread.
+
+        ``--cert``/``--key`` are exported (and ``X509_USER_PROXY`` removed)
+        before the context exists, because the context seeds its credential
+        from the environment when it is created; ``--key`` defaults to the
+        certificate file, for a proxy.
+        """
         params = self.params
         if params.cert:
             if not params.key:
@@ -475,6 +576,11 @@ class Command:
             return self._interrupted()
 
     def _interrupted(self) -> int:
+        """``Ctrl-C``: cancel the context from another thread, wait a little, answer ``EINTR``.
+
+        A second ``Ctrl-C`` is ignored while cancelling, so the message and
+        the cancel complete; the old handler is restored afterwards.
+        """
         output.message("Caught keyboard interrupt. Canceling...", stderr=True)
         self.interrupted = True
         previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -506,7 +612,7 @@ class Command:
                 _report_oserror(self.prog, exc)
                 # Keep the command's existing exit-status policy for raw OSErrors.
             else:
-                _silence_stdout()
+                silence_stdout()
         except SystemExit:
             pass  # parser.error() inside the command: argparse has printed why
         except OverflowError as exc:
@@ -529,29 +635,14 @@ class Command:
 
 
 def _report_oserror(program: str, exc: OSError) -> None:
+    """Print a local ``OSError`` the way a ``GError`` is printed, with the file name if any."""
     error = from_oserror(exc)
     where = f" [{exc.filename}]" if exc.filename else ""
     output.message(f"{program}: {error.user_message}{where} (error {error.code})\n", stderr=True)
 
 
-def _silence_stdout() -> None:
-    """Point stdout at ``/dev/null`` once the reader of a pipe has gone.
-
-    gfal2-util runs unbuffered, so nothing is left to write at exit; here
-    the interpreter's last flush of ``sys.stdout`` would fail again and print
-    ``Exception ignored ... BrokenPipeError`` (and exit 120). This is what
-    the ``signal`` module's documentation recommends for ``SIGPIPE``.
-    """
-    try:
-        fd = sys.stdout.fileno()
-    except (AttributeError, ValueError):  # io.UnsupportedOperation is a ValueError
-        return
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, fd)
-    os.close(devnull)
-
-
 def _wait(worker: threading.Thread, timeout: float | None) -> None:
+    """Wait for the command thread; a separate function so tests can raise ``Ctrl-C`` here."""
     worker.join(timeout)
 
 
@@ -563,11 +654,16 @@ def _thread_traceback() -> None:
 
 
 def exit_status(code: int | None) -> int:
-    """What the process exits with, for what :meth:`Command.execute` returned."""
-    return 0 if code is None else code & 0xFF
+    """What the process exits with, for what :meth:`Command.execute` returned.
+
+    ``None`` is 0; anything else is truncated to a byte, as the shell would
+    see it (``-1`` is 255, ``256`` is 0 - gfal2-util's behaviour).
+    """
+    return int(ExitCode.OK) if code is None else code & 0xFF
 
 
 def main(command: str, spec: Spec, argv: Sequence[str] | None = None) -> int:
+    """Run ``gfal-<command>`` inside a report context; its exit status (see :func:`_main`)."""
     return output.run_cli(f"gfal-{command}", argv, lambda: _main(command, spec, argv))
 
 
@@ -585,11 +681,11 @@ def _main(command: str, spec: Spec, argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         output.error(exc)
         _report_oserror(runner.prog, exc)
-        return 1
+        return int(ExitCode.FAILED)
     except ValueError as exc:
         output.error(exc)
         print(f"{runner.prog}: {exc}", file=sys.stderr)
-        return 1
+        return int(ExitCode.FAILED)
     except Exception as exc:
         output.error(exc)
         if getattr(runner.params, "verbose", 0) >= 3:
@@ -600,4 +696,4 @@ def _main(command: str, spec: Spec, argv: Sequence[str] | None = None) -> int:
                 "Run with -vvv for technical details.",
                 file=sys.stderr,
             )
-        return 1
+        return int(ExitCode.FAILED)

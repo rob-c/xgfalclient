@@ -6,12 +6,13 @@ import errno
 import logging
 import os
 import ssl
+import sys
 from pathlib import Path
 
 import pytest
+from xrdsec import credentials
 
 import xgfalclient
-from conftest import REAL_UID, UNUSED_UID
 from xgfalclient import GError
 from xgfalclient.creds import (
     BEARER,
@@ -91,7 +92,8 @@ def test_x509_discovery_order(tmp_path: Path) -> None:
     ):
         path.write_text("x")
     env = {"X509_USER_PROXY": str(proxy), "X509_USER_CERT": str(cert), "X509_USER_KEY": str(key)}
-    assert find_x509(options, None, "", {**env, "HOME": str(home)}).cert == str(proxy)  # type: ignore[union-attr]
+    found = find_x509(options, None, "", {**env, "HOME": str(home)})
+    assert found is not None and found.cert == str(proxy)
     # A stale X509_USER_PROXY stands for nothing: not the user certificate,
     # not ~/.globus - the variable named the identity, and it is not there.
     env["X509_USER_PROXY"] = str(tmp_path / "stale")
@@ -122,30 +124,29 @@ def test_x509_discovery_needs_both_halves(monkeypatch: pytest.MonkeyPatch, tmp_p
     )
 
 
-def test_x509_default_proxy_location(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    proxy = Path(f"/tmp/x509up_u{UNUSED_UID}")
-    try:
-        proxy.write_text("x")
-        found = find_x509(Options(load_system=False), None, "", {"HOME": str(tmp_path)})
-        assert found == X509Credential(str(proxy), str(proxy))
-    finally:
-        proxy.unlink()
+def _default_proxy() -> Path:
+    """``/tmp/x509up_u<euid>``, in the tests' own ``/tmp`` (xrdsec.testing.fixtures)."""
+    proxy = Path(credentials.TMP_DIR) / f"x509up_u{os.geteuid()}"
+    proxy.write_text("x")
+    return proxy
+
+
+def test_x509_default_proxy_location(tmp_path: Path) -> None:
+    proxy = _default_proxy()
+    found = find_x509(Options(load_system=False), None, "", {"HOME": str(tmp_path)})
+    assert found == X509Credential(str(proxy), str(proxy))
 
 
 def test_a_missing_named_proxy_is_not_replaced_by_the_default_one(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """In a pilot, /tmp/x509up_u<uid> is the pilot's proxy, not the payload's."""
-    proxy = Path(f"/tmp/x509up_u{UNUSED_UID}")
+    _default_proxy()
     missing = str(tmp_path / "payload-proxy")
-    try:
-        proxy.write_text("x")
-        env = {"X509_USER_PROXY": missing, "HOME": str(tmp_path)}
-        with caplog.at_level("WARNING"):
-            assert find_x509(Options(load_system=False), None, "", env) is None
-            assert find_x509(Options(load_system=False), None, "", env) is None
-    finally:
-        proxy.unlink()
+    env = {"X509_USER_PROXY": missing, "HOME": str(tmp_path)}
+    with caplog.at_level("WARNING"):
+        assert find_x509(Options(load_system=False), None, "", env) is None
+        assert find_x509(Options(load_system=False), None, "", env) is None
     warnings = [r for r in caplog.records if missing in r.getMessage()]
     assert len(warnings) == 1  # said once, not once per request
     assert "no X.509 credential will be presented" in warnings[0].getMessage()
@@ -160,22 +161,27 @@ def test_x509_uses_real_environment_by_default(
     assert find_x509(Options(load_system=False)) == X509Credential(str(proxy), str(proxy))
 
 
+def _private(path: Path, text: str) -> Path:
+    """Write a token file the way ``htgettoken`` and ``oidc-token`` do: mode 0600."""
+    path.write_text(text)
+    path.chmod(0o600)
+    return path
+
+
 def test_bearer_token_discovery(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     options = Options(load_system=False)
     store = CredentialStore()
     assert find_bearer_token(options, store, "https://se/f", {}) is None
-    token_file = tmp_path / "tok"
-    token_file.write_text("  from-file \n")
+    token_file = _private(tmp_path / "tok", "  from-file \n")
     assert (
         find_bearer_token(options, None, "", {"BEARER_TOKEN_FILE": str(token_file)}) == "from-file"
     )
     assert find_bearer_token(options, None, "", {"BEARER_TOKEN_FILE": str(tmp_path / "no")}) is None
-    empty = tmp_path / "empty"
-    empty.write_text("\n")
+    empty = _private(tmp_path / "empty", "\n")
     assert find_bearer_token(options, None, "", {"BEARER_TOKEN_FILE": str(empty)}) is None
     runtime = tmp_path / "run"
     runtime.mkdir()
-    (runtime / f"bt_u{UNUSED_UID}").write_text("from-runtime")
+    _private(runtime / f"bt_u{os.geteuid()}", "from-runtime")
     assert find_bearer_token(options, None, "", {"XDG_RUNTIME_DIR": str(runtime)}) == "from-runtime"
     assert find_bearer_token(options, None, "", {"XDG_RUNTIME_DIR": str(tmp_path)}) is None
     assert find_bearer_token(options, None, "", {"BEARER_TOKEN": " inline "}) == "inline"
@@ -187,21 +193,114 @@ def test_bearer_token_discovery(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert find_bearer_token(Options(load_system=False)) == "ambient"
 
 
-def test_bearer_token_tmp_fallback() -> None:
-    path = Path(f"/tmp/bt_u{UNUSED_UID}")
-    try:
-        path.write_text("tmp-token")
-        assert find_bearer_token(Options(load_system=False), None, "", {}) == "tmp-token"
-    finally:
-        path.unlink()
+def test_bearer_token_discovery_order(tmp_path: Path) -> None:
+    """WLCG order, as xrdclient follows it for ``root://``: an empty step passes to the next."""
+    options = Options(load_system=False)
+    runtime = tmp_path / "run"
+    runtime.mkdir()
+    _private(runtime / f"bt_u{os.geteuid()}", "from-runtime")
+    named = _private(tmp_path / "named", "from-named")
+    env = {"XDG_RUNTIME_DIR": str(runtime), "BEARER_TOKEN_FILE": str(named)}
+    assert find_bearer_token(options, None, "", {**env, "BEARER_TOKEN": "inline"}) == "inline"
+    assert find_bearer_token(options, None, "", env) == "from-named"
+    # A named file that is missing or blank is passed over, not final.
+    env["BEARER_TOKEN_FILE"] = str(tmp_path / "missing")
+    assert find_bearer_token(options, None, "", env) == "from-runtime"
+
+
+def test_bearer_token_tmp_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The search ends in xrdsec's ``TMP_DIR`` (``/tmp``; conftest points it elsewhere)."""
+    monkeypatch.setattr(credentials, "TMP_DIR", str(tmp_path))
+    _private(tmp_path / f"bt_u{os.geteuid()}", "tmp-token")
+    assert find_bearer_token(Options(load_system=False), None, "", {}) == "tmp-token"
+
+
+def _refused(env: dict[str, str]) -> GError:
+    with pytest.raises(GError) as caught:
+        find_bearer_token(Options(load_system=False), None, "", env)
+    assert caught.value.code == errno.EACCES
+    return caught.value
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o620])
+def test_shared_token_file_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: int
+) -> None:
+    """A token file group or others can touch is not used, nor passed over for the next."""
+    monkeypatch.setattr(credentials, "TMP_DIR", str(tmp_path))
+    planted = tmp_path / f"bt_u{os.geteuid()}"
+    planted.write_text("somebody-elses")
+    planted.chmod(mode)
+    error = _refused({})
+    assert str(planted) in error.message and f"chmod 600 {planted}" in error.message
+    # Not skipped in favour of a later location, either.
+    runtime = tmp_path / "run"
+    runtime.mkdir()
+    shared = runtime / f"bt_u{os.geteuid()}"
+    shared.write_text("leaked")
+    shared.chmod(mode)
+    assert str(shared) in _refused({"XDG_RUNTIME_DIR": str(runtime)}).message
+    named = tmp_path / "named"
+    named.write_text("named")
+    named.chmod(mode)
+    assert str(named) in _refused({"BEARER_TOKEN_FILE": str(named)}).message
+
+
+def test_token_file_owned_by_another_user_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    named = _private(tmp_path / "theirs", "theirs")
+    real = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real + 1)  # as if somebody else wrote it
+    assert "not to you" in _refused({"BEARER_TOKEN_FILE": str(named)}).message
+
+
+def test_symlink_at_a_predictable_name_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``/tmp/bt_u<uid>`` as a link to an attacker's file is refused; a named link is followed."""
+    target = _private(tmp_path / "target", "linked")
+    monkeypatch.setattr(credentials, "TMP_DIR", str(tmp_path))
+    (tmp_path / f"bt_u{os.geteuid()}").symlink_to(target)
+    assert "symbolic link" in _refused({}).message
+    named = tmp_path / "named-link"
+    named.symlink_to(target)
+    found = find_bearer_token(
+        Options(load_system=False), None, "", {"BEARER_TOKEN_FILE": str(named)}
+    )
+    assert found == "linked"
+
+
+def test_token_file_that_is_not_a_regular_file_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(credentials, "TMP_DIR", str(tmp_path))
+    (tmp_path / f"bt_u{os.geteuid()}").mkdir(mode=0o700)
+    assert "not a regular file" in _refused({}).message
+    huge = _private(tmp_path / "huge", "x" * ((1 << 20) + 1))
+    assert "larger than" in _refused({"BEARER_TOKEN_FILE": str(huge)}).message
+
+
+def test_insecure_token_file_fails_the_operation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ctx: xgfalclient.Gfal2Context
+) -> None:
+    """Through the context, as a plugin asks for its token: EACCES, the file named."""
+    named = tmp_path / "tok"
+    named.write_text("leaked")
+    named.chmod(0o644)
+    monkeypatch.setenv("BEARER_TOKEN_FILE", str(named))
+    with pytest.raises(GError) as caught:
+        ctx.bearer_token("davs://se.example/f")
+    assert caught.value.code == errno.EACCES and str(named) in caught.value.message
 
 
 def test_ca_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert find_ca_path({"X509_CERT_DIR": str(tmp_path)}) == str(tmp_path)
-    monkeypatch.setattr("xgfalclient.creds.sys.platform", "linux")
+    monkeypatch.setattr(credentials, "GRID_SECURITY_DIRS", None)  # the platform's own
+    monkeypatch.setattr("sys.platform", "linux")
     monkeypatch.setattr("os.path.isdir", lambda path: path == "/etc/grid-security/certificates")
     assert find_ca_path({}) == "/etc/grid-security/certificates"
-    monkeypatch.setattr("xgfalclient.creds.sys.platform", "darwin")
+    monkeypatch.setattr("sys.platform", "darwin")
     monkeypatch.setattr("os.path.isdir", lambda path: path.startswith("/opt/homebrew"))
     assert find_ca_path({}) == "/opt/homebrew/etc/grid-security/certificates"
     monkeypatch.setattr("os.path.isdir", lambda path: False)
@@ -223,6 +322,9 @@ def test_tls_contexts_are_cached_and_configured(pki: PKI) -> None:
     assert insecure.verify_mode == ssl.CERT_NONE and not insecure.check_hostname
     contexts.clear()
     assert contexts.get(proxy, ca_file=str(pki.ca_file)) is not first
+    # A certificate and its separate key: the key read through xrdsec's checks.
+    pair = X509Credential(str(pki.user_cert_path), str(pki.user_key_path))
+    assert contexts.get(pair, ca_file=str(pki.ca_file)).verify_mode == ssl.CERT_REQUIRED
 
 
 def test_tls_context_bad_credentials(tmp_path: Path, pki: PKI) -> None:
@@ -236,13 +338,19 @@ def test_tls_context_bad_credentials(tmp_path: Path, pki: PKI) -> None:
         contexts.get(X509Credential(str(garbage), str(garbage)))
     assert caught.value.code == errno.EACCES
     assert "garbage.pem" in caught.value.message
+    # A key others may read is refused before OpenSSL sees it.
+    key = tmp_path / "shared-key.pem"
+    key.write_bytes(pki.user_key_path.read_bytes())
+    key.chmod(0o644)
+    with pytest.raises(GError) as caught:
+        contexts.get(X509Credential(str(pki.user_cert_path), str(key)))
+    assert caught.value.code == errno.EACCES and "chmod 600" in caught.value.message
+    # With no credential, a trust store that will not load is not worded as one.
+    with pytest.raises(FileNotFoundError):
+        contexts.get(None, ca_file=str(tmp_path / "no-such-ca.pem"))
 
 
-def test_real_uid_and_empty_token_file_variable() -> None:
-    assert REAL_UID() == os.geteuid()
-    with pytest.MonkeyPatch.context() as patch:
-        patch.delattr(os, "geteuid")  # as on Windows
-        assert REAL_UID() == 0
+def test_an_empty_token_file_variable_is_unset() -> None:
     assert (
         find_bearer_token(Options(load_system=False), None, "", {"BEARER_TOKEN_FILE": ""}) is None
     )
@@ -300,12 +408,8 @@ def test_seed_options_follows_gfal2_order(tmp_path: Path) -> None:
 def test_seed_options_default_proxy_and_real_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    proxy = Path(f"/tmp/x509up_u{UNUSED_UID}")
-    try:
-        proxy.write_text("x")
-        assert _seeded({"X509_USER_CERT": "/c", "X509_USER_KEY": "/k"})[0] == str(proxy)
-    finally:
-        proxy.unlink()
+    proxy = _default_proxy()
+    assert _seeded({"X509_USER_CERT": "/c", "X509_USER_KEY": "/k"})[0] == str(proxy)
     monkeypatch.setenv("BEARER_TOKEN", "from-env")
     options = Options(load_system=False)
     seed_options(options)
@@ -365,3 +469,10 @@ def test_seed_options_says_where_it_looked(
         f"Private key: {key}",
         "Could not find the credentials in any of the known locations",
     ]
+
+
+def test_clearing_before_any_tls_imports_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A context freed without ever making a TLS connection does not import ``ssl`` to say so."""
+    monkeypatch.delitem(sys.modules, "xrdsec.tls", raising=False)
+    TLSContexts().clear()
+    assert "xrdsec.tls" not in sys.modules

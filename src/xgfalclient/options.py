@@ -25,6 +25,12 @@ unset, an existing ``/etc/gfal2.d``) is layered on top, so a site's tuning
 applies to this client exactly as it does to the C one. (gfal2 refuses to
 start with a missing or partial configuration directory; this deliberately
 does not.)
+
+Each ``Gfal2Context`` owns one :class:`Options`; the context's
+``get_opt_*``/``set_opt_*`` methods are thin wrappers over the accessors
+here, and plugins read their settings through the defaulted forms
+(:meth:`Options.string`, :meth:`Options.integer`...) so a missing key is
+never an error inside a plugin.
 """
 
 from __future__ import annotations
@@ -40,11 +46,11 @@ from . import _log
 from .errors import GError
 
 __all__ = [
-    "Options",
     "DEFAULTS",
-    "KEY_NOT_FOUND",
     "GROUP_NOT_FOUND",
     "INVALID_VALUE",
+    "KEY_NOT_FOUND",
+    "Options",
     "parse_ini",
 ]
 
@@ -88,20 +94,28 @@ _FILE_FAILED = 24
 #: What ``g_key_file_get_integer`` accepts: ``strtol`` skips leading blanks,
 #: and nothing may follow the digits.
 _INTEGER = re.compile(r"[ \t\n\v\f\r]*[+-]?[0-9]+\Z")
+#: The C ``int`` range ``g_key_file_get_integer`` returns into.
 _INT_MIN, _INT_MAX = -(2**31), 2**31 - 1
+#: What GLib's ``g_ascii_isspace`` calls a blank (trailing ones are ignored).
 _BLANKS = " \t\n\v\f\r"
 
-#: The configuration a stock gfal2 2.23 installation ships with.
 #: gfal2's default configuration directory, spelt as it logs it (with the slash).
 DEFAULT_CONFIG_DIR = "/etc/gfal2.d/"
 
 
 def is_config_name(name: str) -> bool:
-    """gfal2's ``is_config_dir``: the first ``.conf`` in the name ends it."""
+    """gfal2's ``is_config_dir``: the first ``.conf`` in the name ends it.
+
+    So ``http.conf`` is read, while ``http.conf.rpmnew`` and
+    ``a.conf.b.conf`` are not - gfal2 looks for the first occurrence, and
+    a packaging backup must never override the live file.
+    """
     at = name.find(".conf")
     return at >= 0 and at + len(".conf") == len(name)
 
 
+#: The configuration a stock gfal2 2.23 installation ships with: the keys
+#: of the ``/etc/gfal2.d/*.conf`` files its RPMs install, with their values.
 DEFAULTS = """
 [CORE]
 RESOLVE_DNS=false
@@ -165,6 +179,7 @@ COPY_CHECKSUM_TYPE=ADLER32
 NORMALIZE_PATH=true
 """
 
+# GLib's boolean spellings: case-sensitive, so ``True`` and ``yes`` are errors.
 _TRUE = ("true", "1")
 _FALSE = ("false", "0")
 
@@ -201,12 +216,24 @@ def parse_ini(text: str, source: str = "<string>") -> dict[str, dict[str, str]]:
 class Options:
     """A thread-safe key file with gfal2's accessors.
 
+    The ``get_*``/``set_*`` methods are GLib's ``g_key_file_*`` semantics
+    (raising ``GError`` with GLib's codes); the short forms (``string``,
+    ``integer``, ``boolean``, ``string_list``, ``timeout``) are for plugin
+    code and return a default instead. One re-entrant lock guards every
+    access, so a context shared between threads may be reconfigured while
+    copies run; each read sees a whole value.
+
     >>> opts = Options()
     >>> opts.get_integer("CORE", "NAMESPACE_TIMEOUT")
     300
     """
 
     def __init__(self, *, load_system: bool = True) -> None:
+        """The stock defaults, then (unless ``load_system=False``) the site's files.
+
+        A file that fails to load raises, as ``gfal2_context_new`` fails;
+        tests pass ``load_system=False`` to be independent of the machine.
+        """
         self._lock = threading.RLock()
         self._groups: dict[str, dict[str, str]] = {}
         self.merge(parse_ini(DEFAULTS, "<defaults>"))
@@ -246,14 +273,23 @@ class Options:
 
     def merge(self, groups: Mapping[str, Mapping[str, str]]) -> None:
         """Layer ``groups`` over what is already set, key by key (so a group
-        without keys is not created)."""
+        without keys is not created).
+
+        This is how gfal2 combines its configuration files: a later file
+        changes only the keys it names, never removes the others.
+        """
         with self._lock:
             for group, keys in groups.items():
                 if keys:
                     self._groups.setdefault(group, {}).update(keys)
 
     def load_file(self, path: str) -> None:
-        """Merge one ``.ini``-formatted file (``load_opts_from_file``), all or nothing."""
+        """Merge one ``.ini``-formatted file (``load_opts_from_file``), all or nothing.
+
+        The whole file is parsed before anything is merged, so a syntax error
+        on the last line leaves the options as they were. The error message
+        is gfal2's, naming the file, with GLib's code.
+        """
         try:
             self.merge(parse_ini(_read_key_file(path), path))
         except GError as exc:
@@ -262,10 +298,12 @@ class Options:
             ) from exc
 
     def groups(self) -> list[str]:
+        """Every group that has at least one key, in the order first set."""
         with self._lock:
             return list(self._groups)
 
     def keys(self, group: str) -> list[str]:
+        """The keys of ``group``; ``GError`` (code 4) if there is no such group."""
         with self._lock:
             return list(self._require_group(group))
 
@@ -277,12 +315,14 @@ class Options:
     # -- raw access ------------------------------------------------------------
 
     def _require_group(self, group: str) -> dict[str, str]:
+        """The live dict for ``group`` (call with the lock held), or GLib's missing-group error."""
         found = self._groups.get(group)
         if found is None:
             raise GError(f"Key file does not have group “{group}”", GROUP_NOT_FOUND)
         return found
 
     def _raw(self, group: str, key: str) -> str:
+        """The stored text, or GLib's missing-group/missing-key ``GError`` (codes 4 and 3)."""
         with self._lock:
             keys = self._require_group(group)
             if key not in keys:
@@ -292,28 +332,42 @@ class Options:
             return keys[key]
 
     def has(self, group: str, key: str) -> bool:
+        """Whether ``key`` is set in ``group`` (never raises)."""
         with self._lock:
             return key in self._groups.get(group, {})
 
     def remove(self, group: str, key: str) -> bool:
+        """Delete one key (``g_key_file_remove_key``); ``GError`` if it was not set.
+
+        The group stays even when it becomes empty, as GLib leaves it.
+        """
         with self._lock:
             self._raw(group, key)
             del self._groups[group][key]
             return True
 
     def _set(self, group: str, key: str, value: str) -> None:
+        """Store ``value`` as text, creating the group if needed."""
         with self._lock:
             self._groups.setdefault(group, {})[key] = value
 
     # -- typed accessors -------------------------------------------------------
 
     def get_string(self, group: str, key: str) -> str:
+        """``get_opt_string``: the value exactly as written (no unescaping)."""
         return self._raw(group, key)
 
     def set_string(self, group: str, key: str, value: str) -> None:
+        """``set_opt_string``; a non-string is stored as its ``str()``."""
         self._set(group, key, str(value))
 
     def get_integer(self, group: str, key: str) -> int:
+        """``get_opt_integer``: a decimal C ``int``, else ``GError`` code 5.
+
+        ``0x10``, ``1e3`` and ``12abc`` are all refused, as GLib refuses them;
+        Python's ``int()`` alone would accept some and reject others
+        differently.
+        """
         raw = self._raw(group, key)
         if _INTEGER.match(raw) and _INT_MIN <= int(raw) <= _INT_MAX:
             return int(raw)
@@ -333,6 +387,7 @@ class Options:
         self._set(group, key, str(number))
 
     def get_boolean(self, group: str, key: str) -> bool:
+        """``get_opt_boolean``: ``true``/``false``/``1``/``0`` exactly, else ``GError`` code 5."""
         raw = self._raw(group, key).rstrip(_BLANKS)
         if raw in _TRUE:
             return True
@@ -344,9 +399,15 @@ class Options:
         )
 
     def set_boolean(self, group: str, key: str, value: bool) -> None:
+        """``set_opt_boolean``, stored as GLib writes it (``true``/``false``)."""
         self._set(group, key, "true" if value else "false")
 
     def get_string_list(self, group: str, key: str) -> list[str]:
+        """``get_opt_string_list``: the value split on ``;``, one trailing ``;`` ignored.
+
+        ``a;b`` and ``a;b;`` both give ``["a", "b"]``; an empty value gives
+        ``[]``. Empty elements in the middle are kept (``a;;b``).
+        """
         raw = self._raw(group, key)
         parts = raw.split(";")  # never empty: splitting "" gives [""]
         if parts[-1] == "":
@@ -354,6 +415,7 @@ class Options:
         return parts
 
     def set_string_list(self, group: str, key: str, values: Iterable[str]) -> None:
+        """``set_opt_string_list``: every element followed by ``;``, GLib's format."""
         self._set(group, key, "".join(f"{value};" for value in values))
 
     # -- defaulted reads for plugin code -----------------------------------------
@@ -366,32 +428,50 @@ class Options:
             return default
 
     def integer(self, group: str, key: str, default: int = 0) -> int:
+        """``get_integer``, or ``default`` if the key is missing *or* unparsable.
+
+        An unparsable value falling back silently is gfal2's plugin
+        behaviour (``gfal2_get_opt_integer_with_default``), not an oversight.
+        """
         try:
             return self.get_integer(group, key)
         except GError:
             return default
 
     def boolean(self, group: str, key: str, default: bool = False) -> bool:
+        """``get_boolean``, or ``default`` if the key is missing or unparsable."""
         try:
             return self.get_boolean(group, key)
         except GError:
             return default
 
     def string_list(self, group: str, key: str, default: list[str] | None = None) -> list[str]:
+        """``get_string_list``, or a copy of ``default`` (``[]``) if the key is missing."""
         try:
             return self.get_string_list(group, key)
         except GError:
             return list(default or [])
 
     def timeout(self, group: str, key: str = "OPERATION_TIMEOUT") -> int:
-        """A plugin's operation timeout, falling back to the core namespace one."""
+        """A plugin's operation timeout, falling back to the core namespace one.
+
+        ``[<group>] OPERATION_TIMEOUT`` if the group sets it, else
+        ``[CORE] NAMESPACE_TIMEOUT``, else 300 seconds. A set but
+        unparsable plugin value is 300, not the core value.
+        """
         if self.has(group, key):
             return self.integer(group, key, 300)
         return self.integer("CORE", "NAMESPACE_TIMEOUT", 300)
 
 
 def _read_key_file(path: str) -> str:
-    """The text of ``path``, failing as ``g_key_file_load_from_file`` does."""
+    """The text of ``path``, failing as ``g_key_file_load_from_file`` does.
+
+    Anything but a regular file is refused before it is read, with GLib's
+    "Not a regular file"; open failures carry GLib's ``GFileError`` numbers,
+    which gfal2 passes through to ``GError.code``. ``surrogateescape`` lets
+    a file with stray non-UTF-8 bytes load rather than fail the context.
+    """
     try:
         with open(path, "rb") as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):

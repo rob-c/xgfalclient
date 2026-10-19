@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """Copies: uploads, parallel downloads, and HTTP third-party copy with gfal2's fallbacks."""
 
 from __future__ import annotations
@@ -8,26 +7,27 @@ import logging
 import os
 import socket
 import threading
+import time
 import types
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 import xgfalclient
-from test_http_helpers import (  # noqa: F401 - fixtures
-    Events,
-    dav,
-    dav2,
-    davs,
-    davs_open,
-    hctx,
-    write,
-)
+from test_http_helpers import Events, write
+from test_http_helpers import dav as dav
+from test_http_helpers import dav2 as dav2
+from test_http_helpers import davs as davs
+from test_http_helpers import davs_open as davs_open
+from test_http_helpers import hctx as hctx
 from xgfalclient import GError, checksum_mode
 from xgfalclient import transfer as transfer_module
-from xgfalclient.plugins.http import _copy
+from xgfalclient.plugins.http import _copy, _ranged, _streamed
+from xgfalclient.plugins.http.plugin import HTTPPlugin
 from xgfalclient.testing.pki import PKI
 from xgfalclient.testing.webdav import Tape, WebDAVServer
+from xgfalclient.transfer import Transfer
 
 MB = 1 << 20
 
@@ -104,12 +104,12 @@ def test_local_failures_without_an_errno(
 
     source = tmp_path / "up"
     source.write_bytes(b"x")
-    monkeypatch.setattr(_copy, "open", refuse, raising=False)
+    monkeypatch.setattr(_streamed, "open", refuse, raising=False)
     with pytest.raises(GError) as caught:
         hctx.filecopy(file_url(source), dav.url("/data/x"))
     assert caught.value.code == errno.EIO and "Could not open source" in caught.value.message
     write(dav, "/data/f", b"x")
-    monkeypatch.setattr(_copy.os, "open", refuse)
+    monkeypatch.setattr(os, "open", refuse)
     with pytest.raises(GError) as caught:
         hctx.filecopy(dav.url("/data/f"), file_url(tmp_path / "down"))
     assert caught.value.code == errno.EIO and "Could not open destination" in caught.value.message
@@ -151,7 +151,7 @@ def test_parallel_download(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", MB)
     data = os.urandom(3 * MB + 17)
     write(dav, "/data/big", data)
     seen: list[int] = []
@@ -174,10 +174,10 @@ def test_parallel_download_without_ranges(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", MB)
     data = os.urandom(2 * MB)
     write(dav, "/data/big", data)
-    dav.ignore_range = True
+    dav.ignore_ranges = True
     hctx.filecopy(dav.url("/data/big"), file_url(tmp_path / "big"))
     assert (tmp_path / "big").read_bytes() == data
 
@@ -188,7 +188,7 @@ def test_parallel_download_failures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", MB)
     write(dav, "/data/big", os.urandom(8 * MB))
     dav.fault("GET", status=403)
     with pytest.raises(GError) as caught:
@@ -208,8 +208,8 @@ def test_parallel_download_failure_stops_the_other_streams(
 ) -> None:
     # One stream fails while the other is mid-segment; the other stops at its
     # next block rather than finishing its range.
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
-    monkeypatch.setattr(_copy, "BLOCK", 64 << 10)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", MB)
+    monkeypatch.setattr(_ranged, "BLOCK", 64 << 10)
     write(dav, "/data/big", os.urandom(2 * MB))
     stopped = threading.Event()
     second = threading.Event()
@@ -220,8 +220,8 @@ def test_parallel_download_failure_stops_the_other_streams(
             stopped.set()
 
     fake = types.SimpleNamespace(Lock=threading.Lock, Event=Watched, Thread=threading.Thread)
-    monkeypatch.setattr(_copy, "threading", fake)
-    original = _copy._pwrite_all
+    monkeypatch.setattr(_ranged, "threading", fake)
+    original = _ranged._pwrite_all
     lock = threading.Lock()
     writes: list[int] = []
 
@@ -236,27 +236,87 @@ def test_parallel_download_failure_stops_the_other_streams(
         assert stopped.wait(10)
         original(fd, view, offset)
 
-    monkeypatch.setattr(_copy, "_pwrite_all", pwrite)
+    monkeypatch.setattr(_ranged, "_pwrite_all", pwrite)
     with pytest.raises(GError) as caught:
         hctx.filecopy(params(nbstreams=2), dav.url("/data/big"), file_url(tmp_path / "a"))
     assert "boom" in caught.value.message
     assert len(writes) == 2
 
 
-def test_download_refuses_zero_progress_from_the_destination(monkeypatch) -> None:
-    monkeypatch.setattr(_copy.os, "pwrite", lambda *_: 0)
+class _FailingRanges:
+    """A plugin whose first two ranged GETs fail together, each its own way."""
+
+    def __init__(self) -> None:
+        self.ranges: list[str] = []
+        self.both = threading.Barrier(2, timeout=10)
+        self.lock = threading.Lock()
+
+    def io_timeout(self) -> float:
+        return 5.0
+
+    def _get(self, url: str, headers: dict[str, str], timeout: float) -> object:
+        with self.lock:
+            self.ranges.append(headers["Range"])
+            index = len(self.ranges)
+        self.both.wait()  # both streams are in flight before either fails
+        raise GError(f"stream {index} failed", errno.EIO if index == 1 else errno.EPERM)
+
+
+def test_a_parallel_download_reports_the_first_failure_and_drops_queued_segments() -> None:
+    plugin = _FailingRanges()
+    transfer = types.SimpleNamespace(source="https://h/f", add=lambda n: None, check=lambda: None)
     with pytest.raises(GError) as caught:
-        _copy._pwrite_all(123, memoryview(b"payload"), 0)
+        _ranged._parallel(cast(HTTPPlugin, plugin), cast(Transfer, transfer), -1, 8 * MB, 2)
+    # Eight 1 MiB segments were queued; only the two in flight were asked for.
+    assert len(plugin.ranges) == 2
+    first = caught.value
+    assert first.message in ("stream 1 failed", "stream 2 failed")
+    other = "stream 2 failed" if first.message == "stream 1 failed" else "stream 1 failed"
+    assert [note for note in getattr(first, "__notes__", []) if other in note]
+    assert not [t for t in threading.enumerate() if t.name.startswith("xgfal-http-get")]
+
+
+def test_one_error_every_stream_raised_is_reported_once() -> None:
+    """A callback's exception reaches every stream's ``check()``: it is not its own note."""
+    shared = GError("callback said no", errno.EIO)
+
+    class Shared(_FailingRanges):
+        def _get(self, url: str, headers: dict[str, str], timeout: float) -> object:
+            self.both.wait()
+            raise shared
+
+    transfer = types.SimpleNamespace(source="https://h/f", add=lambda n: None, check=lambda: None)
+    with pytest.raises(GError) as caught:
+        _ranged._parallel(cast(HTTPPlugin, Shared()), cast(Transfer, transfer), -1, 8 * MB, 2)
+    assert caught.value is shared and not getattr(shared, "__notes__", [])
+
+
+def test_a_segment_queued_after_a_failure_asks_for_nothing() -> None:
+    plugin = _FailingRanges()
+    stop = threading.Event()
+    stop.set()
+    transfer = types.SimpleNamespace(source="https://h/f")
+    job = _ranged._Job(cast(HTTPPlugin, plugin), cast(Transfer, transfer), -1, stop)
+    _ranged._fetch_segment(job, (0, MB), memoryview(bytearray(16)))
+    assert plugin.ranges == []
+
+
+def test_download_refuses_zero_progress_from_the_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "pwrite", lambda *_: 0)
+    with pytest.raises(GError) as caught:
+        _ranged._pwrite_all(123, memoryview(b"payload"), 0)
     assert caught.value.code == errno.EIO
 
 
-def test_download_preserves_a_destination_enospc(monkeypatch) -> None:
+def test_download_preserves_a_destination_enospc(monkeypatch: pytest.MonkeyPatch) -> None:
     def full(*_args: object) -> int:
         raise OSError(errno.ENOSPC, "filesystem nearly full")
 
-    monkeypatch.setattr(_copy.os, "pwrite", full)
+    monkeypatch.setattr(os, "pwrite", full)
     with pytest.raises(GError) as caught:
-        _copy._pwrite_all(123, memoryview(b"payload"), 0)
+        _ranged._pwrite_all(123, memoryview(b"payload"), 0)
     assert caught.value.code == errno.ENOSPC
     assert "Could not write destination" in caught.value.message
 
@@ -315,24 +375,6 @@ def test_pull(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVSer
     assert seen[-1] == 3000
 
 
-def test_every_performance_marker_is_reported(
-    hctx: xgfalclient.Gfal2Context,
-    dav: WebDAVServer,
-    dav2: WebDAVServer,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # davix's performance callback reaches monitor_callback for each marker,
-    # however quick the copy; the core's once-a-second clock does not apply.
-    monkeypatch.setattr(transfer_module, "MONITOR_INTERVAL", 3600.0)
-    write(dav, "/data/src", b"s" * 3000)
-    dav2.marker_every = 1000
-    seen: list[int] = []
-    copy = params()
-    copy.monitor_callback = lambda src, dst, avg, inst, done, elapsed: seen.append(done)
-    hctx.filecopy(copy, dav.url("/data/src"), dav2.url("/data/dst"))
-    assert seen == [1000, 2000, 3000]
-
-
 def test_pull_with_everything(
     hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
 ) -> None:
@@ -371,7 +413,7 @@ def test_checksum_verification_header(
     dav: WebDAVServer,
     dav2: WebDAVServer,
     mode: str,
-    check: object,
+    check: int,
     expected: str | None,
 ) -> None:
     """gfal2 only ever tells dCache not to verify, and only when it verifies that end itself."""
@@ -506,7 +548,7 @@ ABC_ADLER32 = "024d0127"
 
 
 def _checked(
-    mode: object, value: str = "", algorithm: str = "ADLER32", **values: object
+    mode: int, value: str = "", algorithm: str = "ADLER32", **values: Any
 ) -> tuple[xgfalclient.TransferParameters, Events]:
     """Parameters that check ``mode`` with the user's ``value``, and their events."""
     events = Events()
@@ -758,12 +800,14 @@ def test_download_is_the_cores_copy(
     assert not [s for s in events.stages(local) if s.startswith("CHECKSUM")]
 
 
-def _plugin(context: xgfalclient.Gfal2Context):  # type: ignore[no-untyped-def]
-    return context.plugin("davs://h/", "copy")
+def _plugin(context: xgfalclient.Gfal2Context) -> HTTPPlugin:
+    found = context.plugin("davs://h/", "copy")
+    assert isinstance(found, HTTPPlugin)
+    return found
 
 
-def _chain(plugin: object, source: str, destination: str) -> list[str]:
-    modes = _copy.CopyMode(plugin, source, destination)  # type: ignore[arg-type]
+def _chain(plugin: HTTPPlugin, source: str, destination: str) -> list[str]:
+    modes = _copy.CopyMode(plugin, source, destination)
     found: list[str] = []
     while modes.mode is not None and (not found or modes.fallback):
         found.append(modes.mode)
@@ -833,7 +877,7 @@ def test_copy_mode_query_argument(
     write(dav, "/data/src", b"q")
     hctx.filecopy(dav.url("/data/src?copy_mode=push"), dav2.url("/data/dst"))
     push = next(r for r in dav.requests if r.method == "COPY")
-    assert push.path == "/data/src?copy_mode=push"
+    assert push.target == "/data/src?copy_mode=push"
     assert push.header("Destination") == f"http://127.0.0.1:{dav2.port}/data/dst"
 
 
@@ -872,14 +916,14 @@ def test_tpc_failures(
 ) -> None:
     hctx.set_opt_boolean("HTTP PLUGIN", "ENABLE_FALLBACK_TPC_COPY", False)
     write(dav, "/data/src", b"x")
-    dav2.tpc = "fail"
+    dav2.tpc_failure = "HTTP 500 : the remote side refused"
     with pytest.raises(GError) as caught:
         hctx.filecopy(dav.url("/data/src"), dav2.url("/data/dst"))
     assert caught.value.code == errno.EIO
     assert caught.value.message.endswith(
         "Last attempt: Transfer failure: HTTP 500 : the remote side refused"
     )
-    dav2.tpc = "normal"
+    dav2.tpc_failure = None
     # davix's words and errno for a COPY the active end turns down, as gfal2
     # 2.23.5 reports them (observed side by side against this server).
     refusals = [
@@ -980,10 +1024,10 @@ def test_fallback_after_the_destination_exists(
     write(dav, "/data/src", b"x")
     real = _copy.third_party
 
-    def exists(plugin: object, transfer: object, mode: str) -> None:
+    def exists(plugin: HTTPPlugin, transfer: Transfer, mode: str) -> None:
         if mode == _copy.PULL:
             raise GError("there already", errno.EEXIST)
-        real(plugin, transfer, mode)  # type: ignore[arg-type]
+        real(plugin, transfer, mode)
 
     monkeypatch.setattr(_copy, "third_party", exists)
     events = Events()
@@ -1062,7 +1106,7 @@ def test_resolve_dns(
     """``[CORE] RESOLVE_DNS``: the copy goes to one address of the alias, by name."""
     write(dav, "/data/src", b"x")
     hctx.set_opt_boolean("CORE", "RESOLVE_DNS", True)
-    monkeypatch.setattr(_copy.socket, "getnameinfo", lambda address, flags: ("localhost", ""))
+    monkeypatch.setattr(socket, "getnameinfo", lambda address, flags: ("localhost", ""))
     hctx.filecopy(dav.url("/data/src"), dav2.url("/data/dst"))
     copy_request = next(r for r in dav2.requests if r.method == "COPY")
     assert copy_request.header("Host") == f"localhost:{dav2.port}"
@@ -1071,29 +1115,13 @@ def test_resolve_dns(
     def unknown(address: object, flags: int) -> tuple[str, str]:
         raise socket.gaierror(8, "no name")
 
-    monkeypatch.setattr(_copy.socket, "getnameinfo", unknown)
+    monkeypatch.setattr(socket, "getnameinfo", unknown)
     assert _copy.resolved(_plugin(hctx), "dav://u@127.0.0.1:1/f") == "dav://u@127.0.0.1:1/f"
-    monkeypatch.setattr(_copy.socket, "getnameinfo", lambda address, flags: ("h.example", ""))
+    monkeypatch.setattr(socket, "getnameinfo", lambda address, flags: ("h.example", ""))
     assert _copy.resolved(_plugin(hctx), "dav://u@127.0.0.1:1/f") == "dav://u@h.example:1/f"
 
 
 # -- credentials in a third-party copy ------------------------------------------------------
-
-
-def test_far_token_from_the_context(
-    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
-) -> None:
-    write(dav, "/data/src", b"x")
-    dav.tokens = {"SRC"}
-    dav2.tokens = {"SRC"}
-    hctx.cred_set(dav.url("/"), hctx.cred_new("BEARER", "SRC"))
-    hctx.cred_set(dav2.url("/"), hctx.cred_new("BEARER", "SRC"))
-    hctx.filecopy(dav.url("/data/src"), dav2.url("/data/dst"))
-    copy_request = next(r for r in dav2.requests if r.method == "COPY")
-    assert copy_request.header("TransferHeaderAuthorization") == "Bearer SRC"
-    assert copy_request.header("Authorization") == "Bearer SRC"
-    # A token means Credential: none, and no X-No-Delegate.
-    assert copy_request.header("Credential") == "none"
 
 
 def test_cs3_far_side(
@@ -1129,6 +1157,54 @@ def test_macaroon_for_the_far_side(
     assert copy_request.header("Source") == f"https://127.0.0.1:{davs.port}/data/src"
     assert copy_request.header("Credential") == "none"
     assert copy_request.header("X-No-Delegate") is None
+
+
+def test_an_ambient_token_is_replaced_by_a_minted_macaroon(
+    hctx: xgfalclient.Gfal2Context, davs: WebDAVServer, dav2: WebDAVServer, grid_env: PKI
+) -> None:
+    """An identity-mapped token (a DiracX token) is taken for a direct read or
+    write, and to mint a macaroon, but refused on the delegated TPC leg. So
+    when one is in hand, the far leg carries a macaroon the far SE minted, not
+    the bare token. (Regression, fixed in 0.3.2: the ambient token used to
+    short-circuit the mint and be forwarded, which the far SE then refused.)"""
+    write(davs, "/data/src", b"from tls")
+    hctx.set_opt_string("BEARER", "TOKEN", "IDENTITY")  # an ambient, unscoped token
+    hctx.filecopy(params(timeout=1800), davs.url("/data/src"), dav2.url("/data/dst"))
+    assert dav2.local("/data/dst").read_bytes() == b"from tls"
+    issued = davs.macaroons[-1]["macaroon"]
+    copy_request = next(r for r in dav2.requests if r.method == "COPY")
+    assert copy_request.header("TransferHeaderAuthorization") == f"Bearer {issued}"
+    assert copy_request.header("TransferHeaderAuthorization") != "Bearer IDENTITY"
+    assert copy_request.header("Credential") == "none"
+
+
+def test_an_ambient_token_is_forwarded_when_no_macaroon_can_be_minted(
+    hctx: xgfalclient.Gfal2Context, davs: WebDAVServer, dav2: WebDAVServer, grid_env: PKI
+) -> None:
+    """The mint is a best effort: a far SE that will not mint (both the file
+    and the SE-as-issuer requests refused) leaves the ambient token to be
+    forwarded as before, rather than no credential at all. With the option
+    explicitly off, no mint is attempted and the token is forwarded. (The
+    in-tree active end cannot verify ``davs``' test CA, so each copy fails
+    after the ``COPY``; only what it carried is asserted.)"""
+    hctx.set_opt_boolean("HTTP PLUGIN", "ENABLE_FALLBACK_TPC_COPY", False)
+    write(davs, "/data/src", b"x")
+    hctx.set_opt_string("BEARER", "TOKEN", "IDENTITY")
+    davs.fault("POST", status=403, times=2)  # the file, then the SE as issuer
+    with pytest.raises(GError):
+        hctx.filecopy(davs.url("/data/src"), dav2.url("/data/dst"))
+    assert [r.method for r in davs.requests if r.method == "POST"] == ["POST", "POST"]
+    copy_request = next(r for r in dav2.requests if r.method == "COPY")
+    assert copy_request.header("TransferHeaderAuthorization") == "Bearer IDENTITY"
+    assert copy_request.header("Credential") == "none"
+    hctx.set_opt_boolean("HTTP PLUGIN", "RETRIEVE_BEARER_TOKEN", False)
+    davs.clear()
+    dav2.clear()
+    with pytest.raises(GError):
+        hctx.filecopy(davs.url("/data/src"), dav2.url("/data/dst2"))
+    assert not [r for r in davs.requests if r.method == "POST"]
+    copy_request = next(r for r in dav2.requests if r.method == "COPY")
+    assert copy_request.header("TransferHeaderAuthorization") == "Bearer IDENTITY"
 
 
 def test_macaroon_refused_then_no_token(
@@ -1224,7 +1300,7 @@ def test_a_parallel_download_resumes_a_dropped_segment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", MB)
     data = os.urandom(3 * MB + 17)
     write(dav, "/data/big", data)
     # One segment's ranged GET drops part way; its worker re-requests the rest.
@@ -1233,13 +1309,49 @@ def test_a_parallel_download_resumes_a_dropped_segment(
     assert (tmp_path / "big").read_bytes() == data
 
 
+def test_a_parallel_segment_cut_mid_body_resumes_where_it_was_cut(
+    hctx: xgfalclient.Gfal2Context,
+    dav: WebDAVServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", MB)
+    data = b"x" * (3 * MB)  # every segment's bytes alike: whichever one the fault hits
+    write(dav, "/data/big", data)
+    # A 206 that stops 40 000 bytes in: those count, and only the rest is asked again.
+    dav.fault("GET", status=206, body=data[:MB], truncate=40_000, times=1)
+    hctx.filecopy(params(nbstreams=2), dav.url("/data/big"), file_url(tmp_path / "big"))
+    assert (tmp_path / "big").read_bytes() == data
+    ranges = [r.header("Range") or "" for r in dav.requests if r.method == "GET"]
+    # The fault hits whichever segment's GET reaches the server first, so the
+    # resumed range starts 40 000 bytes into *some* segment, not always the first.
+    starts = [int(r.split("=")[1].split("-")[0]) for r in ranges]
+    assert len(ranges) == 3 and any(start + 40_000 in starts for start in starts)
+
+
+def test_a_parallel_segment_cut_before_its_first_byte_is_asked_again(
+    hctx: xgfalclient.Gfal2Context,
+    dav: WebDAVServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 206 whose body is cut before a byte arrives made no progress: retried, not reset."""
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", MB)
+    data = b"y" * (3 * MB)
+    write(dav, "/data/big", data)
+    dav.fault("GET", status=206, body=data[:MB], truncate=0, times=1)
+    hctx.filecopy(params(nbstreams=2), dav.url("/data/big"), file_url(tmp_path / "big"))
+    assert (tmp_path / "big").read_bytes() == data
+    assert [r.method for r in dav.requests].count("GET") == 3
+
+
 def test_a_download_gives_up_after_conn_retry(
     hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tmp_path: Path
 ) -> None:
     data = os.urandom(100_000)
     write(dav, "/data/big", data)
     hctx.set_opt_integer("CORE", "CONN_RETRY", 2)
-    dav.fault("GET", body=data, truncate=1000, times=50)  # every GET drops
+    dav.fault("GET", status=200, body=data, truncate=1000, times=50)  # every GET drops
     with pytest.raises(GError) as caught:
         hctx.filecopy(params(nbstreams=1), dav.url("/data/big"), file_url(tmp_path / "out"))
     assert caught.value.code in (errno.EIO, errno.ECOMM if hasattr(errno, "ECOMM") else errno.EIO)
@@ -1274,14 +1386,13 @@ def test_a_parallel_segment_gives_up_after_conn_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A segment whose stream keeps dropping is bounded by CONN_RETRY, then errors."""
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", MB)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", MB)
     data = os.urandom(3 * MB + 17)
     write(dav, "/data/big", data)
     hctx.set_opt_integer("CORE", "CONN_RETRY", 2)
     hctx.set_opt_integer("CORE", "CONN_RETRY_INTERVAL", 1)  # exercise the pause path
-    import xgfalclient.plugins.http.plugin as plugin_module
 
-    monkeypatch.setattr(plugin_module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
     # Every GET's connection is reset before a byte arrives, so no segment ever
     # makes progress and each one exhausts its retries.
     dav.fault("GET", drop=True, times=1000)

@@ -7,7 +7,15 @@ having are OpenSSH's, announced in the server's ``SSH_FXP_VERSION``:
 ``hardlink@openssh.com``, ``limits@openssh.com`` and, on servers that have
 it (ProFTPD, some appliances), ``check-file-name`` for server-side hashes.
 
-This module is pure encoding; :mod:`.client` does the talking.
+This module is pure encoding; :mod:`.client` does the talking. Every SFTP
+packet (draft-02 §3) is ``uint32 length || byte type || uint32 request-id ||
+...`` (``INIT``/``VERSION`` carry a version instead of an id), with the
+:rfc:`4251` §5 data types - ``uint32``, ``uint64``, ``string`` - that
+:mod:`..crypto.sshkeys` encodes for the SSH layer as well. Names drop the
+spec's ``SSH_FXP_``/``SSH_FX_``/``SSH_FILEXFER_`` prefixes; the in-tree
+test server (:mod:`xgfalclient.testing._sftp`) uses the same constants, so a
+wrong value here would not be caught by the in-process tests - only by the
+interop tests against OpenSSH.
 """
 
 from __future__ import annotations
@@ -17,21 +25,23 @@ import stat as _stat
 import struct
 from dataclasses import dataclass, field
 
-from ..._compat import SLOTS
 from ...crypto.sshkeys import Reader, string, uint32
 from ...types import Stat
 
 __all__ = [
+    "STATUS_NAMES",
     "VERSION",
     "Attrs",
     "StatusError",
     "errno_for_status",
-    "STATUS_NAMES",
 ]
 
+#: The protocol version we send in ``INIT``; a server answering lower is refused.
 VERSION = 3
 
-# Packet types.
+# Packet types (draft-02 §3), ``SSH_FXP_*``. Requests are 1-20 and 200,
+# responses 101-105 and 201. ``VERSION_`` has a trailing underscore only to
+# keep it apart from the protocol number above.
 INIT = 1
 VERSION_ = 2
 OPEN = 3
@@ -52,6 +62,14 @@ STAT = 17
 RENAME = 18
 READLINK = 19
 SYMLINK = 20
+# Responses, each after its uint32 request id (draft-02 §7):
+#   STATUS  uint32 code, string message, string language tag
+#   HANDLE  string handle (opaque, at most 256 bytes)
+#   DATA    string data (may be shorter than asked; EOF comes as a STATUS)
+#   NAME    uint32 count, then count x (string filename, string longname, ATTRS)
+#   ATTRS   ATTRS
+# EXTENDED carries a string request name (``statvfs@openssh.com`` ...) and
+# request-specific fields; its success answer is EXTENDED_REPLY or STATUS.
 STATUS = 101
 HANDLE = 102
 DATA = 103
@@ -60,7 +78,9 @@ ATTRS = 105
 EXTENDED = 200
 EXTENDED_REPLY = 201
 
-# SSH_FXP_OPEN flags.
+# SSH_FXP_OPEN ``pflags`` (draft-02 §6.3), the POSIX ``open(2)`` flags by
+# another name: CREAT/TRUNC/EXCL are O_CREAT/O_TRUNC/O_EXCL, and APPEND forces
+# every write to the end of file regardless of its offset.
 FXF_READ = 0x01
 FXF_WRITE = 0x02
 FXF_APPEND = 0x04
@@ -68,15 +88,17 @@ FXF_CREAT = 0x08
 FXF_TRUNC = 0x10
 FXF_EXCL = 0x20
 
-# Attribute flags.
+# ATTRS ``flags`` bits (draft-02 §5): which optional fields follow, in this
+# order. UIDGID and ACMODTIME each cover a pair of fields.
 ATTR_SIZE = 0x01
 ATTR_UIDGID = 0x02
 ATTR_PERMISSIONS = 0x04
 ATTR_ACMODTIME = 0x08
 ATTR_EXTENDED = 0x80000000
 
-# Status codes. 0-8 are version 3; the rest are later drafts', which some
-# servers send regardless of the negotiated version.
+# Status codes (draft-02 §7, ``SSH_FX_*``). 0-8 are version 3; the rest are
+# later drafts' (versions 4-6), which some servers send regardless of the
+# negotiated version, so they are named and mapped too.
 FX_OK = 0
 FX_EOF = 1
 FX_NO_SUCH_FILE = 2
@@ -87,6 +109,7 @@ FX_NO_CONNECTION = 6
 FX_CONNECTION_LOST = 7
 FX_OP_UNSUPPORTED = 8
 
+#: Status code -> spec name, the message when the server sent none.
 STATUS_NAMES = {
     0: "OK",
     1: "EOF",
@@ -122,6 +145,11 @@ STATUS_NAMES = {
     31: "NO_MATCHING_BYTE_RANGE_LOCK",
 }
 
+# Status code -> errno, the closest POSIX meaning. FX_EOF maps to EIO
+# because the client handles a real end of file itself (reads, READDIR) and
+# only an EOF where none belongs reaches the errno; FX_FAILURE is v3's
+# catch-all, so the plugin refines it by looking at the path afterwards
+# (EEXIST for mkdir, ENOTEMPTY for rmdir, EISDIR for unlink), as gfal2 does.
 _STATUS_ERRNO = {
     FX_EOF: errno.EIO,
     FX_NO_SUCH_FILE: errno.ENOENT,
@@ -158,29 +186,52 @@ _STATUS_ERRNO = {
 
 
 def errno_for_status(code: int) -> int:
-    """The ``errno`` an SFTP status stands for; ``EIO`` for anything unknown."""
+    """The ``errno`` an SFTP status stands for; ``EIO`` for anything unknown.
+
+    ``FX_OK`` is not in the table and so is ``EIO`` too: callers only ask
+    for a status that is an error. The plugin may still replace the result
+    where v3's codes are too coarse (see the table's comment).
+    """
     return _STATUS_ERRNO.get(code, errno.EIO)
 
 
 class StatusError(Exception):
-    """An ``SSH_FXP_STATUS`` that was not ``OK``; the plugin turns it into a ``GError``."""
+    """An ``SSH_FXP_STATUS`` that was not ``OK``; the plugin turns it into a ``GError``.
+
+    Raised by :class:`~.client.SFTPClient` and caught by the plugin, which
+    may patch the errno with context the status lacks. It is a plain
+    exception rather than a ``GError`` so code can tell a server's answer
+    (the connection is fine) from a transport failure (it is not).
+    """
 
     def __init__(self, code: int, message: str = "") -> None:
+        """``message`` is the status's error text; the code's name if it was empty."""
         super().__init__(code, message)
         self.code = code
         self.message = message or STATUS_NAMES.get(code, f"status {code}")
 
     @property
     def errno(self) -> int:
+        """The POSIX errno for :attr:`code` (see :func:`errno_for_status`)."""
         return errno_for_status(self.code)
 
     def __str__(self) -> str:
+        """The server's message alone, ready to follow ``"<op> <path>: "``."""
         return self.message
 
 
-@dataclass(**SLOTS)
+@dataclass(slots=True)
 class Attrs:
-    """``ATTRS``: every field optional, as the ``flags`` word says."""
+    """``ATTRS``: every field optional, as the ``flags`` word says.
+
+    Wire layout (draft-02 §5): ``uint32 flags``, then only the fields whose
+    bit is set - ``uint64 size``, ``uint32 uid, gid``, ``uint32
+    permissions``, ``uint32 atime, mtime`` - then, with ``ATTR_EXTENDED``,
+    ``uint32 count`` and that many ``string type, string data`` pairs.
+    ``None`` means "absent": in a SETSTAT it leaves the field unchanged.
+    ``permissions`` is the full ``st_mode``, file-type bits included, as
+    OpenSSH sends it; v3 times are whole seconds since the epoch.
+    """
 
     size: int | None = None
     uid: int | None = None
@@ -191,6 +242,13 @@ class Attrs:
     extended: list[tuple[bytes, bytes]] = field(default_factory=list)
 
     def encode(self) -> bytes:
+        """The wire form, flags first.
+
+        uid and gid are sent only as a pair, likewise atime and mtime, since
+        one flag covers both; setting just one of a pair sends neither.
+        Times are masked to 32 bits so a pre-1970 or post-2106 value wraps
+        instead of raising from :mod:`struct`.
+        """
         flags = 0
         body = b""
         if self.size is not None:
@@ -213,6 +271,12 @@ class Attrs:
 
     @classmethod
     def decode(cls, reader: Reader) -> Attrs:
+        """Read one ``ATTRS`` at ``reader``'s position, consuming exactly its bytes.
+
+        Unknown flag bits are ignored: v3 defines no other field, and a
+        server that set one would be using a layout we never negotiated.
+        A short packet raises ``KeyError_`` from the :class:`Reader`.
+        """
         flags = reader.uint32()
         attrs = cls()
         if flags & ATTR_SIZE:
@@ -247,8 +311,10 @@ class Attrs:
 
     @property
     def is_dir(self) -> bool:
+        """A directory; false when the server sent no permissions."""
         return self.permissions is not None and _stat.S_ISDIR(self.permissions)
 
     @property
     def is_link(self) -> bool:
+        """A symbolic link (only an ``LSTAT`` or ``READDIR`` can say so)."""
         return self.permissions is not None and _stat.S_ISLNK(self.permissions)

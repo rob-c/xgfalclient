@@ -43,6 +43,13 @@ built-in ``LFC_HOST`` (gfal2's ``lfc_plugin.conf`` named the retired
 ``lstat`` always asks the server (gfal2 answers from a cache that
 ``readdirpp`` fills, possibly stale); and connection failures keep their
 own ``errno`` (see :mod:`.wire`) where gfal2 says ``ECOMM``.
+
+Layout: :mod:`.wire` is the byte format, :mod:`.csec` authentication,
+:mod:`.client` the connection pool and one method per Cns call; this module
+is only gfal2's semantics on top - URL parsing, which call each operation
+makes, and gfal2's error wording (``"Error report from LFC : ..."``),
+which the tests pin. Every :class:`~.client.CnsError`
+is turned into a plain ``GError`` here; none should reach the caller.
 """
 
 from __future__ import annotations
@@ -54,13 +61,13 @@ import stat as _stat
 import threading
 import uuid
 from collections.abc import Iterator
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 from ...errors import ECOMM, GError
 from ...plugin import Plugin, PluginFile
 from ...types import Stat
 from . import wire
-from .client import CnsError, FileStat, Server
+from .client import CnsError, FileStat, Server, ServerOptions
 from .csec import (
     GSIMechanism,
     IDMechanism,
@@ -71,12 +78,15 @@ from .csec import (
     mechanism_names,
 )
 
-__all__ = ["LFCPlugin", "GROUP", "LFCURL", "ENOATTR"]
+__all__ = ["ENOATTR", "GROUP", "LFCURL", "LFCPlugin"]
 
+#: The gfal2 configuration group for this plugin's options.
 GROUP = "LFC PLUGIN"
 
+#: "No such attribute": ``ENOATTR`` on macOS/BSD, ``ENODATA`` on Linux (its alias there).
 ENOATTR: int = getattr(errno, "ENOATTR", errno.ENODATA)
 
+# The extended attributes gfal2's LFC plugin defined; ``listxattr`` lists them in this order.
 XATTR_GUID = "user.guid"
 XATTR_REPLICAS = "user.replicas"
 XATTR_COMMENT = "user.comment"
@@ -91,6 +101,7 @@ DEFAULT_CONRETRYINT = 1
 
 #: The catalogue's two-letter checksum types (``Cns_srv_setfsizeg``).
 CHECKSUM_NAMES = {"AD": "ADLER32", "MD": "MD5", "CS": "CS"}
+# gfal2 algorithm name -> catalogue code; CRC32 is stored as the generic "CS".
 _SHORT_CHECKSUM = {"ADLER32": "AD", "MD5": "MD", "CS": "CS", "CRC32": "CS"}
 
 #: ``_get_host`` in ``lfc_register.c``: the host of a replica's URL.
@@ -113,18 +124,42 @@ _GUID_OPERATIONS = frozenset(
 )
 
 
+class _ReplicaInfo(NamedTuple):
+    """What registration learns about a replica: its size and one checksum.
+
+    ``csumtype`` is a catalogue code (``AD``/``MD``/``CS``) or ``""``, with
+    ``csumvalue`` then ``""`` too. A tuple, so it unpacks and compares like
+    the ``(size, type, value)`` that gfal2's ``_get_replica_info`` fills.
+    """
+
+    size: int
+    csumtype: str
+    csumvalue: str
+
+
 class LFCURL:
-    """A parsed catalogue URL: which server, and which path (or GUID) on it."""
+    """A parsed catalogue URL: which server, and which path (or GUID) on it.
+
+    For a ``guid:`` URL, :attr:`path` is already the resolved name, so every
+    operation works on paths alone; :attr:`guid` just remembers the input.
+    """
 
     def __init__(self, url: str, host: str, path: str, guid: str = "") -> None:
+        """``url`` as given (for credentials and messages), ``host`` maybe with ``:port``."""
         self.url = url
+        #: ``host`` or ``host:port`` (``[v6]:port``), split by :func:`_split_host`.
         self.host = host
+        #: The absolute catalogue path.
         self.path = path
         self.guid = guid
 
 
 def _split_host(value: str, default_port: int) -> tuple[str, int]:
-    """``send2nsd``'s ``host[:port]``: the last colon, unless it is inside IPv6."""
+    """``send2nsd``'s ``host[:port]``: the last colon, unless it is inside IPv6.
+
+    ``[v6]`` and ``[v6]:port`` are unwrapped; a bare IPv6 address (several
+    colons, no brackets) is all host. A non-numeric port is ``EINVAL``.
+    """
     if value.startswith("[") and "]" in value:
         host, _, rest = value[1:].partition("]")
         port = rest[1:] if rest.startswith(":") else ""
@@ -138,12 +173,19 @@ def _split_host(value: str, default_port: int) -> tuple[str, int]:
 
 
 def _lfn_path(url: str) -> str:
-    """``lfc_urlconverter``: drop ``lfn:``, doubled slashes and a trailing one."""
+    """``lfc_urlconverter``: drop ``lfn:``, doubled slashes and a trailing one.
+
+    ``lfn:/`` itself is the root, ``/``.
+    """
     return re.sub(r"/+", "/", url[4:]).rstrip("/") or "/"
 
 
 def to_stat(record: FileStat) -> Stat:
-    """``gfal_lfc_convert_statg``: no inode, no device, as in gfal2."""
+    """``gfal_lfc_convert_statg``: no inode, no device, as in gfal2.
+
+    The record's file id could serve as an inode, but gfal2 leaves
+    ``st_ino`` at ``0`` and so does this.
+    """
     return Stat(
         st_mode=record.mode,
         st_nlink=record.nlink,
@@ -157,7 +199,14 @@ def to_stat(record: FileStat) -> Stat:
 
 
 class LFCPlugin(Plugin):
-    """The LCG File Catalog: a namespace of logical names and their replicas."""
+    """The LCG File Catalog: a namespace of logical names and their replicas.
+
+    One instance per gfal2 context. It keeps a :class:`~.client.Server` -
+    a connection pool - per (host, port, credential, ``$CSEC_MECH``), so
+    different identities never share an authenticated connection; all of
+    them are closed by :meth:`close`. Methods are safe to call from several
+    threads at once.
+    """
 
     name = "lfc"
     schemes: ClassVar[tuple[str, ...]] = ("lfc", "lfn", "guid")
@@ -169,6 +218,7 @@ class LFCPlugin(Plugin):
     copy_manages_destination = True
 
     def __init__(self, context: Any) -> None:
+        """Bind to the gfal2 ``context``; no connection is made until first use."""
         super().__init__(context)
         self._servers: dict[tuple[object, ...], Server] = {}
         self._lock = threading.Lock()
@@ -201,6 +251,12 @@ class LFCPlugin(Plugin):
         return int(self.options.integer(GROUP, name, default))
 
     def default_host(self) -> str:
+        """The catalogue for ``lfn:``/``guid:`` URLs: ``$LFC_HOST``, then the config.
+
+        There is deliberately no built-in default (see the module
+        docstring), so neither set is ``EINVAL`` with a message saying how
+        to fix it.
+        """
         host = os.environ.get("LFC_HOST") or self.options.string(GROUP, "LFC_HOST", "")
         if not host:
             raise GError(
@@ -210,12 +266,21 @@ class LFCPlugin(Plugin):
         return host
 
     def _default_port(self) -> int:
+        """``$LFC_PORT`` if numeric, else 5010; a port in the URL wins over both."""
         value = os.environ.get("LFC_PORT", "")
         return int(value) if value.isdigit() else wire.PORT
 
     # -- URLs ----------------------------------------------------------------------------
 
     def parse(self, url: str) -> LFCURL:
+        """Which server and path ``url`` means; ``EINVAL`` for anything else.
+
+        ``lfc://`` needs a host and a path (``lfc://host`` alone is
+        ``EINVAL``); ``lfn:`` takes the default host. ``guid:`` costs a
+        round trip - ``Cns_getlinks`` - and resolves to the file's own path
+        (the first link); its errors keep gfal2's wording, odd spacing
+        included.
+        """
         lowered = url[:6].lower()
         if lowered.startswith("lfc://"):
             rest = url[6:].lstrip("/")
@@ -252,6 +317,14 @@ class LFCPlugin(Plugin):
     # -- servers --------------------------------------------------------------------------
 
     def _mechanisms(self, url: str) -> list[Mechanism]:
+        """The Csec offer for ``url``, in ``$CSEC_MECH`` order, built per connection.
+
+        GSI is always offered when named, with ``None`` for TLS when no
+        credential exists, so the failure is Csec's own "no credential"
+        after negotiation (see :class:`~.csec.GSIMechanism`). The TLS
+        context leaves host-name checking to GSI's rule. KRB5 is offered
+        only when a Kerberos library loads; unknown names are dropped.
+        """
         found: list[Mechanism] = []
         for name in mechanism_names(os.environ.get("CSEC_MECH")):
             if name == "GSI":
@@ -268,6 +341,15 @@ class LFCPlugin(Plugin):
         return found
 
     def server(self, hostport: str, url: str) -> Server:
+        """The pooled :class:`~.client.Server` for ``hostport`` and ``url``'s identity.
+
+        Keyed by lower-cased host, port, the X.509 credential ``url`` would
+        use and ``$CSEC_MECH``, so a change of proxy or mechanism list gets
+        new connections rather than ones authenticated as someone else.
+        Settings are read when the server is first made: environment, then
+        ``[LFC PLUGIN]``, then gfal2's defaults (negative retry values count
+        as ``0``); the I/O timeout is the context's operation timeout.
+        """
         host, port = _split_host(hostport, self._default_port())
         credential = self.context.x509(url)
         mechs = os.environ.get("CSEC_MECH", "")
@@ -275,10 +357,7 @@ class LFCPlugin(Plugin):
         with self._lock:
             found = self._servers.get(key)
             if found is None:
-                found = self._servers[key] = Server(
-                    host,
-                    port,
-                    lambda: self._mechanisms(url),
+                options = ServerOptions(
                     timeout=float(self.option_timeout()),
                     connect_timeout=float(self._setting("LFC_CONNTIMEOUT", DEFAULT_CONNTIMEOUT)),
                     retries=max(0, self._setting("LFC_CONRETRY", DEFAULT_CONRETRY)),
@@ -287,12 +366,17 @@ class LFCPlugin(Plugin):
                     ),
                     sessions=self.options.boolean(GROUP, "SESSION_REUSE", True),
                 )
+                found = self._servers[key] = Server(
+                    host, port, lambda: self._mechanisms(url), options
+                )
             return found
 
     def _server(self, target: LFCURL) -> Server:
+        """The server for a parsed URL."""
         return self.server(target.host, target.url)
 
     def close(self) -> None:
+        """End every pooled session; later calls reconnect as needed."""
         with self._lock:
             servers, self._servers = list(self._servers.values()), {}
         for server in servers:
@@ -300,20 +384,24 @@ class LFCPlugin(Plugin):
 
     @staticmethod
     def _error(exc: CnsError, text: str = "Error report from LFC : {}") -> GError:
+        """``exc`` in gfal2's words: ``text`` with the message in ``{}``, the same ``errno``."""
         return GError(text.format(exc.message), exc.code)
 
     # -- namespace ----------------------------------------------------------------------
 
     def _statg(self, target: LFCURL) -> FileStat:
+        """``Cns_statg`` by path, with gfal2's error text: the call behind most getters."""
         try:
             return self._server(target).statg(target.path)
         except CnsError as exc:
             raise self._error(exc) from exc
 
     def stat(self, url: str) -> Stat:
+        """``gfal_lfc_statG``: ``Cns_statg``, following symlinks."""
         return to_stat(self._statg(self.parse(url)))
 
     def lstat(self, url: str) -> Stat:
+        """``Cns_lstat``, always from the server (gfal2 might answer from a listing cache)."""
         target = self.parse(url)
         try:
             return to_stat(self._server(target).lstat(target.path))
@@ -321,6 +409,7 @@ class LFCPlugin(Plugin):
             raise self._error(exc) from exc
 
     def access(self, url: str, mode: int) -> None:
+        """``Cns_access``; ``mode`` as for ``os.access``, errors in gfal2's wording."""
         target = self.parse(url)
         try:
             self._server(target).access(target.path, mode)
@@ -328,6 +417,7 @@ class LFCPlugin(Plugin):
             raise self._error(exc, f"lfc access error, file : {url}, error : {{}}") from exc
 
     def chmod(self, url: str, mode: int) -> None:
+        """``Cns_chmod`` on the permission bits of ``mode``."""
         target = self.parse(url)
         try:
             self._server(target).chmod(target.path, mode)
@@ -344,6 +434,7 @@ class LFCPlugin(Plugin):
             ) from exc
 
     def mkdir(self, url: str, mode: int) -> None:
+        """One directory, with a fresh GUID (:meth:`_mkdir`); ``EEXIST`` if it exists."""
         target = self.parse(url)
         self._mkdir(self._server(target), target.path, mode)
 
@@ -353,29 +444,34 @@ class LFCPlugin(Plugin):
         self._mkdir_rec(self._server(target), target.path, mode)
 
     def _mkdir_rec(self, server: Server, path: str, mode: int) -> None:
-        try:
-            self._mkdir(server, path, mode)
+        """``mkdir -p`` on ``server``: try the leaf, and only on ``ENOENT`` build the path.
+
+        Ancestors that already exist (``EEXIST``) or that we may not create
+        but can presumably traverse (``EACCES``, e.g. ``/grid``) are passed
+        over; the final ``mkdir`` of the leaf reports any real problem.
+        Also used by :meth:`_touch` for a new file's parents.
+        """
+        if self._try_mkdir(server, path, mode, (errno.EEXIST, errno.ENOENT)) != errno.ENOENT:
             return
-        except GError as exc:
-            if exc.code == errno.EEXIST:
-                return
-            if exc.code != errno.ENOENT:
-                raise
         # gfal_lfc_mkdir_rec: every ancestor with owner rwx, then the leaf.
         parts = [part for part in path.split("/") if part]
         for depth in range(1, len(parts)):
-            try:
-                self._mkdir(server, "/" + "/".join(parts[:depth]), mode | 0o700)
-            except GError as exc:
-                if exc.code not in (errno.EEXIST, errno.EACCES):
-                    raise
+            ancestor = "/" + "/".join(parts[:depth])
+            self._try_mkdir(server, ancestor, mode | 0o700, (errno.EEXIST, errno.EACCES))
+        self._try_mkdir(server, path, mode, (errno.EEXIST,))
+
+    def _try_mkdir(self, server: Server, path: str, mode: int, tolerated: tuple[int, ...]) -> int:
+        """:meth:`_mkdir`; 0 when made, the errno when it is one of ``tolerated``, else raise."""
         try:
             self._mkdir(server, path, mode)
         except GError as exc:
-            if exc.code != errno.EEXIST:
+            if exc.code not in tolerated:
                 raise
+            return exc.code
+        return 0
 
     def rmdir(self, url: str) -> None:
+        """``Cns_rmdir``, with gfal2's ``ENOTEMPTY`` for a directory that has entries."""
         target = self.parse(url)
         try:
             self._server(target).rmdir(target.path)
@@ -385,6 +481,7 @@ class LFCPlugin(Plugin):
             raise GError(f"Error report from LFC {exc.message}", code) from exc
 
     def rename(self, old: str, new: str) -> None:
+        """``Cns_rename`` on the first URL's server; the second URL's host is ignored."""
         source = self.parse(old)
         target = self._same_server(source, new)
         try:
@@ -393,6 +490,11 @@ class LFCPlugin(Plugin):
             raise self._error(exc) from exc
 
     def symlink(self, target: str, link: str) -> None:
+        """``Cns_symlink``: ``target`` may be an LFC URL or an absolute catalogue path.
+
+        Anything else (a relative path, another protocol's URL) is
+        ``EINVAL``: the link must name something in this catalogue.
+        """
         pointed = self.parse(target) if self.handles(target, "symlink") else None
         where = self.parse(link)
         path = pointed.path if pointed is not None else target
@@ -412,6 +514,12 @@ class LFCPlugin(Plugin):
             raise self._error(exc) from exc
 
     def unlink(self, url: str) -> None:
+        """gfal2's unlink: ``Cns_delfilesbyname`` with ``force``, entry and replica records.
+
+        The request can succeed while the file fails; that per-path status
+        is raised the same way as a request error. The replicas' data on
+        the storage elements is untouched, as in gfal2.
+        """
         target = self.parse(url)
         try:
             statuses = self._server(target).delfiles([target.path], True)
@@ -422,6 +530,7 @@ class LFCPlugin(Plugin):
             raise self._error(failure)
 
     def opendir(self, url: str) -> Iterator[tuple[str, Stat | None]]:
+        """The whole listing, read up front (see :meth:`.client.Server.listdir`), with stats."""
         target = self.parse(url)
         try:
             entries = self._server(target).listdir(target.path)
@@ -432,6 +541,11 @@ class LFCPlugin(Plugin):
     # -- metadata ---------------------------------------------------------------------
 
     def getxattr(self, url: str, name: str) -> str:
+        """One of the five LFC attributes (each one round trip); ``ENOATTR`` otherwise.
+
+        The ``"axttr not found"`` typo is gfal2's and is kept for scripts
+        that match on it.
+        """
         target = self.parse(url)
         if name == XATTR_GUID:
             return self._statg(target).guid
@@ -458,6 +572,12 @@ class LFCPlugin(Plugin):
         return list(FILE_XATTRS)
 
     def setxattr(self, url: str, name: str, value: str, flags: int) -> None:
+        """``user.comment`` (non-empty), or ``user.replicas`` with ``+surl``/``-surl``.
+
+        ``flags`` (``XATTR_CREATE``...) are ignored. The other attributes
+        are read-only (``ENOATTR``): GUID and checksum are set when a file
+        is registered.
+        """
         target = self.parse(url)
         if name == XATTR_COMMENT:
             if not value:
@@ -529,26 +649,41 @@ class LFCPlugin(Plugin):
         # gfal2's core reports a plugin that opened nothing as a bad handle.
         raise GError(f"No replica registered for {url}", errno.EBADF)
 
-    def _replica_info(self, surl: str) -> tuple[int, str, str]:
-        """``_get_replica_info``: the replica's size and a checksum, if one comes."""
+    def _replica_info(self, surl: str) -> _ReplicaInfo:
+        """``_get_replica_info``: the replica's size and a checksum, if one comes.
+
+        Asks the replica's own plugin, trying Adler-32, then MD5, then the
+        generic type, and keeps the first that answers (cut to the
+        catalogue's 32 characters). No checksum at all is fine: the entry
+        is then registered without one. A failing ``stat`` propagates - a
+        replica that cannot be seen is not registered.
+        """
         size = self.context.stat(surl).st_size
         for short in ("AD", "MD", "CS"):
             try:
                 value = self.context.checksum(surl, CHECKSUM_NAMES[short])
             except GError:
                 continue
-            return size, short, value[:32]
-        return size, "", ""
+            return _ReplicaInfo(size, short, value[:32])
+        return _ReplicaInfo(size, "", "")
 
     def register(self, surl: str, target: LFCURL) -> None:
-        """``gfal_lfc_register``: add ``surl`` as a replica of ``target``, creating it if new."""
+        """``gfal_lfc_register``: add ``surl`` as a replica of ``target``, creating it if new.
+
+        An existing entry must agree with the replica: same size, and the
+        same checksum when both sides have one of the same type (else
+        ``EINVAL``, nothing changed). A new entry gets a fresh GUID, its
+        parents, the size and checksum (:meth:`_touch`), then the replica.
+        Registering a replica that is already there succeeds. Not atomic:
+        a failure after :meth:`_touch` leaves an entry with no replica.
+        """
         found = _SURL_HOST.match(surl)
         if found is None:
             raise GError(f"The source is not a valid url: {surl} (No match)", errno.EINVAL)
         # gfal2 cut the last character off the host here (a g_strlcpy
         # off-by-one); the whole host name is registered instead.
         replica_host = found.group(2)
-        size, csumtype, csumvalue = self._replica_info(surl)
+        info = self._replica_info(surl)
         server = self._server(target)
         try:
             record: FileStat | None = server.statg(target.path)
@@ -559,36 +694,40 @@ class LFCPlugin(Plugin):
                 ) from exc
             record = None
         if record is not None:
-            if size != record.size:
+            if info.size != record.size:
                 raise GError(
-                    f"Replica file size ({size}) and LFC file size ({record.size}) do not match",
+                    f"Replica file size ({info.size}) and LFC file size ({record.size}) "
+                    "do not match",
                     errno.EINVAL,
                 )
             if (
                 record.csumvalue
-                and csumvalue
-                and csumtype == record.csumtype
-                and csumvalue != record.csumvalue
+                and info.csumvalue
+                and info.csumtype == record.csumtype
+                and info.csumvalue != record.csumvalue
             ):
                 raise GError(
-                    f"Replica checksum ({csumvalue}) and LFC checksum ({record.csumvalue}) "
+                    f"Replica checksum ({info.csumvalue}) and LFC checksum ({record.csumvalue}) "
                     "do not match",
                     errno.EINVAL,
                 )
             guid, fileid = record.guid, record.fileid
         else:
             guid, fileid = str(uuid.uuid4()), 0
-            self._touch(server, target.path, guid, size, csumtype, csumvalue)
+            self._touch(server, target.path, guid, info)
         try:
             server.addreplica(guid, fileid, replica_host, surl)
         except CnsError as exc:
             if exc.code != errno.EEXIST:  # already registered: that is fine
                 raise GError(f"Could not register the replica : {exc.message} ", exc.code) from exc
 
-    def _touch(
-        self, server: Server, path: str, guid: str, size: int, csumtype: str, csumvalue: str
-    ) -> None:
-        """``_lfc_touch``: the parent directories, the entry, its size and checksum."""
+    def _touch(self, server: Server, path: str, guid: str, info: _ReplicaInfo) -> None:
+        """``_lfc_touch``: the parent directories, the entry, its size and checksum.
+
+        Parents are made only when ``Cns_access`` cannot see the parent;
+        the entry is created ``0o644`` (less the umask) with ``guid``, and
+        ``Cns_setfsizeg`` records ``info``'s size and checksum on it.
+        """
         parent = path.rsplit("/", 1)[0] or "/"
         try:
             server.access(parent, os.F_OK)
@@ -599,12 +738,16 @@ class LFCPlugin(Plugin):
         except CnsError as exc:
             raise GError(f"Could not create the file: {exc.message}", exc.code) from exc
         try:
-            server.setfsizeg(guid, size, csumtype, csumvalue)
+            server.setfsizeg(guid, info.size, info.csumtype, info.csumvalue)
         except CnsError as exc:
             raise GError(f"Could not set file size and checksum: {exc.message}", exc.code) from exc
 
     def unregister(self, target: LFCURL, surl: str) -> None:
-        """``gfal_lfc_unregister``: drop one replica record."""
+        """``gfal_lfc_unregister``: drop one replica record.
+
+        By file id (from ``Cns_statg``), so a ``guid:`` URL works too. The
+        entry stays even when its last replica goes.
+        """
         server = self._server(target)
         try:
             record = server.statg(target.path)
@@ -620,7 +763,12 @@ class LFCPlugin(Plugin):
     # -- copies ---------------------------------------------------------------------------
 
     def copy(self, transfer: Any) -> None:
-        """Register the source as a replica of the destination name."""
+        """Register the source as a replica of the destination name.
+
+        No bytes move: the source must already be where it will be read
+        from. The ``TRANSFER_TYPE`` event says so to monitoring, and
+        ``transfer.check()`` honours a cancellation that arrived meanwhile.
+        """
         from ... import events as ev
 
         transfer.event(ev.TRANSFER_TYPE, "register")

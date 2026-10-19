@@ -45,6 +45,36 @@ junk is 0, a negative size wraps around to an unsigned one.
 ``archiving_errno=N``       archiving fails with ``N`` once that time is up
 ==========================  ===================================================
 
+What the table leaves implicit, and tests rely on:
+
+* Prefix matching cuts both ways. ``?access_errno=13`` on its own makes
+  ``access`` *succeed* (its ``access`` value is ``13``); the errno is only
+  reached behind an earlier ``access=0``. Put ``size=`` before
+  ``size_pre=``, and beware that ``time`` also answers to ``timeout=...``.
+* Values are cut to gfal2's buffers: 63 characters for most keys, 1023 for
+  ``list``, 2047 for ``checksum``, ``time``, the xattrs and ``getxattr``'s
+  ``errno``. ``rd_path`` is the exception twice over: every occurrence
+  counts, and ``rd_path=`` is found anywhere after the ``?``.
+* Error knobs are numbers stored in a C ``int`` (wrapping at 32 bits) and
+  fail with ``os.strerror(N)`` as the message. ``errno``, ``open_errno``,
+  ``read_errno`` and ``access_errno`` count only when positive; the
+  staging, release, archiving and transfer ones fail on any non-zero
+  value. ``wait``, ``staging_time`` and ``archiving_time`` are 64-bit.
+* ``size_pre``/``size_post``: with a user agent starting ``fts_url_copy``,
+  stats cycle source, destination-before, destination-after (and a copy
+  that is not cancelled jumps to "after"), so FTS's stat-copy-stat sequence sees
+  the destination appear. Every ``stat`` advances it, including the one in
+  ``open``, ``unlink`` and ``opendir``. The cycle is per plugin instance.
+* ``open`` accepts exactly ``O_RDONLY`` or ``O_WRONLY``: any other flag
+  (``O_CREAT`` included) is ``ENOSYS``, "does not support read and write".
+* ``time=0`` makes a copy instant, and then ``transfer_errno`` never fires
+  (it is checked once per elapsed second); a negative ``time`` fails the
+  copy as cancelled (``ECANCELED``).
+* Staging: ``bring_online`` records when each URL will be online; a
+  synchronous call, or ``staging_time`` 0, answers at once. A poll for a URL
+  never asked for counts as done. Archiving starts its clock at the first
+  ``archive_poll`` and forgets the URL once it reports done.
+
 Reads return random bytes, as gfal2's come from ``/dev/urandom``. There is
 no ``rmdir``, ``rename``, ``chmod``, ``listxattr``, ``setxattr`` or token
 support: those are ``EPROTONOSUPPORT``, as in gfal2. Staging and archiving
@@ -68,6 +98,7 @@ Where this knowingly differs from gfal2 (each an upstream defect):
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import random
@@ -78,20 +109,26 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator, Sequence
+from typing import TYPE_CHECKING
 
 from ..errors import GError
 from ..plugin import O_RDONLY, O_WRONLY, DirEntry, Plugin, PluginFile, StagingResult
 from ..transfer import Transfer
 from ..types import Stat
 
+if TYPE_CHECKING:
+    from ..context import Gfal2Context
+
 __all__ = ["MockPlugin"]
 
-# gfal2's buffer sizes: a value longer than the buffer is cut short.
+# gfal2's buffer sizes: a value longer than the buffer is cut short (to one
+# less than the size, for the C string's terminating NUL).
 _ARG = 64
 _LIST = 1024
 _URL_MAX = 2048
 
 _ULLONG = 2**64
+#: What C's number parsers skip and accept before the digits: isspace(), a sign.
 _NUMBER = re.compile(r"[ \t\n\v\f\r]*([+-]?)")
 
 #: Where gfal2 looks for ``MOCK_LOAD_TIME_SIGNAL<N>`` (the process arguments).
@@ -101,6 +138,7 @@ _LOAD_TIME_SIGNAL = "MOCK_LOAD_TIME_SIGNAL"
 #: How long a second of a mock copy lasts (tests shorten it).
 _TICK = 1.0
 
+#: The attributes gfal2's mock answers from the query; the key is the name itself.
 _XATTRS = ("user.status", "user.replicas", "user.guid", "user.comment", "spacetoken")
 
 # The fts_url_copy stat stages (gfal_mock_plugin.h ``StatStage``).
@@ -166,6 +204,7 @@ def _strtol(text: str, base: int = 10) -> tuple[int, int]:
 
 
 def _atoll(text: str) -> int:
+    """C ``atoll``: the leading decimal integer, saturated to 64 bits; junk is 0."""
     return _strtol(text)[0]
 
 
@@ -175,6 +214,7 @@ def _int(url: str, key: str) -> int:
 
 
 def _c_int(value: int) -> int:
+    """``value`` stored in a 32-bit C ``int``: two's-complement wrap-around."""
     return (value + 2**31) % 2**32 - 2**31
 
 
@@ -194,6 +234,7 @@ def _unsigned(url: str, key: str) -> int:
 
 
 def _fail(code: int) -> GError:
+    """The error an injected errno produces: ``strerror`` text, ``code`` as is."""
     return GError(os.strerror(code), code)
 
 
@@ -209,10 +250,8 @@ def _now() -> int:
 
 def _raise_signal(number: int) -> None:
     """C ``raise``: an invalid signal number is ignored."""
-    try:
+    with contextlib.suppress(ValueError, OSError):
         signal.raise_signal(number)
-    except (ValueError, OSError):
-        pass
 
 
 def _load_time_signal(path: str = _CMDLINE) -> None:
@@ -246,19 +285,28 @@ def _entries(listing: str) -> Iterator[tuple[str, Stat, int]]:
             return
         end = listing.find(",", position)
         end = len(listing) if end < 0 else end
-        token = listing[position:end]
-        name, colon, rest = token.partition(":")
-        mode = size = 0
-        if colon:
-            mode, used = _strtol(rest, 8)
-            mode %= 2**32  # mode_t
-            if not mode & 0o170000:  # S_IFMT, which is 16 bits on macOS
-                mode |= _stat.S_IFREG
-            stop = len(name) + 1 + used
-            tail = token[stop + 1 :] if stop < len(token) else listing[end + 1 :]
-            size = _strtol(tail)[0] % _ULLONG  # gfal2's bindings print it unsigned
-        yield name[:255], Stat(st_mode=mode, st_size=size), 0
+        name, info = _entry(listing, listing[position:end], end)
+        yield name, info, 0
         position = end + 1
+
+
+def _entry(listing: str, token: str, end: int) -> tuple[str, Stat]:
+    """One ``name[:mode[:size]]`` entry, ``token``, which ends at ``end`` in ``listing``.
+
+    A size-less entry's size is read from what follows ``end``, as gfal2's
+    ``strtol`` does.
+    """
+    name, colon, rest = token.partition(":")
+    mode = size = 0
+    if colon:
+        mode, used = _strtol(rest, 8)
+        mode %= 2**32  # mode_t
+        if not mode & 0o170000:  # S_IFMT, which is 16 bits on macOS
+            mode |= _stat.S_IFREG
+        stop = len(name) + 1 + used
+        tail = token[stop + 1 :] if stop < len(token) else listing[end + 1 :]
+        size = _strtol(tail)[0] % _ULLONG  # gfal2's bindings print it unsigned
+    return name[:255], Stat(st_mode=mode, st_size=size)
 
 
 def _checksums_match(one: str, other: str) -> bool:
@@ -270,16 +318,27 @@ def _checksums_match(one: str, other: str) -> bool:
 
 
 class _MockReader(PluginFile):
-    """Random bytes up to the stat size, as gfal2's reads of ``/dev/urandom``."""
+    """Random bytes up to the stat size, as gfal2's reads of ``/dev/urandom``.
+
+    Two reads of the same range differ, so a test cannot compare content,
+    only lengths; a copy's checksum comes from ``checksum=`` instead.
+    """
 
     def __init__(self, url: str, size: int) -> None:
+        """``size`` is the ``stat`` size taken when the file was opened."""
         super().__init__(url)
         self._size = size
 
     def size(self) -> int:
+        """The size fixed at open, for ``SEEK_END``."""
         return self._size
 
     def pread(self, offset: int, size: int) -> bytes:
+        """``read_wait`` seconds' sleep, then ``read_errno``, then the random bytes.
+
+        Both knobs are read from the URL on every call. Past the end of the
+        file the answer is empty.
+        """
         wait = _int(self.url, "read_wait")
         if wait > 0:
             time.sleep(wait)
@@ -290,9 +349,10 @@ class _MockReader(PluginFile):
 
 
 class _MockWriter(PluginFile):
-    """gfal2 opens ``/dev/null`` for a plain ``O_WRONLY``."""
+    """gfal2 opens ``/dev/null`` for a plain ``O_WRONLY``: every write is accepted and lost."""
 
     def pwrite(self, data: bytes | bytearray | memoryview, offset: int) -> int:
+        """Claim all of ``data`` written; nothing is kept or checked."""
         return len(data)
 
 
@@ -300,7 +360,13 @@ class _MockWriter(PluginFile):
 
 
 class MockPlugin(Plugin):
-    """gfal2's ``mock`` plugin."""
+    """gfal2's ``mock`` plugin; the module docstring lists the URL knobs.
+
+    Per instance (one per context): the ``fts_url_copy`` stat cycle, under
+    ``_lock``. Process-wide: the staging and archiving clocks, under
+    ``_tables_lock``. Nothing else is remembered between calls, so the same
+    URL always behaves the same way otherwise.
+    """
 
     name = "mock"
     schemes = ("mock",)
@@ -312,8 +378,9 @@ class MockPlugin(Plugin):
     copy_manages_destination = True
     copy_manages_checksums = True
 
-    def __init__(self, context: object) -> None:
-        super().__init__(context)  # type: ignore[arg-type]
+    def __init__(self, context: Gfal2Context) -> None:
+        """Read ``[MOCK PLUGIN] SIGNALS``; when it is true, fire the load-time signal hook."""
+        super().__init__(context)
         self._lock = threading.Lock()
         self._stage = _SOURCE
         self._signals = bool(self.options.boolean(self.option_group, "SIGNALS", False))
@@ -321,11 +388,18 @@ class MockPlugin(Plugin):
             _load_time_signal()
 
     def handles(self, url: str, operation: str) -> bool:
+        """Every URL that starts ``mock:``, whatever the operation."""
         return url.startswith("mock:")  # gfal2's strncmp: case-sensitive, any form after it
 
     # -- namespace ---------------------------------------------------------------
 
     def stat(self, url: str) -> Stat:
+        """``wait``, then ``signal``, then ``errno``, then the size; a ``list`` makes a directory.
+
+        The mode is always ``0755`` with ``S_IFDIR`` or ``S_IFREG``; every
+        other field is 0. The order of the knobs is gfal2's and matters: a
+        URL with both ``wait`` and ``errno`` sleeps before it fails.
+        """
         wait = _atoll(_value(url, "wait"))
         if wait > 0:
             time.sleep(wait)
@@ -352,6 +426,11 @@ class MockPlugin(Plugin):
         return Stat(st_mode=kind | 0o755, st_size=size)
 
     def access(self, url: str, mode: int) -> int:
+        """1 if ``access`` or ``exists`` is positive, else ``access_errno`` or ``ENOENT``.
+
+        ``mode`` is ignored, and ``stat``'s knobs (``wait``, ``errno``) do not
+        apply. See the module docstring for the prefix trap in ``access``.
+        """
         for key in ("access", "exists"):
             value = _value(url, key)
             if value and _c_int(_atoll(value)) > 0:
@@ -360,18 +439,25 @@ class MockPlugin(Plugin):
         raise _fail(code if code > 0 else errno.ENOENT)
 
     def mkdir(self, url: str, mode: int) -> None:
+        """Succeed, unless a ``rd_path`` value starts with this URL (minus its query): ``EPERM``.
+
+        Nothing is created: a later ``stat`` of the URL is as its query says.
+        """
         read_only = _values(url, "rd_path")
         base = url[: url.find("?")]
         if any(path.startswith(base) for path in read_only):
             raise _fail(errno.EPERM)
 
     def mkdir_rec(self, url: str, mode: int) -> None:
+        """As :meth:`mkdir`: gfal2's mock has no parents to make."""
         self.mkdir(url, mode)
 
     def unlink(self, url: str) -> None:
+        """A :meth:`stat` and nothing more: it fails as that stat fails."""
         self.stat(url)
 
     def opendir(self, url: str) -> Iterator[DirEntry]:
+        """The ``list`` entries, after a :meth:`stat`; ``ENOTDIR`` without a ``list``."""
         if not self.stat(url).is_dir():
             raise _fail(errno.ENOTDIR)
         return iter(list(_entries(_value(url, "list", _LIST))))
@@ -379,6 +465,11 @@ class MockPlugin(Plugin):
     # -- I/O ---------------------------------------------------------------------
 
     def open(self, url: str, flags: int, mode: int = 0o644, size: int | None = None) -> PluginFile:
+        """A :meth:`stat`, then ``open_errno``; a random-byte reader or a null writer.
+
+        ``flags`` must be exactly ``O_RDONLY`` or ``O_WRONLY``; anything else
+        is ``ENOSYS``. ``mode`` and ``size`` are ignored.
+        """
         info = self.stat(url)
         code = _int(url, "open_errno")
         if code > 0:
@@ -392,12 +483,23 @@ class MockPlugin(Plugin):
     # -- metadata ------------------------------------------------------------------
 
     def checksum(self, url: str, algorithm: str, offset: int, length: int) -> str:
+        """``errno`` if positive, else the ``checksum`` value, ``""`` when there is none.
+
+        The algorithm and range are ignored: the same text answers for all.
+        """
         code = _int(url, "errno")
         if code > 0:
             raise _fail(code)
         return _value(url, "checksum", _URL_MAX)
 
     def getxattr(self, url: str, name: str) -> str:
+        """``errno`` if positive, else the value of the key called ``name``.
+
+        Only :data:`_XATTRS` names are answered, and a known name without a
+        value is ``ENODATA``. Any other name is ``ENODATA`` too - unless the
+        URL has a non-positive ``errno=``, which gfal2's reuse of its buffer
+        turns into ``""``.
+        """
         found = _value(url, "errno", _URL_MAX)
         code = _c_int(_atoll(found))
         if code > 0:
@@ -421,6 +523,14 @@ class MockPlugin(Plugin):
         timeout: int,
         is_async: bool,
     ) -> tuple[list[StagingResult], str]:
+        """Start the staging clock for each URL; a random UUID is the request token.
+
+        Each result is ``True`` (or the ``staging_errno`` failure) when the
+        file is "online" already - ``staging_time`` not positive, or a
+        synchronous call - and ``False`` (queued) otherwise. ``metadata``,
+        ``pintime`` and ``timeout`` are ignored, as in gfal2. Asking again
+        restarts that URL's clock.
+        """
         results: list[StagingResult] = []
         for url in urls:
             code = _int(url, "staging_errno")
@@ -435,6 +545,10 @@ class MockPlugin(Plugin):
         return results, str(uuid.uuid4())
 
     def bring_online_poll(self, urls: Sequence[str], token: str) -> list[StagingResult]:
+        """Per URL: done (``True`` or ``staging_errno``) once its time is up, else ``EAGAIN``.
+
+        The token is ignored; the clocks are keyed by URL alone.
+        """
         results: list[StagingResult] = []
         for url in urls:
             code = _int(url, "staging_errno")
@@ -447,6 +561,7 @@ class MockPlugin(Plugin):
         return results
 
     def release(self, urls: Sequence[str], token: str) -> list[GError | None]:
+        """``release_errno`` per URL, ``None`` (released) without one; no state changes."""
         results: list[GError | None] = []
         for url in urls:
             code = _int(url, "release_errno")
@@ -454,9 +569,15 @@ class MockPlugin(Plugin):
         return results
 
     def abort_bring_online(self, urls: Sequence[str], token: str) -> list[GError | None]:
+        """Success for every URL; the staging clocks are left running."""
         return [None for _ in urls]  # gfal2's only touches its arguments
 
     def archive_poll(self, urls: Sequence[str]) -> list[StagingResult]:
+        """``EAGAIN`` until ``archiving_time`` after the URL's first poll, then done.
+
+        Done is ``True`` or the ``archiving_errno`` failure, and forgets the
+        URL, so polling it again starts a new clock.
+        """
         results: list[StagingResult] = []
         for url in urls:
             code = _int(url, "archiving_errno")
@@ -471,10 +592,22 @@ class MockPlugin(Plugin):
     # -- copies ------------------------------------------------------------------
 
     def copy_check(self, source: str, destination: str) -> bool:
+        """Only ``mock:`` to ``mock:``; a copy to or from anything else is streamed."""
         return source.startswith("mock:") and destination.startswith("mock:")
 
     def copy(self, transfer: Transfer) -> None:
-        """``gfal_plugin_mock_filecopy``."""
+        """``gfal_plugin_mock_filecopy``: checksums, a timed sleep, injected failure.
+
+        In order: with ``GFALT_CHECKSUM_SOURCE``, the source's ``checksum``
+        must match the user's (``EIO``); the copy then "runs" for the
+        destination's ``time`` seconds, checking for cancellation, and a
+        ``transfer_errno`` on the destination fails it after the first
+        second. A cancel is ``ECANCELED`` (or that ``transfer_errno``, when
+        there is one). Then the stat cycle moves to
+        "after", and with ``GFALT_CHECKSUM_TARGET`` the destination's
+        ``checksum`` must match the source's (both modes) or the user's
+        (``EIO``). An empty checksum on either side matches anything.
+        """
         source, destination = transfer.source, transfer.destination
         mode = int(transfer.checksum_mode)
         user = transfer.user_checksum or ""
@@ -484,17 +617,9 @@ class MockPlugin(Plugin):
             if not _checksums_match(user, source_checksum):
                 raise GError("User and source checksums do not match", errno.EIO)
         seconds = self._duration(destination)
-        failure = _int(destination, "transfer_errno")
         transfer.event("TRANSFER:ENTER", f"Mock copy start, sleep {seconds}")
         transfer.event("TRANSFER:TYPE", "mock")
-        error: GError | None = None
-        while seconds > 0:
-            if _sleep_second(transfer):
-                seconds = -10  # gfal2's cancel callback
-            seconds -= 1
-            if failure:
-                error = _fail(failure)
-                break
+        seconds, error = _sleep_through(transfer, seconds, _int(destination, "transfer_errno"))
         transfer.event("TRANSFER:EXIT", f"Mock copy start, sleep {seconds}")
         if seconds < 0:
             raise error or GError("Transfer canceled", errno.ECANCELED)
@@ -502,15 +627,17 @@ class MockPlugin(Plugin):
             self._stage = _AFTER  # "jump over to the destination stat"
         if error is None and mode & 2:  # GFALT_CHECKSUM_TARGET
             target = _value(destination, "checksum", _URL_MAX)
-            if mode & 1:
-                if not _checksums_match(source_checksum, target):
-                    error = GError("Source and destination checksums do not match", errno.EIO)
-            elif not _checksums_match(user, target):
-                error = GError("User and destination checksums do not match", errno.EIO)
+            error = _target_mismatch(target, source_checksum if mode & 1 else None, user)
         if error is not None:
             raise error
 
     def _duration(self, destination: str) -> int:
+        """How many seconds the copy lasts: ``time=``, else a random pick.
+
+        Without ``time`` it is drawn from ``[MIN_TRANSFER_TIME,
+        MAX_TRANSFER_TIME)`` (``[MOCK PLUGIN]``, default 10 and 100) when the
+        minimum is the smaller, and is exactly the maximum when they are equal.
+        """
         given = _value(destination, "time", _URL_MAX)
         if given:
             return _c_int(_atoll(given))
@@ -520,6 +647,31 @@ class MockPlugin(Plugin):
             return high
         # rand() % (max - min) + min, with C's sign rule for the remainder
         return random.randrange(abs(high - low)) + low
+
+
+def _sleep_through(transfer: Transfer, seconds: int, failure: int) -> tuple[int, GError | None]:
+    """The copy's "run": ``seconds`` one at a time; the count left and any injected error.
+
+    A cancel drops the count below zero (gfal2's cancel callback sets -10);
+    a ``transfer_errno`` (``failure``) ends the run after the first second.
+    """
+    while seconds > 0:
+        if _sleep_second(transfer):
+            seconds = -10  # gfal2's cancel callback
+        seconds -= 1
+        if failure:
+            return seconds, _fail(failure)
+    return seconds, None
+
+
+def _target_mismatch(target: str, source: str | None, user: str) -> GError | None:
+    """The destination checksum check: against the source's (when checked) or the user's."""
+    if source is not None:
+        if not _checksums_match(source, target):
+            return GError("Source and destination checksums do not match", errno.EIO)
+    elif not _checksums_match(user, target):
+        return GError("User and destination checksums do not match", errno.EIO)
+    return None
 
 
 def _sleep_second(transfer: Transfer) -> bool:

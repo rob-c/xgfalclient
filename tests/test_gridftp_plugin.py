@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """The gridftp plugin through the gfal2 API, against the in-process server."""
 
 from __future__ import annotations
@@ -15,33 +14,34 @@ from typing import Any
 import pytest
 
 import xgfalclient
-from conftest import needs_peer_chain
-from test_gridftp_helpers import (  # noqa: F401 - fixtures
+from test_gridftp_helpers import (
     GROUP,
     Events,
     FakeServer,
-    _fast_polls,
     code_of,
-    ftp,
-    gctx,
-    gsi,
-    gsi_pair,
     login_script,
     make_gsi,
     plugin_of,
     write,
 )
+from test_gridftp_helpers import _fast_polls as _fast_polls
+from test_gridftp_helpers import ftp as ftp
+from test_gridftp_helpers import gctx as gctx
+from test_gridftp_helpers import gsi as gsi
+from test_gridftp_helpers import gsi_pair as gsi_pair
 from xgfalclient.errors import ECOMM, GError
 from xgfalclient.plugins.gridftp import plugin as gridftp_plugin
 from xgfalclient.plugins.gridftp.data import DataConn
 from xgfalclient.testing.gridftp import FEATURES, GridFTPServer
 from xgfalclient.testing.pki import PKI
+from xgfalclient.types import TransferParameters
+from xgfalclient.url import parse
 
 Ctx = xgfalclient.Gfal2Context
 
 
 def test_local_download_refuses_zero_pwrite_progress(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(gridftp_plugin.os, "pwrite", lambda *_: 0)
+    monkeypatch.setattr(os, "pwrite", lambda *_: 0)
     with pytest.raises(OSError) as caught:
         gridftp_plugin._pwrite(123, memoryview(b"payload"), 0)
     assert caught.value.errno == errno.EIO
@@ -53,7 +53,8 @@ def root_of(server: GridFTPServer) -> Path:
 
 @pytest.fixture(params=["ftp", "gsi"])
 def server(request: pytest.FixtureRequest) -> GridFTPServer:
-    return request.getfixturevalue(request.param)  # type: ignore[no-any-return]
+    found: GridFTPServer = request.getfixturevalue(request.param)
+    return found
 
 
 # -- namespace -------------------------------------------------------------------
@@ -173,6 +174,7 @@ def test_listdir_and_opendir(gctx: Ctx, server: GridFTPServer) -> None:
         dirent, info = directory.readpp()
         if dirent is None:
             break
+        assert info is not None
         entries[dirent.d_name] = info
     assert entries["a"].st_size == 3 and entries["sub"].is_dir() and entries["."].is_dir()
     assert code_of(lambda: gctx.listdir(server.url("/nope")))[0] == errno.ENOENT
@@ -385,7 +387,6 @@ def test_gsi_without_delegation(gctx: Ctx, gsi: GridFTPServer) -> None:
 # -- files ------------------------------------------------------------------------
 
 
-@needs_peer_chain
 @pytest.mark.parametrize("option", ["", "DCAU", "ENCRYPTION"])
 def test_read_handles(gctx: Ctx, gsi: GridFTPServer, option: str) -> None:
     if option:
@@ -498,18 +499,18 @@ def test_write_handles(gctx: Ctx, server: GridFTPServer) -> None:
         handle.write("def")
     assert (root_of(server) / "w").read_bytes() == b"abcdef"
     plugin = plugin_of(gctx)
-    handle = plugin.open(server.url("/x"), os.O_WRONLY | os.O_CREAT, size=3)
-    handle.write(b"xyz")
-    handle.lseek(3)  # where the stream is: nothing to do
-    handle.lseek(1)  # elsewhere: the upload is committed, and ESTO takes over
+    upload = plugin.open(server.url("/x"), os.O_WRONLY | os.O_CREAT, size=3)
+    upload.write(b"xyz")
+    upload.lseek(3)  # where the stream is: nothing to do
+    upload.lseek(1)  # elsewhere: the upload is committed, and ESTO takes over
     assert (root_of(server) / "x").read_bytes() == b"xyz"
-    handle.write(b"Y")
-    assert handle.pwrite(b"!", 0) == 1
-    handle.lseek(10)
-    handle.close()
-    handle.close()
-    assert code_of(lambda: handle.write(b"late"))[0] == errno.EBADF
-    assert code_of(lambda: handle.pwrite(b"late", 0))[0] == errno.EBADF
+    upload.write(b"Y")
+    assert upload.pwrite(b"!", 0) == 1
+    upload.lseek(10)
+    upload.close()
+    upload.close()
+    assert code_of(lambda: upload.write(b"late"))[0] == errno.EBADF
+    assert code_of(lambda: upload.pwrite(b"late", 0))[0] == errno.EBADF
     assert (root_of(server) / "x").read_bytes() == b"!Yz"
     assert "ALLO 3" in server.log and "ESTO A 1 /x" in server.log
 
@@ -539,7 +540,7 @@ def test_write_timeout(gctx: Ctx, ftp: GridFTPServer, monkeypatch: pytest.Monkey
     handle = gctx.open(ftp.url("/w"), "w")
 
     def stalled(self: DataConn, data: object) -> None:
-        raise socket.timeout("timed out")  # no strerror: the exception is the text
+        raise TimeoutError("timed out")  # no strerror: the exception is the text
 
     monkeypatch.setattr(DataConn, "sendall", stalled)
     code, message = code_of(lambda: handle.write(b"x"))
@@ -640,6 +641,16 @@ def test_ipv6_control_connection(gctx: Ctx, tmp_path: Path) -> None:
         assert any(line.startswith("EPRT |2|::1|") for line in server.log)
 
 
+def test_server_url_brackets_an_ipv6_host(gctx: Ctx, tmp_path: Path) -> None:
+    root = tmp_path / "v6url"
+    write(root / "f", b"six")
+    with GridFTPServer(root, host="::1") as server:
+        assert server.url("/f") == f"ftp://[::1]:{server.port}/f"
+        assert gctx.open(server.url("/f"), "r").read_bytes(10) == b"six"
+    with GridFTPServer(root, host="127.0.0.1") as server:
+        assert server.url() == f"ftp://127.0.0.1:{server.port}/"
+
+
 def test_advertised_unspecified_address(gctx: Ctx, tmp_path: Path) -> None:
     root = tmp_path / "r"
     write(root / "f", b"data")
@@ -660,7 +671,7 @@ def test_passive_connection_refused(gctx: Ctx, ftp: GridFTPServer) -> None:
 # -- copies -----------------------------------------------------------------------
 
 
-def _params(gctx: Ctx, streams: int = 0, events: Events | None = None) -> object:
+def _params(gctx: Ctx, streams: int = 0, events: Events | None = None) -> TransferParameters:
     params = gctx.transfer_parameters()
     params.overwrite = True
     params.nbstreams = streams
@@ -678,7 +689,6 @@ def test_copy_check(gctx: Ctx) -> None:
     assert not plugin.copy_check("gsiftp://b/y", "https://h/x")
 
 
-@needs_peer_chain
 @pytest.mark.parametrize("streams", [0, 3])
 @pytest.mark.parametrize("option", ["", "DCAU", "ENCRYPTION"])
 def test_upload_and_download(
@@ -801,7 +811,7 @@ def test_copy_cancel(gctx: Ctx, ftp: GridFTPServer, tmp_path: Path) -> None:
     source = write(tmp_path / "s", b"x" * 100)
     ftp.faults["STOR"] = "hang"
     params = _params(gctx)
-    params.timeout = 1  # type: ignore[attr-defined]
+    params.timeout = 1
     code, _ = code_of(lambda: gctx.filecopy(params, "file://" + str(source), ftp.url("/y")))
     assert code == errno.ETIMEDOUT
 
@@ -822,7 +832,7 @@ def test_third_party(
     events = Events()
     progress: list[int] = []
     params = _params(gctx, streams, events)
-    params.monitor_callback = lambda *args: progress.append(args[4])  # type: ignore[attr-defined]
+    params.monitor_callback = lambda *args: progress.append(args[4])
     gctx.filecopy(params, one.url("/src"), two.url("/dst"))
     assert (root_of(two) / "dst").read_bytes() == data
     assert ("GSIFTP", "TRANSFER:TYPE", "3rd push") in events.stages()
@@ -830,7 +840,6 @@ def test_third_party(
     assert progress[-1] == len(data)
 
 
-@needs_peer_chain
 def test_third_party_dcau_and_encryption(
     gctx: Ctx, gsi_pair: tuple[GridFTPServer, GridFTPServer]
 ) -> None:
@@ -990,12 +999,12 @@ def test_upload_and_download_checks(gctx: Ctx, ftp: GridFTPServer, tmp_path: Pat
     source = write(tmp_path / "s", b"abc")
     write(root_of(ftp) / "f", b"old")
     params = _params(gctx)
-    params.overwrite = False  # type: ignore[attr-defined]
+    params.overwrite = False
     code, _ = code_of(lambda: gctx.filecopy(params, "file://" + str(source), ftp.url("/f")))
     assert code == errno.EEXIST and (root_of(ftp) / "f").read_bytes() == b"old"
     events = Events()
     params = _params(gctx, events=events)
-    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")  # type: ignore[attr-defined]
+    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")
     gctx.filecopy(params, "file://" + str(source), ftp.url("/f"))
     stages = [stage for _, stage, _ in events.stages()]
     assert stages[3:] == [
@@ -1019,7 +1028,7 @@ def test_upload_and_download_checks(gctx: Ctx, ftp: GridFTPServer, tmp_path: Pat
     assert not (root_of(ftp) / "g").exists()
     # Strict mode checks nothing and removes nothing.
     params = _params(gctx)
-    params.strict_copy = True  # type: ignore[attr-defined]
+    params.strict_copy = True
     assert code_of(lambda: gctx.filecopy(params, "file://" + str(source), ftp.url("/h")))[0] == (
         ECOMM
     )
@@ -1045,7 +1054,7 @@ def test_third_party_events_and_order(
     write(root_of(two) / "dst", b"old")
     events = Events()
     params = _params(gctx, events=events)
-    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")  # type: ignore[attr-defined]
+    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")
     source, target = one.url("/src"), two.url("/dst")
     gctx.filecopy(params, source, target)
     assert (root_of(two) / "dst").read_bytes() == b"abc"
@@ -1072,8 +1081,8 @@ def test_third_party_destination_checks(
     source, target = one.url("/src"), two.url("/dst")
     events = Events()
     params = _params(gctx, events=events)
-    params.overwrite = False  # type: ignore[attr-defined]
-    params.create_parent = True  # type: ignore[attr-defined]
+    params.overwrite = False
+    params.create_parent = True
     assert code_of(lambda: gctx.filecopy(params, source, target)) == (
         errno.EEXIST,
         f"DESTINATION EXISTS  Destination already exist {target}, Cancel",
@@ -1152,7 +1161,7 @@ def test_third_party_checksums(gctx: Ctx, gsi_pair: tuple[GridFTPServer, GridFTP
 
     def copy(mode: Any, value: str, events: Events | None = None, **extra: Any) -> None:
         params = _params(gctx, events=events)
-        params.set_checksum(mode, "ADLER32", value)  # type: ignore[attr-defined]
+        params.set_checksum(mode, "ADLER32", value)
         for name, setting in extra.items():
             setattr(params, name, setting)
         gctx.filecopy(params, source, target)
@@ -1198,7 +1207,10 @@ def test_third_party_checksums(gctx: Ctx, gsi_pair: tuple[GridFTPServer, GridFTP
     del two.faults["CKSM"]
     events = Events()
     copy(mode.both, good, events)
-    sides = [(stage, int(e.side)) for e, (_, stage, _) in zip(events.items, events.stages())]
+    sides = [
+        (stage, int(e.side))
+        for e, (_, stage, _) in zip(events.items, events.stages(), strict=False)
+    ]
     assert ("CHECKSUM:ENTER", 0) not in sides and ("CHECKSUM:ENTER", 1) in sides
 
 
@@ -1222,7 +1234,7 @@ def test_third_party_streams_and_buffers(
     one, two = gsi_pair
     write(root_of(one) / "src", b"abc")
     params = _params(gctx, 4)
-    params.tcp_buffersize = 1048576  # type: ignore[attr-defined]
+    params.tcp_buffersize = 1048576
     gctx.set_opt_integer(GROUP, "RD_NB_STREAM", 2)  # overrides nbstreams, as in gfal2
     gctx.filecopy(params, one.url("/src"), two.url("/dst"))
     assert "OPTS RETR Parallelism=2,2,2;" in one.log
@@ -1315,8 +1327,8 @@ def test_host_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
     log = plugin_of.__globals__["xgfalclient"].creat_context().plugin("gsiftp://h/", "stat").log
     assert resolve("gsiftp://u@h:2811/p?q", "x", log) == "gsiftp://u@name:2811/p?q"
     assert resolve("gsiftp://h/p", "x", log) == "gsiftp://name/p"
-    assert module._explicit_port(module.parse("gsiftp://[::1]/p")) == 0
-    assert module._explicit_port(module.parse("gsiftp://[::1]:5/p")) == 5
+    assert module._explicit_port(parse("gsiftp://[::1]/p")) == 0
+    assert module._explicit_port(parse("gsiftp://[::1]:5/p")) == 5
 
 
 def test_gridftp_v2_get_and_put(gctx: Ctx, tmp_path: Path) -> None:
@@ -1385,9 +1397,9 @@ def test_bulk_copy(gctx: Ctx, gsi_pair: tuple[GridFTPServer, GridFTPServer]) -> 
     write(root_of(two) / "file", b"f")
     events = Events()
     params = _params(gctx, events=events)
-    params.overwrite = False  # type: ignore[attr-defined]
-    params.create_parent = True  # type: ignore[attr-defined]
-    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")  # type: ignore[attr-defined]
+    params.overwrite = False
+    params.create_parent = True
+    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")
     pairs = [
         (one.url("/a"), two.url("/p/a")),
         (one.url("/missing"), two.url("/p/m")),
@@ -1423,7 +1435,7 @@ def test_bulk_copy_checks(gctx: Ctx, gsi_pair: tuple[GridFTPServer, GridFTPServe
     one, two = gsi_pair
     write(root_of(one) / "a", b"abc")
     params = _params(gctx)
-    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")  # type: ignore[attr-defined]
+    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")
     pairs = [(one.url("/a"), two.url("/x"))]
     assert _bulk(gctx, params, pairs, ["024D0127"]) == [None]
     (error,) = _bulk(gctx, params, pairs, ["deadbeef"])
@@ -1450,8 +1462,8 @@ def test_bulk_copy_checks(gctx: Ctx, gsi_pair: tuple[GridFTPServer, GridFTPServe
     (error,) = _bulk(gctx, params, [(one.url("/a"), two.url("/z"))])
     assert error is not None and error.code == ECOMM
     del one.after["RETR"]
-    params.strict_copy = True  # type: ignore[attr-defined]
-    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")  # type: ignore[attr-defined]
+    params.strict_copy = True
+    params.set_checksum(xgfalclient.checksum_mode.both, "ADLER32", "")
     assert _bulk(gctx, params, pairs) == [None]
     # Mixed pairs are copied one by one, as the core would.
     params = _params(gctx)
@@ -1463,7 +1475,7 @@ def test_bulk_copy_checks(gctx: Ctx, gsi_pair: tuple[GridFTPServer, GridFTPServe
     assert _bulk(gctx, params, [("file://" + str(local), two.url("/up"))]) == [None]
     # A bulk entry with no value: the destination is checksummed, but against nothing.
     params = _params(gctx)
-    params.set_checksum(xgfalclient.checksum_mode.target, "ADLER32", "x")  # type: ignore[attr-defined]
+    params.set_checksum(xgfalclient.checksum_mode.target, "ADLER32", "x")
     assert _bulk(gctx, params, [(one.url("/a"), two.url("/t"))], [""]) == [None]
 
 

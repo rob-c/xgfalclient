@@ -1,7 +1,6 @@
 """The ``srm://`` plugin's tape operations and copies."""
 
 # The shared fixtures come from test_srm; ruff sees each use as a redefinition.
-# ruff: noqa: F811
 
 from __future__ import annotations
 
@@ -11,9 +10,15 @@ from pathlib import Path
 import pytest
 
 import xgfalclient
-from test_srm import GROUP, _fast_polls, _no_bdii, fails, root, sctx, srm  # noqa: F401
+from test_srm import GROUP, fails
+from test_srm import _fast_polls as _fast_polls
+from test_srm import _no_bdii as _no_bdii
+from test_srm import root as root
+from test_srm import sctx as sctx
+from test_srm import srm as srm
 from xgfalclient.errors import GError
 from xgfalclient.plugins.srm import plugin as srm_plugin
+from xgfalclient.plugins.srm.plugin import SRMPlugin
 from xgfalclient.testing.srm import SRMServer
 
 # -- tape --------------------------------------------------------------------------
@@ -364,6 +369,7 @@ def test_copy_checksums(
     assert events.stages().count("CHECKSUM:ENTER") == 2
     # The destination checksum against the source's.
     plugin = sctx.plugin(src, "copy")
+    assert isinstance(plugin, SRMPlugin)
     real = plugin._checksum_of
 
     def bad_destination(url: str, algorithm: str, fallback: bool) -> str:
@@ -447,7 +453,9 @@ def test_copy_cleanup_to_a_local_file(
     def unlink(url: str) -> int:
         if url.startswith("file:"):
             raise GError("Permission denied", errno.EACCES)
-        return real(url)
+        result = real(url)
+        assert isinstance(result, int)
+        return result
 
     monkeypatch.setattr(sctx, "unlink", unlink)
     p, events = params(overwrite=True)

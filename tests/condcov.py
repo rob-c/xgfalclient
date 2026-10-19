@@ -36,23 +36,35 @@ import pytest
 
 #: Every package the project ships; each is held to the same rule.
 PACKAGES = ("xgfalclient", "gfal2", "gfal2_util")
-# Moving implementations must not remove their condition-coverage gate.
+# Library modules held to the same rule. Since 0.4.0 the code xgfalclient
+# shares lives in xrdcore, xrdsec and xrdhttp, whose own suites gate every
+# line and branch; this list names the ones whose every decision is reached
+# by gfal2's own use, so that a library change that alters a gfal2 path
+# fails here too, plus two that *are* gfal2 behaviour - xrdsec.discovery
+# (GFAL2, GFAL2_SEED) and xrdhttp.redirects (davix's forwarding rule, the
+# scheme-keeping Location) - whose few decisions on a neighbour's path are
+# taken by tests/test_library_decisions.py. Left to the libraries' gates,
+# because what gfal2 does not reach there is another client's policy:
+# xrdcore.pipeline (unrecycled and depth-1 pumps), xrdcore.report,
+# xrdhttp.expect (xrdclient's Expect threshold), metalink, tape and tpc
+# (XrdCl's readings beside davix's), and xrdsec's credentials, tokens, tls,
+# x509, proxies, voms, aes and rsa (XrdCl's settings, other profiles), and
+# der and p256 (malformed encodings and out-of-range signatures gfal2 never
+# produces; xrdsec's suite holds those cases, which this one used to copy).
+# xrdclient.session.bulk is xrdclient's own: the XRootD plugin's bulk engine.
 SHARED_MODULES = (
-    "xrdclient.copy._pipeline",
-    "xrdclient.http._engine",
-    "xrdclient.http._connection",
-    "xrdclient.http.expect",
-    "xrdclient._xml",
-    "xrdclient.crypto.aes",
-    "xrdclient.crypto.der",
-    "xrdclient.crypto.ed25519",
-    "xrdclient.crypto.p256",
-    "xrdclient.crypto.rsa",
-    "xrdclient.crypto.voms",
-    "xrdclient.crypto.x509",
     "xrdclient.session.bulk",
-    "xrdclient.s3._codec",
-    "xrdclient.s3.sigv4",
+    "xrdcore.checksum",
+    "xrdcore.safexml",
+    "xrdsec.discovery",
+    "xrdsec.ed25519",
+    "xrdhttp.connection",
+    "xrdhttp.engine",
+    "xrdhttp.redirects",
+    "xrdhttp.webdav",
+    "xrdhttp.wire",
+    "xrdhttp.s3.codec",
+    "xrdhttp.s3.sigv4",
 )
 PROBE = "__condcov__"
 ENABLED = bool(os.environ.get("XGFAL_CONDCOV"))
@@ -123,7 +135,9 @@ class Instrumenter(ast.NodeTransformer):
         if isinstance(node.op, ast.Not) and isinstance(node.operand, ast.BoolOp):
             node.operand = self.boolop(node.operand, tested=True)
             return node
-        return self.generic_visit(node)  # type: ignore[return-value]
+        visited = self.generic_visit(node)
+        assert isinstance(visited, ast.expr)
+        return visited
 
     def visit_BoolOp(self, node: ast.BoolOp) -> ast.expr:
         return self.boolop(node, tested=False)

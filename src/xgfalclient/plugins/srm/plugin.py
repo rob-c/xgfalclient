@@ -41,46 +41,92 @@ file's; there is no ``srmPing`` for Castor before each copy and open; and
 
 Messages, ``errno`` values and the requests on the wire were checked, case by
 case, against gfal2 2.23.5 driving :mod:`xgfalclient.testing.srm`.
+
+How the code is laid out (this module is the facade and the plugin class):
+
+* :mod:`._base` - ``_SRMBase``, the plugin's root: options, SURL and BDII
+  resolution, the ``srmLs`` of one SURL, the nearline check, and the TURL
+  requests (``srmPrepareToGet``/``srmPrepareToPut``, ``srmReleaseFiles``,
+  ``srmPutDone``) that I/O and copies share; with the option group, event
+  names and the helpers several modules use.
+* :mod:`._staging` - ``_StagingMixin``: ``bring_online``,
+  ``bring_online_poll``, ``release``, ``abort_bring_online`` and
+  ``archive_poll``.
+* :mod:`._copy` - ``_CopyMixin``: ``copy_check`` and ``copy``, gfal2's
+  ``srm_plugin_filecopy`` with its checks, events and rollback.
+* this module - :class:`SRMPlugin` itself (``_StagingMixin`` +
+  ``_CopyMixin``, plus the class attributes the registry reads), the
+  namespace (``stat``, ``access``, ``mkdir``, ``rmdir``, ``unlink``,
+  ``rename``, ``chmod``), listings (``srmLs`` in ``LS_CHUNK`` pages),
+  ``open`` and :class:`SRMFile`, and the metadata (``checksum``,
+  ``listxattr``, ``getxattr``).
+
+Every name the single-module layout had is re-exported here, so
+``from xgfalclient.plugins.srm.plugin import X`` keeps working. ``LS_CHUNK``,
+which tests patch on this module, is read here by the listing, so the patch
+reaches it; the split modules do not look anything up through this one,
+because nothing patches a name they use.
 """
 
 from __future__ import annotations
 
+# The stdlib names the single-module layout imported stay attributes of this
+# module, and everything below is re-exported with a redundant ``as`` so
+# mypy's strict no-implicit-reexport and ruff both treat it as this module's API.
 import errno
 import json
 import os
 import stat as _stat
-from collections.abc import Callable, Iterator, Sequence
-from typing import Any
+from collections.abc import Callable as Callable
+from collections.abc import Iterator, Sequence
+from typing import Any, TypeVar
 
-from ... import events as ev
-from ...checksum import checksums_match, normalise_name
+from ...checksum import checksums_match as checksums_match
+from ...checksum import normalise_name
 from ...errors import GError
-from ...plugin import O_ACCMODE_MASK, Plugin, PluginFile, StagingResult
-from ...transfer import Transfer, TransferParameters, run_copy
+from ...plugin import O_ACCMODE_MASK, PluginFile
+from ...plugin import Plugin as Plugin
+from ...plugin import StagingResult as StagingResult
+from ...transfer import Transfer as Transfer
+from ...transfer import TransferParameters as TransferParameters
+from ...transfer import run_copy as run_copy
 from ...types import Stat
-from ...url import scheme_of
-from .bdii import Resolver
-from .client import Client, Detail, FileStatus, Space, Status, file_error
-from .transport import SURL, Transport, normalise_path, parse_surl
+from ...url import scheme_of as scheme_of
+from ._base import _ADVICE as _ADVICE
+from ._base import _LOCALITIES as _LOCALITIES
+from ._base import _SOURCE as _SOURCE
+from ._base import _TARGET as _TARGET
+from ._base import CLOSE_ENTER as CLOSE_ENTER
+from ._base import CLOSE_EXIT as CLOSE_EXIT
+from ._base import DEFAULT_3RD_PARTY_PROTOCOLS as DEFAULT_3RD_PARTY_PROTOCOLS
+from ._base import DEFAULT_TURL_PROTOCOLS as DEFAULT_TURL_PROTOCOLS
+from ._base import EVENT_DOMAIN as EVENT_DOMAIN
+from ._base import GET_EVENT as GET_EVENT
+from ._base import GROUP, _by_endpoint, _locality, _stat_error
+from ._base import PUT_EVENT as PUT_EVENT
+from ._base import _SRMBase as _SRMBase
+from ._base import _turl as _turl
+from ._copy import _CopyMixin as _CopyMixin
+from ._copy import _inner as _inner
+from ._copy import _prefixed as _prefixed
+from ._copy import _reorder as _reorder
+from ._staging import _archived as _archived
+from ._staging import _file_failure as _file_failure
+from ._staging import _staging as _staging
+from ._staging import _StagingMixin as _StagingMixin
+from .bdii import Resolver as Resolver
+from .client import Client as Client
+from .client import Detail, Space, Status, file_error
+from .client import FileStatus as FileStatus
+from .transport import SURL
+from .transport import Transport as Transport
+from .transport import normalise_path as normalise_path
+from .transport import parse_surl as parse_surl
 
-__all__ = ["SRMPlugin", "SRMFile", "LS_CHUNK", "XATTRS", "EVENT_DOMAIN"]
+__all__ = ["EVENT_DOMAIN", "LS_CHUNK", "XATTRS", "SRMFile", "SRMPlugin"]
 
-GROUP = "SRM PLUGIN"
-DEFAULT_TURL_PROTOCOLS = ["gsiftp", "rfio", "gsidcap", "dcap", "kdcap"]
-DEFAULT_3RD_PARTY_PROTOCOLS = ["gsiftp", "https", "root"]
-
-#: The domain of the ``SRM:GET``/``SRM:PUT`` events; the others are ``SRM``.
-EVENT_DOMAIN = "GFAL2::PLUGINS::SRM"
-GET_EVENT = "SRM:GET"
-PUT_EVENT = "SRM:PUT"
-CLOSE_ENTER = "CLOSE:ENTER"
-CLOSE_EXIT = "CLOSE:EXIT"
-#: ``checksum_mode`` bits.
-_SOURCE, _TARGET = 1, 2
-_ADVICE = (
-    "fallback on the default service path.This can lead to wrong service path, you should "
-    "use FULL SURL format or register your endpoint into the BDII"
-)
+#: The result type of the TURL file method :meth:`SRMFile._io` runs.
+_T = TypeVar("_T")
 
 #: Entries per ``srmLs`` once a server has said a directory is too big to
 #: list in one go.
@@ -91,8 +137,6 @@ XATTRS = ["user.replicas", "user.status", "srm.type", "spacetoken"]
 
 #: ``TFileType`` to the ``st_mode`` type bits; srm-ifce leaves them 0 when absent.
 _TYPES = {"FILE": _stat.S_IFREG, "DIRECTORY": _stat.S_IFDIR, "LINK": _stat.S_IFLNK}
-
-_LOCALITIES = ("ONLINE", "NEARLINE", "ONLINE_AND_NEARLINE", "LOST", "NONE", "UNAVAILABLE")
 
 
 def _to_stat(detail: Detail) -> Stat:
@@ -106,10 +150,6 @@ def _to_stat(detail: Detail) -> Stat:
         st_mtime=detail.modified,
         st_ctime=detail.created,
     )
-
-
-def _locality(detail: Detail) -> str:
-    return detail.locality if detail.locality in _LOCALITIES else "UNKNOWN"
 
 
 def _space_json(space: Space) -> str:
@@ -127,30 +167,36 @@ def _space_json(space: Space) -> str:
     )
 
 
-def _stat_error(status: Status) -> GError:
-    error = file_error("Ls", status)
-    return GError(f"Error reported from srm_ifce : {error.code} {error.message}", error.code)
-
-
-def _prefixed(prefix: str, exc: GError) -> GError:
-    return GError(f"{prefix} {exc.message}", exc.code)
-
-
 class SRMFile(PluginFile):
-    """A file opened through a TURL; closing it closes the SRM request too."""
+    """A file opened through a TURL; closing it closes the SRM request too.
+
+    The bytes go through ``inner``, the file the TURL's plugin opened
+    (``gsiftp://``, ``root://``...); this wrapper only keeps the SRM side
+    of the bargain. Any I/O failure marks an upload :attr:`failed`, so that
+    close aborts it rather than committing a partial file with
+    ``srmPutDone``. Seeks and size queries move no bytes, so they cannot
+    spoil an upload and are passed straight through.
+    """
 
     def __init__(
         self, plugin: SRMPlugin, surl: SURL, inner: PluginFile, token: str, writing: bool
     ) -> None:
+        """Own ``inner`` and the get or put request ``token`` of ``surl``.
+
+        From here on the file is responsible for the request: :meth:`close`
+        releases, commits or aborts it.
+        """
         super().__init__(surl.url)
         self.plugin = plugin
         self.surl = surl
         self.inner = inner
         self.token = token
         self.writing = writing
+        #: Set by the first failed read, write or close of ``inner``.
         self.failed = False
 
-    def _io(self, method: Any, *args: Any) -> Any:
+    def _io(self, method: Callable[..., _T], *args: Any) -> _T:
+        """Call ``method`` on the TURL's file, noting a failure before re-raising it."""
         try:
             return method(*args)
         except Exception:  # any failure of the TURL's I/O spoils the upload
@@ -158,24 +204,31 @@ class SRMFile(PluginFile):
             raise
 
     def read(self, size: int) -> bytes:
-        return self._io(self.inner.read, size)  # type: ignore[no-any-return]
+        """Up to ``size`` bytes from the TURL's file, at its position."""
+        return self._io(self.inner.read, size)
 
     def readinto(self, buffer: memoryview | bytearray) -> int:
-        return self._io(self.inner.readinto, buffer)  # type: ignore[no-any-return]
+        """Fill ``buffer`` from the TURL's file; the byte count read."""
+        return self._io(self.inner.readinto, buffer)
 
     def pread(self, offset: int, size: int) -> bytes:
-        return self._io(self.inner.pread, offset, size)  # type: ignore[no-any-return]
+        """Up to ``size`` bytes at ``offset``, as the TURL's plugin supports it."""
+        return self._io(self.inner.pread, offset, size)
 
     def write(self, data: bytes | bytearray | memoryview) -> int:
-        return self._io(self.inner.write, data)  # type: ignore[no-any-return]
+        """Write to the TURL's file; a failure dooms the upload to an abort."""
+        return self._io(self.inner.write, data)
 
     def pwrite(self, data: bytes | bytearray | memoryview, offset: int) -> int:
-        return self._io(self.inner.pwrite, data, offset)  # type: ignore[no-any-return]
+        """Write at ``offset``; a failure dooms the upload to an abort."""
+        return self._io(self.inner.pwrite, data, offset)
 
     def lseek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        """Seek the TURL's file (a failure here does not spoil an upload)."""
         return self.inner.lseek(offset, whence)
 
     def size(self) -> int | None:
+        """The TURL's plugin's idea of the size (``None`` when it has none)."""
         return self.inner.size()
 
     def close(self) -> None:
@@ -197,8 +250,14 @@ class SRMFile(PluginFile):
             self.plugin._put_done(self.token, self.surl)
 
 
-class SRMPlugin(Plugin):
-    """gfal2's ``srm`` plugin."""
+class SRMPlugin(_StagingMixin, _CopyMixin):
+    """gfal2's ``srm`` plugin.
+
+    The class attributes are what the plugin registry reads; the behaviour
+    is spread over the mixins (see the module docstring). Every public
+    method fails with :class:`~xgfalclient.errors.GError` worded as gfal2
+    words it.
+    """
 
     name = "srm"
     schemes = ("srm",)
@@ -211,69 +270,10 @@ class SRMPlugin(Plugin):
     copy_manages_checksums = True
     event_domain = "SRM"
 
-    def __init__(self, context: Any) -> None:
-        super().__init__(context)
-        self.transport = Transport(self)
-        self.client = Client(self.transport)
-        self.bdii = Resolver(context.options)
-
-    def close(self) -> None:
-        self.transport.close()
-
-    def handles(self, url: str, operation: str) -> bool:
-        """gfal2's ``^srm://.+$``, case-blind: a bare ``srm://`` is nobody's (93)."""
-        return super().handles(url, operation) and len(url) > len("srm://")
-
-    # -- options -------------------------------------------------------------------
-
-    def _timeout(self) -> float:
-        return float(self.option_timeout())
-
-    def _request_time(self) -> int:
-        return int(self.options.integer(GROUP, "REQUEST_LIFETIME", 3600))
-
-    def _turl_protocols(self) -> list[str]:
-        return list(self.options.string_list(GROUP, "TURL_PROTOCOLS", DEFAULT_TURL_PROTOCOLS))
-
-    def _third_party_protocols(self) -> list[str]:
-        return list(
-            self.options.string_list(GROUP, "TURL_3RD_PARTY_PROTOCOLS", DEFAULT_3RD_PARTY_PROTOCOLS)
-        )
-
-    def _spacetoken(self) -> str:
-        """``SPACETOKENDESC``: the space every request but a copy's asks for."""
-        return str(self.options.string(GROUP, "SPACETOKENDESC", ""))
-
-    def _surl(self, url: str) -> SURL:
-        """``url`` parsed, and its web service found as gfal2 finds it."""
-        surl = parse_surl(url)
-        if surl.full:
-            return surl
-        found = None
-        if self.bdii.enabled():
-            try:
-                found = self.bdii.endpoint(surl.host, self._timeout())
-            except GError as exc:
-                self.log.warning(
-                    "Error while bdii SRM service resolution : %s, %s", exc.message, _ADVICE
-                )
-                return surl
-        if found is None:  # gfal2 says this too when the BDII had nothing, and no error
-            self.log.warning("BDII usage disabled, %s", _ADVICE)
-            return surl
-        self.log.debug("Service endpoint resolution, resolved from BDII %s -> %s", url, found)
-        return surl.with_endpoint(found)
-
     # -- namespace -----------------------------------------------------------------
 
-    def _detail(self, surl: SURL) -> Detail:
-        """``srmLs`` of one SURL, failing as gfal2's stat fails."""
-        detail = self.client.ls([surl], timeout=self._timeout())[0]
-        if not detail.status.ok:
-            raise _stat_error(detail.status)
-        return detail
-
     def _exists(self, surl: SURL) -> Detail | None:
+        """``srmLs`` of ``surl``, or ``None`` when it is missing; other failures raise."""
         try:
             return self._detail(surl)
         except GError as exc:
@@ -282,6 +282,7 @@ class SRMPlugin(Plugin):
             return None
 
     def stat(self, url: str) -> Stat:
+        """One ``srmLs``, as srm-ifce turns it into a ``stat``: see ``_to_stat``."""
         return _to_stat(self._detail(self._surl(url)))
 
     def access(self, url: str, mode: int) -> None:
@@ -303,6 +304,10 @@ class SRMPlugin(Plugin):
         self._makedirs(surl)
 
     def mkdir_rec(self, url: str, mode: int) -> None:
+        """``mkdir -p``: nothing to do for an existing directory, ``ENOTDIR`` for a file.
+
+        ``srmMkdir`` carries no permissions, so ``mode`` is not sent.
+        """
         surl = self._surl(url)
         found = self._exists(surl)
         if found is None:
@@ -323,6 +328,11 @@ class SRMPlugin(Plugin):
         self.client.mkdir(surl)
 
     def rmdir(self, url: str) -> None:
+        """``srmLs`` to refuse a file (``ENOTDIR``), then ``srmRmdir``.
+
+        A non-empty directory fails with ``ENOTEMPTY`` from the server's
+        ``SRM_NON_EMPTY_DIRECTORY``.
+        """
         surl = self._surl(url)
         if self._detail(surl).kind != "DIRECTORY":
             raise GError(
@@ -334,11 +344,17 @@ class SRMPlugin(Plugin):
             raise GError(f"Error report from the srm_ifce {os.strerror(code)} ", code)
 
     def unlink(self, url: str) -> None:
+        """One-file :meth:`unlink_bulk`; ``ENOENT`` for a missing file."""
         result = self.unlink_bulk([url])[0]
         if result is not None:
             raise result
 
     def unlink_bulk(self, urls: Sequence[str]) -> list[GError | None]:
+        """``srmRm`` per endpoint; one answer per URL (``None`` for removed).
+
+        A failed request fails every URL sent with it; a bad URL fails
+        alone.
+        """
         results: list[GError | None] = [None] * len(urls)
         for indices, surls in _by_endpoint(urls, results, self._surl):
             try:
@@ -347,14 +363,16 @@ class SRMPlugin(Plugin):
                 for index in indices:
                     results[index] = exc
                 continue
-            for index, found in zip(indices, statuses):
+            for index, found in zip(indices, statuses, strict=False):
                 results[index] = _rm_error(found.status)
         return results
 
     def rename(self, old: str, new: str) -> None:
+        """``srmMv``, sent to ``old``'s endpoint (an SRM cannot move across services)."""
         self.client.mv(self._surl(old), self._surl(new))
 
     def chmod(self, url: str, mode: int) -> None:
+        """``srmSetPermission`` of the owner and other bits; group bits are not sent."""
         self.client.set_permission(self._surl(url), mode)
 
     # -- listing -------------------------------------------------------------------
@@ -379,6 +397,13 @@ class SRMPlugin(Plugin):
         return top.subpaths
 
     def opendir(self, url: str) -> Iterator[tuple[str, Stat | None]]:
+        """The entries with their ``stat``, as gfal2's ``readdirpp`` gives them.
+
+        One ``srmLs`` of the whole directory first. A server that refuses
+        (``EFBIG``, from ``SRM_TOO_MANY_RESULTS``) is asked again in pages
+        of :data:`LS_CHUNK`, fetched as the iterator is consumed; failures
+        before the first page raise here, later ones from the iterator.
+        """
         surl = self._surl(url)
         try:
             return self._entries(surl, self._page(surl, None, None), None)
@@ -395,6 +420,12 @@ class SRMPlugin(Plugin):
     def _entries(
         self, surl: SURL, page: list[Detail], count: int | None
     ) -> Iterator[tuple[str, Stat | None]]:
+        """Yield ``page``, then (when paging) the next pages until a short one.
+
+        ``count`` ``None`` means ``page`` is the whole listing. A page of
+        exactly ``count`` entries may be the last; the empty page that then
+        follows ends the listing, at the cost of one extra request.
+        """
         offset = 0
         while True:
             for detail in page:
@@ -405,73 +436,28 @@ class SRMPlugin(Plugin):
             page = self._page(surl, offset, count)
 
     def listdir(self, url: str) -> list[str]:
+        """The names of :meth:`opendir`, paging included."""
         return [name for name, _ in self.opendir(url)]
-
-    # -- TURLs -----------------------------------------------------------------------
-
-    def _get_turl(
-        self,
-        surl: SURL,
-        protocols: list[str],
-        timeout: float,
-        spacetoken: str = "",
-        space: str = "",
-    ) -> tuple[str, str]:
-        """``(token, TURL)`` of an ``srmPrepareToGet``."""
-        token, statuses = self.client.prepare_get(
-            [surl],
-            protocols,
-            request_time=self._request_time(),
-            timeout=timeout,
-            spacetoken=spacetoken,
-        )
-        return token, _turl(statuses[0], "PrepareToGet", protocols, space)
-
-    def _put_turl(
-        self,
-        surl: SURL,
-        size: int,
-        protocols: list[str],
-        timeout: float,
-        spacetoken: str = "",
-        space: str = "",
-    ) -> tuple[str, str]:
-        """``(token, TURL)`` of an ``srmPrepareToPut``."""
-        token, statuses = self.client.prepare_put(
-            [surl],
-            [size],
-            protocols,
-            request_time=self._request_time(),
-            timeout=timeout,
-            spacetoken=spacetoken,
-        )
-        return token, _turl(statuses[0], "PrepareToPut", protocols, space)
-
-    def _release_quietly(self, token: str, surl: SURL) -> None:
-        try:
-            self.client.release(token, [surl])
-        except GError as exc:
-            self.log.debug("error on the release request : %s", exc)
-
-    def _put_done(self, token: str, surl: SURL) -> None:
-        found = self.client.put_done(token, [surl])[0]
-        if not found.status.ok:
-            error = file_error("PutDone", found.status)
-            raise GError(
-                f"Error on the surl {surl.wire} while putdone : {error.message}", error.code
-            )
 
     # -- I/O -----------------------------------------------------------------------
 
     def open(self, url: str, flags: int, mode: int = 0o644, size: int | None = None) -> PluginFile:
+        """A TURL for ``TURL_PROTOCOLS``, opened through the core: see :class:`SRMFile`.
+
+        Any write access mode means ``srmPrepareToPut`` (``size`` is its
+        expected size, 0 when unknown), otherwise ``srmPrepareToGet``. If
+        the TURL will not open, the request is released or aborted before
+        the error propagates, so nothing is left pinned. ``mode`` is not
+        sent: the server decides a new file's permissions.
+        """
         surl = self._surl(url)
         protocols = self._turl_protocols()
         writing = bool(flags & O_ACCMODE_MASK)
-        spacetoken = self._spacetoken()
+        request = self._local_request(protocols)
         if writing:
-            token, turl = self._put_turl(surl, size or 0, protocols, self._timeout(), spacetoken)
+            token, turl = self._put_turl(surl, size or 0, request)
         else:
-            token, turl = self._get_turl(surl, protocols, self._timeout(), spacetoken)
+            token, turl = self._get_turl(surl, request)
         try:
             inner = self.context._open(turl, flags, size)
         except GError:
@@ -485,7 +471,13 @@ class SRMPlugin(Plugin):
     # -- metadata ------------------------------------------------------------------
 
     def checksum(self, url: str, algorithm: str, offset: int, length: int) -> str:
-        """The checksum ``srmLs`` reports, else the TURL's plugin's."""
+        """The checksum ``srmLs`` reports, else the TURL's plugin's.
+
+        ``srmLs`` only answers for the whole file and only when its
+        algorithm is the one asked for (compared by normalised name). Any
+        other case gets a get TURL for ``TURL_3RD_PARTY_PROTOCOLS``, asks
+        that plugin, and releases the TURL whatever the result.
+        """
         surl = self._surl(url)
         if offset == 0 and length == 0:
             detail = self._detail(surl)
@@ -494,23 +486,33 @@ class SRMPlugin(Plugin):
                 return detail.checksum_value
         self.log.debug("No valid SRM checksum, fallback to the TURL checksum")
         protocols = self._third_party_protocols()
-        token, turl = self._get_turl(surl, protocols, self._timeout(), self._spacetoken())
+        token, turl = self._get_turl(surl, self._local_request(protocols))
         try:
             return self.context.checksum(turl, algorithm, offset, length)
         finally:
             self._release_quietly(token, surl)
 
     def listxattr(self, url: str) -> list[str]:
+        """:data:`XATTRS`, whatever ``url`` is: no request is made."""
         return list(XATTRS)
 
     def getxattr(self, url: str, name: str) -> str:
+        """gfal2's SRM attributes; ``ENODATA`` for any other name.
+
+        ``user.replicas`` is a get TURL (left pinned, as gfal2 leaves it),
+        ``user.status`` the locality from ``srmLs``, ``srm.type`` the
+        ``backend_type`` from ``srmPing``, and ``spacetoken`` (JSON) the
+        user's space tokens, ``spacetoken.description?<desc>`` the metadata
+        of a description's spaces and ``spacetoken.token?<token>`` one
+        space's.
+        """
         surl = self._surl(url)
         if name == "user.replicas":
             if self.options.boolean(GROUP, "XATTR_FAIL_NEARLINE", False):
                 self._require_online(surl, "")
             # gfal2 leaves this TURL pinned, so that it stays usable.
             protocols = self._turl_protocols()
-            return self._get_turl(surl, protocols, self._timeout(), self._spacetoken())[1]
+            return self._get_turl(surl, self._local_request(protocols))[1]
         if name == "user.status":
             return _locality(self._detail(surl))
         if name == "srm.type":
@@ -526,6 +528,7 @@ class SRMPlugin(Plugin):
         raise GError("not an existing extended attribute", errno.ENODATA)
 
     def _space_xattr(self, surl: SURL, which: str) -> str:
+        """The ``spacetoken[.which]`` attribute: ``which`` is "" or ``kind?value``."""
         if not which:
             return json.dumps(self.client.space_tokens(surl), separators=(",", ":"))
         kind, sep, value = which.partition("?")
@@ -537,359 +540,9 @@ class SRMPlugin(Plugin):
             return _space_json(self.client.space_metadata(surl, [value])[0])
         raise GError(f"Unknown space token attribute {which}", errno.ENODATA)
 
-    def _require_online(self, surl: SURL, prefix: str) -> None:
-        """``COPY_FAIL_NEARLINE``/``XATTR_FAIL_NEARLINE``: refuse a file only on tape.
-
-        As gfal2: exactly ``NEARLINE``; ``NONE``, ``LOST`` and the rest go on
-        to ask for a TURL.
-        """
-        if _locality(self._detail(surl)) == "NEARLINE":
-            raise GError(f"{prefix}The source file is not ONLINE", errno.EINVAL)
-
-    # -- tape ------------------------------------------------------------------------
-
-    def bring_online(
-        self,
-        urls: Sequence[str],
-        metadata: Sequence[str],
-        pintime: int,
-        timeout: int,
-        is_async: bool,
-    ) -> tuple[list[StagingResult], str]:
-        surls = [self._surl(url) for url in urls]
-        token, statuses = self.client.bring_online(
-            surls,
-            self._turl_protocols(),
-            pintime=pintime,
-            timeout=timeout,
-            wait=None if is_async else float(timeout),
-            spacetoken=self._spacetoken(),
-        )
-        return [_staging(found.status, "BringOnline") for found in statuses], token
-
-    def bring_online_poll(self, urls: Sequence[str], token: str) -> list[StagingResult]:
-        surls = [self._surl(url) for url in urls]
-        statuses = self.client.bring_online_status(token, surls)
-        return [_staging(found.status, "StatusOfBringOnlineRequest") for found in statuses]
-
-    def release(self, urls: Sequence[str], token: str) -> list[GError | None]:
-        if not token:
-            # gfal2 will not release without the request's token either.
-            error = GError("Invalid value handle, surl or token", errno.EINVAL)
-            return [error for _ in urls]
-        statuses = self.client.release(token, [self._surl(url) for url in urls])
-        return [_file_failure(found.status, "ReleaseFiles", "release") for found in statuses]
-
-    def abort_bring_online(self, urls: Sequence[str], token: str) -> list[GError | None]:
-        """``srmAbortFiles``; as in gfal2, only a failure of the request itself counts."""
-        self.client.abort_files(token, [self._surl(url) for url in urls])
-        return [None for _ in urls]
-
-    def archive_poll(self, urls: Sequence[str]) -> list[StagingResult]:
-        """Archived means on tape: ``NEARLINE`` or ``ONLINE_AND_NEARLINE``."""
-        results: list[StagingResult] = [False] * len(urls)
-        for indices, surls in _by_endpoint(urls, results, self._surl):
-            try:
-                details = self.client.ls(surls, timeout=self._timeout())
-            except GError as exc:
-                for index in indices:
-                    results[index] = exc
-                continue
-            for index, surl in zip(indices, surls):
-                results[index] = _archived(surl, details)
-        return results
-
-    # -- copies ----------------------------------------------------------------------
-
-    def copy_check(self, source: str, destination: str) -> bool:
-        """An SRM end, and at the other anything that looks like a URL (gfal2's check)."""
-        if scheme_of(source) == "srm":
-            return ":" in destination
-        return scheme_of(destination) == "srm" and ":" in source
-
-    def copy(self, transfer: Transfer) -> None:
-        """gfal2's ``srm_plugin_filecopy``."""
-        source, destination = transfer.source, transfer.destination
-        params = transfer.params
-        get: tuple[str, SURL] | None = None
-        put: tuple[str, SURL] | None = None
-        moved = finished = False
-        transfer.event(ev.PREPARE_ENTER)
-        try:
-            mode = int(transfer.checksum_mode)
-            if self.options.boolean(GROUP, "ALLOW_EMPTY_SOURCE_CHECKSUM", False):
-                mode &= ~_SOURCE
-            algorithm = transfer.checksum_algorithm or self.checksum_type()
-            source_sum = self._source_checksum(transfer, mode, algorithm) if mode else ""
-            size = 0
-            try:
-                size = self.context.stat(source).st_size
-            except GError as exc:
-                self.log.debug(
-                    "Fail to stat src SRM url %s to determine file size, %s", source, exc
-                )
-            protocols = self._third_party_protocols()
-            source_turl, destination_turl = source, destination
-            if scheme_of(source) == "srm":
-                surl = self._surl(source)
-                if self.options.boolean(GROUP, "COPY_FAIL_NEARLINE", False):
-                    self._require_online(surl, "SOURCE SRM_GET_TURL ")
-                wanted = _reorder(list(protocols), destination)
-                token, source_turl = self._copy_turl(
-                    transfer, surl, wanted, params.src_spacetoken, None
-                )
-                get = (token, surl)
-                text = f"Got TURL {source} => {source_turl}"
-                transfer.event(GET_EVENT, text, ev.SOURCE, EVENT_DOMAIN)
-            if scheme_of(destination) == "srm":
-                surl = self._surl(destination)
-                self._prepare_destination(transfer, surl)
-                wanted = _reorder(list(protocols), source)
-                token, destination_turl = self._copy_turl(
-                    transfer, surl, wanted, params.dst_spacetoken, size
-                )
-                put = (token, surl)
-                text = f"Got TURL {destination} => {destination_turl}"
-                transfer.event(PUT_EVENT, text, ev.DESTINATION, EVENT_DOMAIN)
-            transfer.event(ev.PREPARE_EXIT)
-            transfer.check()
-            inner = _inner(transfer, put is not None)
-            moved = True
-            run_copy(self.context, inner, source_turl, destination_turl)
-            transfer.progress(max(size, transfer.transferred), force=True)
-            transfer.event(CLOSE_ENTER, destination, ev.DESTINATION)
-            try:
-                if put is not None:
-                    self._put_done(*put)
-            except GError as exc:
-                raise _prefixed("DESTINATION SRM_PUTDONE", exc) from exc
-            finally:
-                transfer.event(CLOSE_EXIT, destination, ev.DESTINATION)
-            finished = True
-            if mode & _TARGET:
-                self._destination_checksum(transfer, algorithm, source_sum)
-        except BaseException as exc:
-            self._rollback(transfer, exc, put, moved, finished)
-            raise
-        finally:
-            if get is not None:
-                self._release_quietly(*get)
-
-    def _copy_turl(
-        self,
-        transfer: Transfer,
-        surl: SURL,
-        protocols: list[str],
-        spacetoken: str,
-        size: int | None,
-    ) -> tuple[str, str]:
-        """The TURL of one end of a copy (``size`` for a put), prefixed as gfal2 prefixes it."""
-        remaining = transfer.remaining()
-        timeout = remaining if remaining is not None else self._timeout()
-        try:
-            if size is None:
-                return self._get_turl(surl, protocols, timeout, spacetoken, " ")
-            return self._put_turl(surl, size, protocols, timeout, spacetoken, " ")
-        except GError as exc:
-            prefix = "SOURCE SRM_GET_TURL" if size is None else "DESTINATION SRM_PUT_TURL"
-            raise _prefixed(prefix, exc) from exc
-
-    def _prepare_destination(self, transfer: Transfer, surl: SURL) -> None:
-        """``srmRm`` for ``overwrite`` (a missing file is fine) and the parent directory.
-
-        Without ``overwrite`` nothing is checked: ``srmPrepareToPut`` refuses
-        an existing file itself.
-        """
-        destination = transfer.destination
-        if transfer.params.overwrite:
-            try:
-                self.unlink(destination)
-                transfer.event(ev.OVERWRITE, f"Deleted {destination}", ev.DESTINATION)
-            except GError as exc:
-                if exc.code not in (errno.ENOENT, errno.EINVAL):
-                    raise _prefixed("DESTINATION OVERWRITE", exc) from exc
-                self.log.info("%s doesn't exist, carry on", destination)
-        if transfer.params.create_parent:
-            trimmed = destination.rstrip("/")
-            cut = trimmed.rfind("/")
-            try:
-                if cut <= len("srm://"):
-                    raise GError(f"Invalid srm url {destination}", errno.EINVAL)
-                self.mkdir_rec(trimmed[:cut], 0o755)
-            except GError as exc:
-                raise _prefixed("DESTINATION MAKE_PARENT", exc) from exc
-
-    def _checksum_of(self, url: str, algorithm: str, fallback: bool) -> str:
-        """gfal2's ``gfal_srm_checksumG_fallback``: ``srmLs``'s, then the TURL's.
-
-        Without ``fallback`` only ``srmLs`` is asked, and any failure is "".
-        """
-        if fallback:
-            if scheme_of(url) == "srm":
-                return self.checksum(url, algorithm, 0, 0)
-            return str(self.context.checksum(url, algorithm))
-        if scheme_of(url) != "srm":
-            return ""
-        try:
-            detail = self._detail(self._surl(url))
-        except GError:
-            return ""
-        if normalise_name(detail.checksum_type) != normalise_name(algorithm):
-            return ""
-        return detail.checksum_value
-
-    def _source_checksum(self, transfer: Transfer, mode: int, algorithm: str) -> str:
-        transfer.event(ev.CHECKSUM_ENTER, "", ev.SOURCE)
-        try:
-            try:
-                value = self._checksum_of(transfer.source, algorithm, bool(mode & _SOURCE))
-            except GError as exc:
-                raise _prefixed("SOURCE CHECKSUM", exc) from exc
-            user = transfer.user_checksum
-            if mode & _SOURCE and user and not checksums_match(value, user):
-                raise GError(
-                    "SOURCE CHECKSUM MISMATCH User defined checksum and source checksum do not "
-                    f"match {user} != {value}",
-                    errno.EIO,
-                )
-            return value
-        finally:
-            transfer.event(ev.CHECKSUM_EXIT, "", ev.SOURCE)
-
-    def _destination_checksum(self, transfer: Transfer, algorithm: str, source: str) -> None:
-        transfer.event(ev.CHECKSUM_ENTER, "", ev.DESTINATION)
-        try:
-            try:
-                value = self._checksum_of(transfer.destination, algorithm, True)
-            except GError as exc:
-                raise _prefixed("DESTINATION CHECKSUM", exc) from exc
-            user = transfer.user_checksum
-            if not value:
-                raise GError("DESTINATION CHECKSUM Empty destination checksum", errno.EINVAL)
-            if source and not checksums_match(source, value):
-                raise GError(
-                    "TRANSFER CHECKSUM MISMATCH Source and destination checksums do not match "
-                    f"{source} != {value}",
-                    errno.EIO,
-                )
-            if user and not checksums_match(user, value):
-                raise GError(
-                    "TRANSFER CHECKSUM MISMATCH User defined checksum and destination checksums "
-                    f"do not match {user} != {value}",
-                    errno.EIO,
-                )
-        finally:
-            transfer.event(ev.CHECKSUM_EXIT, "", ev.DESTINATION)
-
-    def _rollback(
-        self,
-        transfer: Transfer,
-        exc: BaseException,
-        put: tuple[str, SURL] | None,
-        moved: bool,
-        finished: bool,
-    ) -> None:
-        """gfal2's ``srm_rollback_put``: remove a written destination, or abort the PUT.
-
-        gfal2 also removes a destination that is not an SRM when the copy
-        failed before it began - someone else's file; this does not.
-        """
-        destination = transfer.destination
-        refused = isinstance(exc, GError) and exc.code == errno.EEXIST
-        cleanup = transfer.params.transfer_cleanup
-        written = finished or (moved and put is None)
-        if not refused and written and cleanup:
-            status = 0
-            try:
-                self.context.unlink(destination)
-            except GError as error:
-                if error.code != errno.ENOENT:
-                    self.log.warning("When trying to clean the destination: %s", error.message)
-                    status = error.code
-            transfer.event(ev.CLEANUP, str(status), ev.DESTINATION)
-        elif not finished and put is not None:
-            # Deliberately even without transfer_cleanup: no request is left pending.
-            self.client.abort_request(put[1], put[0])
-            if cleanup:  # some SRMs keep the file after an abort (gfal2's LCGUTIL-358)
-                self.unlink_bulk([destination])
-
-
-def _reorder(protocols: list[str], other: str) -> list[str]:
-    """gfal2's ``reorder_rd3_sup_protocols``: the other end's scheme to the front.
-
-    It swaps places with the head of the list (``gsiftp;root;https`` for a
-    ``davs://`` end - ``davs`` counts as ``https`` - becomes
-    ``https;root;gsiftp``), so that an SRM can hand out a TURL the other end
-    can copy with directly.
-    """
-    scheme = other.partition(":")[0] if ":" in other else ""
-    if scheme == "davs":
-        scheme = "https"
-    if scheme in protocols:
-        index = protocols.index(scheme)
-        protocols[0], protocols[index] = protocols[index], protocols[0]
-    return protocols
-
-
-def _by_endpoint(
-    urls: Sequence[str], results: list[Any], parse: Callable[[str], SURL]
-) -> list[tuple[list[int], list[SURL]]]:
-    """SURLs grouped by endpoint, keeping their indices; bad ones fail in place."""
-    groups: dict[tuple[str, int, str], tuple[list[int], list[SURL]]] = {}
-    for index, url in enumerate(urls):
-        try:
-            surl = parse(url)
-        except GError as exc:
-            results[index] = exc
-            continue
-        indices, surls = groups.setdefault(surl.key, ([], []))
-        indices.append(index)
-        surls.append(surl)
-    return list(groups.values())
-
-
-def _turl(found: FileStatus, short: str, protocols: list[str], space: str) -> str:
-    """The TURL of a get or put, or its failure in gfal2's words.
-
-    gfal2 words a copy's failure ``error on the turl  request`` (an empty
-    ``%s`` between the spaces) and an open's ``error on the turl request``;
-    ``space`` carries that difference.
-    """
-    if not found.status.ok or not found.turl:
-        status = found.status
-        if status.ok:
-            status = Status("SRM_FAILURE", "the server returned no transfer URL")
-        error = file_error(short, status)
-        raise GError(f"error on the turl {space}request : {error.message} ", error.code)
-    if scheme_of(found.turl) not in protocols:
-        raise GError(
-            f"The SRM endpoint returned a protocol that wasn't requested: {found.turl}",
-            errno.EPROTONOSUPPORT,
-        )
-    return found.turl
-
-
-def _inner(transfer: Transfer, srm_destination: bool) -> TransferParameters:
-    """Parameters for the TURL-to-TURL copy: no checksums, no clean-up, events forwarded.
-
-    The SRM plugin does the checksums and the clean-up, and, for an SRM
-    destination, the overwrite and the parent directories, so that copy is
-    strict; to anything else the core checks the destination, as in gfal2.
-    The inner copy reports its progress as the outer copy's.
-    """
-    params = transfer.params.copy()
-    if srm_destination:
-        params.strict_copy = True
-        params.overwrite = False
-    params.transfer_cleanup = False
-    params.set_checksum(0, "", "")
-    left = transfer.remaining()
-    params.timeout = max(1, int(left)) if left is not None else 0
-    params.monitor_callback = lambda _s, _d, _a, _i, done, _e: transfer.progress(done)
-    return params
-
 
 def _rm_error(status: Status) -> GError | None:
+    """One file's ``srmRm`` answer as ``unlink_bulk`` reports it; ``None`` if removed."""
     if status.ok:
         return None
     error = file_error("srmRm", status)
@@ -897,30 +550,3 @@ def _rm_error(status: Status) -> GError | None:
     if code == errno.EINVAL:
         code = errno.ENOENT  # BeStMan answers EINVAL for a missing file; gfal2 says ENOENT
     return GError(f"error reported from srm_ifce, {error.message}", code)
-
-
-def _file_failure(status: Status, short: str, what: str) -> GError | None:
-    if status.ok:
-        return None
-    error = file_error(short, status)
-    return GError(f"error on the {what} request : {error.message} ", error.code)
-
-
-def _staging(status: Status, short: str) -> StagingResult:
-    if status.ok:
-        return True
-    if status.pending:
-        return False
-    error = file_error(short, status)
-    return GError(f"error on the bring online request: {error.message} ", error.code)
-
-
-def _archived(surl: SURL, details: list[Detail]) -> StagingResult:
-    """One SURL's archive state from a bulk ``srmLs``."""
-    wanted = normalise_path(surl.path)
-    found = [item for item in details if normalise_path(item.path) == wanted]
-    if not found:
-        return GError(f"File {surl.url} is not yet archived", errno.EAGAIN)
-    if not found[0].status.ok:
-        return _stat_error(found[0].status)
-    return "NEARLINE" in found[0].locality

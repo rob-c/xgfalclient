@@ -68,7 +68,7 @@ def test_public_names() -> None:
     ):
         assert clasz in classes
     assert commands.GfalCommands.execute_stat.__doc__ == "Stats a file"
-    assert [flags for flags, _ in legacy.CommandLegacy.execute_register.arguments] == [  # type: ignore[attr-defined]
+    assert [flags for flags, _ in vars(legacy.CommandLegacy.execute_register)["arguments"]] == [
         ("lfc",),
         ("surl",),
     ]
@@ -133,7 +133,10 @@ def test_user_commands(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
         def execute_bare(self) -> None:
             raise xgfalclient.GError("bare failure", errno.EIO)
 
-    assert [flags for flags, _ in CommandHello.execute_hello.arguments] == [("file",), ("-x",)]  # type: ignore[attr-defined]
+    assert [flags for flags, _ in vars(CommandHello.execute_hello)["arguments"]] == [
+        ("file",),
+        ("-x",),
+    ]
     assert shell.Gfal2Shell().main(["gfal-hello", "-x", url(tmp_path / "a")]) == 7
     assert capsys.readouterr().out == "HELLO 6\n"
     with pytest.raises(SystemExit):

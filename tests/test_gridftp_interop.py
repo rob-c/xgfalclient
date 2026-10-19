@@ -1,13 +1,14 @@
-# ruff: noqa: E501 - the driver embedded below is a script, kept readable as one
 """The gridftp plugin against a real globus-gridftp-server, side by side with real gfal2.
 
 A throwaway container from ``gfal-ref:latest`` (AlmaLinux 9: globus-gridftp-server
-13.28, gfal2 2.23.5 with its gridftp plugin, Python 3.9) serves ``gsiftp://``
+13.28, gfal2 2.23.5 with its gridftp plugin) serves ``gsiftp://``
 with a host certificate from a fresh test PKI (port 2811) and anonymous
-``ftp://`` (port 2812). A second container on the same docker network runs a
-driver that performs the same operations through ``gfal2`` and through
-``xgfalclient`` (bind-mounted) - each in its own directory of the same
-export - and reports both. Every answer must match, errno and message,
+``ftp://`` (port 2812). A second container on the same docker network, from
+the image with AppStream Python 3.11 added (see :mod:`_interop_image`), runs
+a driver that performs the same operations through ``gfal2`` (on the system
+Python 3.9) and through ``xgfalclient`` (bind-mounted with the host's
+``xrdclient``, on 3.11) - each in its own directory of the same export - and
+reports both. Every answer must match, errno and message,
 except the differences in :data:`KNOWN`. Then ``xgfalclient`` alone runs what
 gfal2 has no API for or does differently: ``MODE E`` with parallel streams,
 ``DCAU A``, ``PROT P``, third-party copies in every combination.
@@ -34,6 +35,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from _interop_image import GFAL2_PYTHON, XGFAL_PYTHON, library_mounts, xgfal_image, xrdclient_src
 
 pytestmark = [
     pytest.mark.interop,
@@ -75,21 +78,29 @@ globus-gridftp-server -p 2812 -aa -anonymous-user griduser -data-interface $ip -
 wait
 """
 
+#: One side per run - ``gfal2`` on the system python3 (keep to 3.9 syntax),
+#: ``xgfal`` on python3.11, which also runs the xgfalclient-only flows - so
+#: that each interpreter imports only the library it can.
 DRIVER = r"""
-import importlib, json, os, sys, time, zlib
-sys.path.insert(0, "/src/src")
-import xgfalclient
-real = importlib.import_module("gfal2")
-HOST = sys.argv[1]
+import json, os, sys, time, zlib
+HOST, SIDE = sys.argv[1:3]
+if SIDE == "xgfal":
+    sys.path[:0] = ["/src/src", "/src/xrd"]
+    import xgfalclient as lib
+else:
+    import gfal2 as lib
 
 def run(fn):
     try:
         return ["ok", fn()]
-    except (real.GError, xgfalclient.GError) as exc:
+    except lib.GError as exc:
         return ["err", exc.code, exc.message]
 
 def stat_tuple(s):
-    return [s.st_mode, s.st_size, s.st_uid, s.st_gid, s.st_nlink, s.st_mtime, s.st_atime, s.st_ctime, s.st_ino]
+    return [
+        s.st_mode, s.st_size, s.st_uid, s.st_gid, s.st_nlink,
+        s.st_mtime, s.st_atime, s.st_ctime, s.st_ino,
+    ]
 
 def ops(g, ctx, scheme, port, name):
     base = f"{scheme}://{HOST}:{port}/data/{name}"
@@ -129,9 +140,16 @@ def ops(g, ctx, scheme, port, name):
         ("mkdir_rec", lambda: ctx.mkdir_rec(base + "/a/b/c", 0o755)),
         ("rmdir not empty", lambda: ctx.rmdir(base + "/a")),
         ("unlink missing", lambda: ctx.unlink(base + "/missing")),
-        ("rename", lambda: (ctx.rename(base + "/hello.txt", base + "/hello2.txt"), ctx.rename(base + "/hello2.txt", base + "/hello.txt"))),
+        ("rename", lambda: (
+            ctx.rename(base + "/hello.txt", base + "/hello2.txt"),
+            ctx.rename(base + "/hello2.txt", base + "/hello.txt"),
+        )),
         ("rename missing", lambda: ctx.rename(base + "/missing", base + "/other")),
-        ("chmod", lambda: (ctx.chmod(base + "/hello.txt", 0o600), oct(ctx.stat(base + "/hello.txt").st_mode), ctx.chmod(base + "/hello.txt", 0o644))[1]),
+        ("chmod", lambda: (
+            ctx.chmod(base + "/hello.txt", 0o600),
+            oct(ctx.stat(base + "/hello.txt").st_mode),
+            ctx.chmod(base + "/hello.txt", 0o644),
+        )[1]),
         ("chmod missing", lambda: ctx.chmod(base + "/missing", 0o600)),
         ("checksum adler32", lambda: ctx.checksum(base + "/hello.txt", "ADLER32")),
         ("checksum md5", lambda: ctx.checksum(base + "/hello.txt", "MD5")),
@@ -149,7 +167,9 @@ def ops(g, ctx, scheme, port, name):
         ("getxattr bad", lambda: ctx.getxattr(base + "/hello.txt", "user.status")),
         ("upload", lambda: copy("file://" + local + ".src", base + "/up.txt") and None),
         ("upload events", lambda: copy("file://" + local + ".src", base + "/up.txt")),
-        ("download", lambda: copy(base + "/up.txt", "file://" + local + ".back") and open(local + ".back").read()),
+        ("download", lambda: (
+            copy(base + "/up.txt", "file://" + local + ".back") and open(local + ".back").read()
+        )),
         ("download events", lambda: copy(base + "/up.txt", "file://" + local + ".back")),
         ("third party", lambda: copy(base + "/up.txt", base + "/tpc.txt")),
         ("third party missing", lambda: copy(base + "/missing", base + "/tpc2.txt")),
@@ -159,16 +179,22 @@ def ops(g, ctx, scheme, port, name):
     for label, fn in table:
         result = run(fn)
         if result[0] == "err":
-            result[2] = result[2].replace(f"/data/{name}", "/data/X").replace(f"/tmp/{name}-", "/tmp/X-").replace(base, "URL")
+            result[2] = (
+                result[2]
+                .replace(f"/data/{name}", "/data/X")
+                .replace(f"/tmp/{name}-", "/tmp/X-")
+                .replace(base, "URL")
+            )
         out[label] = result
     return out
 
 report = {}
 for scheme, port in (("gsiftp", 2811), ("ftp", 2812)):
-    report[scheme] = {
-        "gfal2": ops(real, real.creat_context(), scheme, port, "real"),
-        "xgfal": ops(xgfalclient, xgfalclient.creat_context(), scheme, port, "ours"),
-    }
+    report[scheme] = ops(lib, lib.creat_context(), scheme, port,
+                         "ours" if SIDE == "xgfal" else "real")
+if SIDE != "xgfal":
+    print("REPORT" + json.dumps(report))
+    sys.exit(0)
 
 # xgfalclient alone: parallel streams, data-channel security, big third-party copies.
 def adler(path):
@@ -187,7 +213,7 @@ for scheme, port in (("gsiftp", 2811), ("ftp", 2812)):
         if scheme == "ftp" and option:
             continue
         for streams in (0, 4):
-            ctx = xgfalclient.creat_context()
+            ctx = lib.creat_context()
             if option:
                 ctx.set_opt_boolean("GRIDFTP PLUGIN", option, True)
             base = f"{scheme}://{HOST}:{port}/data/extra"
@@ -206,7 +232,9 @@ for scheme, port in (("gsiftp", 2811), ("ftp", 2812)):
                 return {
                     "up MiB/s": round(50 / up, 1),
                     "down MiB/s": round(50 / down, 1),
-                    "same": adler("/tmp/big.back") == want == ctx.checksum(base + "/big-tpc.bin", "ADLER32"),
+                    "same": adler("/tmp/big.back")
+                    == want
+                    == ctx.checksum(base + "/big-tpc.bin", "ADLER32"),
                 }
             extra[label] = run(flow)
             ctx.free()
@@ -247,19 +275,48 @@ def collect() -> dict[str, Any]:
         os.chmod(work, 0o755)
         _docker("network", "create", network)
         _docker(
-            "run", "-d", "--name", server, "--hostname", HOST, "--network", network,
-            "--network-alias", HOST, "-v", f"{work / 'pki'}:/pki:ro",
-            "-v", f"{work}:/work:ro", IMAGE, "bash", "/work/setup.sh",
-        )  # fmt: skip
+            "run",
+            "-d",
+            "--name",
+            server,
+            "--hostname",
+            HOST,
+            "--network",
+            network,
+            "--network-alias",
+            HOST,
+            "-v",
+            f"{work / 'pki'}:/pki:ro",
+            "-v",
+            f"{work}:/work:ro",
+            IMAGE,
+            "bash",
+            "/work/setup.sh",
+        )
         _docker(
-            "run", "-d", "--name", driver, "--network", network,
+            "run",
+            "-d",
+            "--name",
+            driver,
+            "--network",
+            network,
             # The package alone: src/ also holds the gfal2 shim, which would
             # shadow the real gfal2 and compare this package with itself.
-            "-v", f"{work}:/work:ro",
-            "-v", f"{ROOT / 'src' / 'xgfalclient'}:/src/src/xgfalclient:ro",
-            "-e", "X509_USER_PROXY=/tmp/x509up", "-e", "X509_CERT_DIR=/work/pki/certificates",
-            IMAGE, "sleep", "infinity",
-        )  # fmt: skip
+            "-v",
+            f"{work}:/work:ro",
+            "-v",
+            f"{ROOT / 'src' / 'xgfalclient'}:/src/src/xgfalclient:ro",
+            "-v",
+            f"{xrdclient_src()}:/src/xrd:ro",
+            *library_mounts(),
+            "-e",
+            "X509_USER_PROXY=/tmp/x509up",
+            "-e",
+            "X509_CERT_DIR=/work/pki/certificates",
+            xgfal_image(IMAGE),
+            "sleep",
+            "infinity",
+        )
         _docker(
             "exec",
             driver,
@@ -279,9 +336,15 @@ def collect() -> dict[str, Any]:
             if probe.stdout.count(":1") == 2:
                 break
             subprocess.run(["sleep", "0.5"], check=True)
-        done = _docker("exec", driver, "python3", "/work/driver.py", HOST, timeout=900)
-        line = next(x for x in done.stdout.splitlines() if x.startswith("REPORT"))
-        return json.loads(line[len("REPORT") :])  # type: ignore[no-any-return]
+        sides = {}
+        for side, python in (("gfal2", GFAL2_PYTHON), ("xgfal", XGFAL_PYTHON)):
+            done = _docker("exec", driver, python, "/work/driver.py", HOST, side, timeout=900)
+            line = next(x for x in done.stdout.splitlines() if x.startswith("REPORT"))
+            sides[side] = json.loads(line[len("REPORT") :])
+        report: dict[str, Any] = {"extra": sides["xgfal"].pop("extra")}
+        for scheme in ("gsiftp", "ftp"):
+            report[scheme] = {side: sides[side][scheme] for side in sides}
+        return report
     finally:
         _docker("rm", "-f", server, driver, check=False)
         _docker("network", "rm", network, check=False)
@@ -294,14 +357,44 @@ def report() -> Iterator[dict[str, Any]]:
 
 
 OPERATIONS = [
-    "stat file", "stat dir", "stat missing", "listdir", "readpp", "mkdir", "mkdir exists",
-    "rmdir", "rmdir missing", "mkdir_rec", "rmdir not empty", "unlink missing", "rename",
-    "rename missing", "chmod", "chmod missing", "checksum adler32", "checksum md5",
-    "checksum partial", "checksum bad", "checksum missing", "access", "access missing",
-    "read", "pread", "open missing", "write", "unlink", "listxattr", "getxattr bad",
-    "upload", "upload events", "download", "download events", "third party",
-    "third party missing", "third party result",
-]  # fmt: skip
+    "stat file",
+    "stat dir",
+    "stat missing",
+    "listdir",
+    "readpp",
+    "mkdir",
+    "mkdir exists",
+    "rmdir",
+    "rmdir missing",
+    "mkdir_rec",
+    "rmdir not empty",
+    "unlink missing",
+    "rename",
+    "rename missing",
+    "chmod",
+    "chmod missing",
+    "checksum adler32",
+    "checksum md5",
+    "checksum partial",
+    "checksum bad",
+    "checksum missing",
+    "access",
+    "access missing",
+    "read",
+    "pread",
+    "open missing",
+    "write",
+    "unlink",
+    "listxattr",
+    "getxattr bad",
+    "upload",
+    "upload events",
+    "download",
+    "download events",
+    "third party",
+    "third party missing",
+    "third party result",
+]
 
 
 @pytest.mark.parametrize("scheme", ["gsiftp", "ftp"])
@@ -318,17 +411,23 @@ def test_same_as_gfal2(report: dict[str, Any], scheme: str, operation: str) -> N
 @pytest.mark.parametrize(
     "label",
     [
-        "gsiftp plain x0", "gsiftp plain x4", "gsiftp DCAU x0", "gsiftp DCAU x4",
-        "gsiftp ENCRYPTION x0", "gsiftp ENCRYPTION x4", "ftp plain x0", "ftp plain x4",
+        "gsiftp plain x0",
+        "gsiftp plain x4",
+        "gsiftp DCAU x0",
+        "gsiftp DCAU x4",
+        "gsiftp ENCRYPTION x0",
+        "gsiftp ENCRYPTION x4",
+        "ftp plain x0",
+        "ftp plain x4",
     ],
-)  # fmt: skip
+)
 def test_xgfal_only_flows(report: dict[str, Any], label: str) -> None:
     result = report["extra"][label]
     assert result[0] == "ok", result
     assert result[1]["same"], result
 
 
-if __name__ == "__main__":  # pragma: no cover - a manual report
+if __name__ == "__main__":  # a manual report
     found = collect()
     for scheme in ("gsiftp", "ftp"):
         for operation in OPERATIONS:

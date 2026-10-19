@@ -15,7 +15,8 @@ server, in the same run.
   XrdHttp over TLS, `davs://`; globus-gridftp-server 13 with GSI; dCache
   11.2.7 for `dcap://`/`gsidcap://`; OpenSSH 9.9 for `sftp://`.
 * **Client.** The AlmaLinux 9 system Python 3.9, which is what gfal2's
-  bindings are built for. Both libraries authenticate with the same RFC 3820
+  bindings are built for. (These figures predate 0.4.0, which needs Python
+  3.11+; a rerun must run xgfalclient under AppStream `python3.11` or later.) Both libraries authenticate with the same RFC 3820
   proxy from a throwaway test CA.
 * **Method.** `benchmarks/bench_vs_gfal2.py`: every sample runs in a fresh
   interpreter, so neither library benefits from the other's imports or warm
@@ -113,8 +114,9 @@ server; the same upload through xgfalclient leaves all 268,435,456 bytes,
 byte-identical. There is no gfal2 upload number to compare against.
 
 Passwords are only ever used inside the process - never handed to an `ssh`
-subprocess - so a password login takes the in-process SSH-2 transport. It
-now negotiates aes128-gcm@openssh.com through `cryptography`; the local
+subprocess - so a password login takes an in-process transport: paramiko
+when the `sftp` extra is installed, otherwise the built-in SSH-2
+transport measured here. The built-in transport now negotiates aes128-gcm@openssh.com through `cryptography`; the local
 OpenSSL ctypes and pure-Python fallback backends have been removed. The
 measurements below predate that rebase and need to be rerun for the new backend. Upload there is
 bounded by the server's fsync and its fixed 2 MiB channel window.
@@ -133,6 +135,14 @@ bounded by the server's fsync and its fixed 2 MiB channel window.
   before every listing, no new TLS session per call).
 * **Large writes over TLS.** `socket.sendfile` silently falls back to 8 KiB
   sends on a TLS socket; uploads write 4 MiB at a time instead.
+* **The kernel copies local files.** On Linux, `file://` to `file://` uses
+  `copy_file_range(2)`: no bytes cross into Python, and a filesystem that can
+  (btrfs, XFS, NFS 4.2) shares or offloads them. macOS streams as before.
+* **Cheap start-up.** `import gfal2` imports no xrdclient module, no protocol
+  plugin and no X.509 stack; a plugin is imported the first time a URL of its
+  scheme is used, and the HTTP plugin imports botocore only for `s3://` and
+  its RSA/X.509 stack only for `gcloud://` or proxy delegation.
+  `tests/test_import_cost.py` keeps it that way.
 
 ## Reproducing
 

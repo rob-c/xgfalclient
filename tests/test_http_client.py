@@ -1,26 +1,30 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """The HTTP transport: pooling, retries, redirects, credentials, 100-continue, errors."""
 
 from __future__ import annotations
 
 import errno
-import http.client
-import io
 import socket
 import ssl
 from pathlib import Path
-from typing import Any
 
 import pytest
+from xrdhttp.connection import IncompleteRead, RemoteDisconnected
+from xrdhttp.session import Failure, Route
+from xrdhttp.wire import DIRECT_READ, ShortFileError
 
 import xgfalclient
-from test_http_helpers import dav, dav2, davs, davs_open, hctx, make_server, write  # noqa: F401
+from test_http_helpers import dav as dav
+from test_http_helpers import dav2 as dav2
+from test_http_helpers import davs as davs
+from test_http_helpers import davs_open as davs_open
+from test_http_helpers import hctx as hctx
+from test_http_helpers import write
 from xgfalclient import GError
+from xgfalclient.errors import ECOMM
 from xgfalclient.plugins.http import _client
 from xgfalclient.plugins.http._client import (
     FileBody,
     HTTPClient,
-    Response,
     Target,
     TransportError,
     Upload,
@@ -30,23 +34,18 @@ from xgfalclient.plugins.http._client import (
     transport_error,
     wire_url,
 )
+from xgfalclient.plugins.http.plugin import HTTPPlugin
 from xgfalclient.testing.pki import PKI
 from xgfalclient.testing.webdav import WebDAVServer
 
 
-def plugin(context: xgfalclient.Gfal2Context):  # type: ignore[no-untyped-def]
-    return context.plugin("davs://h/", "stat")
+def plugin(context: xgfalclient.Gfal2Context) -> HTTPPlugin:
+    found = context.plugin("davs://h/", "stat")
+    assert isinstance(found, HTTPPlugin)
+    return found
 
 
 # -- pooling --------------------------------------------------------------------------------
-
-
-def test_connections_are_reused(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
-    write(dav, "/data/f", b"x")
-    for _ in range(5):
-        hctx.stat(dav.url("/data/f"))
-    assert dav.connections == 1
-    assert plugin(hctx).client.idle_count() == 1
 
 
 def test_keep_alive_off(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -69,14 +68,12 @@ def test_idle_connections_are_capped(
     assert plugin(hctx).client.idle_count() == 2
 
 
-def test_stale_pooled_connection_is_retried(
+def test_a_server_that_keeps_hanging_up_is_an_error(
     hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
 ) -> None:
+    """One replacement is the shared suite's; a server that keeps hanging up is an error."""
     write(dav, "/data/f", b"x")
     hctx.stat(dav.url("/data/f"))
-    dav.fault("PROPFIND", drop=True)
-    assert hctx.stat(dav.url("/data/f")).st_size == 1
-    assert dav.connections == 2
     dav.fault("PROPFIND", drop=True, times=50)
     with pytest.raises(GError) as caught:
         hctx.stat(dav.url("/data/f"))
@@ -132,7 +129,7 @@ def test_truncated_bodies(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> 
     dav.fault("GET", status=200, body=b"0123456789", truncate=4)
     with pytest.raises(GError) as caught:
         plugin(hctx)._request("GET", dav.url("/data/f")).read()
-    assert caught.value.code == _client.ECOMM
+    assert caught.value.code == ECOMM
     dav.fault("GET", status=200, body=b"0123456789", truncate=4)
     hctx.set_opt_integer("CORE", "CONN_RETRY", 0)  # with resume off, the drop surfaces
     handle = hctx.open(dav.url("/data/f"), "r")
@@ -143,9 +140,12 @@ def test_truncated_bodies(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> 
     # its stream: a large readinto afterwards must not go looking for it.
     dav.fault("GET", body=b"0123456789", truncate=4)  # the status defaults to 200
     response = plugin(hctx)._request("GET", dav.url("/data/f"))
-    assert (response.read(100), response.read(100)) == (b"0123", b"")
+    assert response.read(100) == b"0123"
     with pytest.raises(GError) as caught:
-        response.readinto(bytearray(_client.DIRECT_READ))
+        response.read(100)  # http.client lets go of its stream at the early end
+    assert "6 bytes of the body never arrived" in caught.value.message
+    with pytest.raises(GError) as caught:
+        response.readinto(bytearray(DIRECT_READ))  # and a large read does not look for it
     assert "6 bytes of the body never arrived" in caught.value.message
 
 
@@ -170,8 +170,10 @@ def test_unread_bodies(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> Non
 
 def test_redirects(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer) -> None:
     write(dav2, "/data/f", b"there")
-    dav.redirects["/data/f"] = dav2.base
-    assert hctx.open(dav.url("/data/f"), "r").read(10) == "there"
+    dav.redirect_prefixes["/data/f"] = dav2.base
+    handle = hctx.open(dav.url("/data/f"), "r")
+    assert handle.read(10) == "there"
+    handle.close()
     write(dav, "/data/g", b"here")
     dav.fault("GET", path="/data/rel", status=302, headers={"Location": "/data/g"})
     assert plugin(hctx)._request("GET", dav.url("/data/rel")).body() == b"here"
@@ -180,12 +182,13 @@ def test_redirects(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebD
     assert (response.status, response.body()) == (200, b"here")
     assert dav.requests[-1].method == "GET"
     dav.fault("GET", path="/data/nowhere", status=302)  # no Location: the answer itself
-    assert plugin(hctx)._request("GET", dav.url("/data/nowhere")).status == 302
+    with plugin(hctx)._request("GET", dav.url("/data/nowhere")) as response:
+        assert response.status == 302
     dav.fault("GET", path="/data/rel", status=302, headers={"Location": "/data/g"})
     response = plugin(hctx).client.request("GET", dav.url("/data/rel"), follow=False)
     assert (response.status, response.header("Location")) == (302, "/data/g")
     response.close()
-    dav.redirects["/data/loop"] = dav.base
+    dav.redirect_prefixes["/data/loop"] = dav.base
     with pytest.raises(GError) as caught:
         hctx.stat(dav.url("/data/loop"))
     assert caught.value.code == errno.ELOOP
@@ -200,20 +203,21 @@ def test_tokens_follow_redirects_but_not_into_clear_text(
 ) -> None:
     write(dav, "/data/f", b"x")
     hctx.cred_set("davs://", hctx.cred_new("BEARER", "SECRET"))
-    davs_open.redirects["/data/"] = f"http://localhost:{dav.port}"
+    davs_open.redirect_prefixes["/data/"] = f"http://localhost:{dav.port}"
     hctx.stat(davs_open.url("/data/f"))
     assert davs_open.requests[-1].header("Authorization") == "Bearer SECRET"
     assert dav.requests[-1].header("Authorization") is None
     write(davs_open, "/moved/data/f", b"x")
-    davs_open.redirects["/data/"] = davs_open.base.replace("127.0.0.1", "localhost") + "/moved"
+    moved = davs_open.base.replace("127.0.0.1", "localhost") + "/moved"
+    davs_open.redirect_prefixes["/data/"] = moved
     hctx.stat(davs_open.url("/data/f"))
     assert davs_open.requests[-1].header("Authorization") == "Bearer SECRET"  # still TLS
-    davs_open.redirects["/data/"] = f"http://127.0.0.1:{dav.port}"
+    davs_open.redirect_prefixes["/data/"] = f"http://127.0.0.1:{dav.port}"
     hctx.stat(davs_open.url("/data/f"))
     assert dav.requests[-1].header("Authorization") == "Bearer SECRET"  # same host
     # From plain http, another host is no worse off than the first.
     hctx.cred_set("dav://", hctx.cred_new("BEARER", "CLEAR"))
-    dav.redirects["/data/"] = f"http://localhost:{dav2.port}"
+    dav.redirect_prefixes["/data/"] = f"http://localhost:{dav2.port}"
     write(dav2, "/data/f", b"x")
     hctx.stat(dav.url("/data/f"))
     assert dav2.requests[-1].header("Authorization") == "Bearer CLEAR"
@@ -264,15 +268,6 @@ def test_basic_auth(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     assert hctx.stat(url).is_dir()
 
 
-def test_bearer_tokens(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
-    dav.tokens = {"GOOD"}
-    with pytest.raises(GError) as caught:
-        hctx.stat(dav.url("/data"))
-    assert caught.value.code == errno.EACCES
-    hctx.cred_set(dav.url("/"), hctx.cred_new("BEARER", "GOOD"))
-    assert hctx.stat(dav.url("/data")).is_dir()
-
-
 def test_bearer_token_keyed_by_host(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     """FTS sets tokens for a bare host name; a URL-prefix one still comes first."""
     dav.tokens = {"HOST", "PREFIX"}
@@ -291,8 +286,18 @@ def test_tokens_in_the_url_stay_in_the_url(
     write(dav, "/data/f", b"x")
     hctx.stat(dav.url("/data/f?authz=Bearer%20T&x=1"))
     request = dav.requests[-1]
-    assert request.path == "/data/f?authz=Bearer%20T&x=1"
+    assert request.target == "/data/f?authz=Bearer%20T&x=1"
     assert request.header("Authorization") is None
+
+
+def test_a_doubled_slash_is_folded_on_the_wire(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
+    """StoRM answers ``400`` to ``/store//file``; the request line is folded
+    (the query, here with an escaped slash, rides along untouched)."""
+    write(dav, "/data/f", b"x")
+    assert hctx.stat(dav.url("/data//f?x=a%2F%2Fb")).st_size == 1
+    assert dav.requests[-1].target == "/data/f?x=a%2F%2Fb"
 
 
 def test_presigned_urls_carry_their_own_credentials(hctx: xgfalclient.Gfal2Context) -> None:
@@ -326,7 +331,7 @@ def test_x509_and_tokens_over_tls(
     assert caught.value.code == errno.EACCES
     request = davs.requests[-1]
     # As gfal2 does, the certificate is presented alongside the token.
-    assert request.header("Authorization") == "Bearer BAD" and request.subject
+    assert request.header("Authorization") == "Bearer BAD" and request.peer is not None
 
 
 def test_tls_verification(
@@ -347,19 +352,11 @@ def test_tls_verification(
 # -- 100-continue --------------------------------------------------------------------------
 
 
-def test_upload_without_100_continue(
-    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(_client, "CONTINUE_WAIT", 0.05)
-    dav.send_continue = False
-    handle = hctx.open(dav.url("/data/a"), "w")
-    handle.write("spooled")
-    handle.close()
-    handle = plugin(hctx).open(dav.url("/data/b"), 0o1101, 0o644, 8)
-    handle.write(b"streamed")
-    handle.close()
-    assert dav.local("/data/a").read_bytes() == b"spooled"
-    assert dav.local("/data/b").read_bytes() == b"streamed"
+def _finished(upload: Upload, status: int) -> None:
+    """Finish ``upload``, check the answer's status, and close the answer (and its connection)."""
+    response = upload.finish()
+    assert response.status == status
+    response.close()
 
 
 def test_upload_redirects_and_extras(
@@ -372,7 +369,7 @@ def test_upload_redirects_and_extras(
         dav.url("/data/a"), 2, headers={"X-Extra": "1"}, cred_url=dav.url("/cred")
     )
     upload.write(b"ab")
-    assert upload.finish().status == 201
+    _finished(upload, 201)
     request = dav.requests[-1]
     assert (request.header("X-Extra"), request.header("Authorization")) == (
         "1",
@@ -380,16 +377,16 @@ def test_upload_redirects_and_extras(
     )
     # From TLS to plain http on another host, before the body: no token goes along.
     hctx.cred_set("davs://", hctx.cred_new("BEARER", "SECRET"))
-    davs_open.redirects["/data/"] = f"http://localhost:{dav.port}"
+    davs_open.redirect_prefixes["/data/"] = f"http://localhost:{dav.port}"
     upload = client.upload(davs_open.url("/data/b"), 2)
     upload.write(b"cd")
-    assert upload.finish().status == 201
+    _finished(upload, 201)
     assert dav.local("/data/b").read_bytes() == b"cd"
     assert dav.requests[-1].header("Authorization") is None
     # A redirect status with no Location is the answer.
     dav.fault("PUT", status=302)
     upload = client.upload(dav.url("/data/c"), 2)
-    assert upload.finish().status == 302
+    _finished(upload, 302)
 
 
 def test_empty_spooled_upload(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -430,6 +427,16 @@ def test_targets() -> None:
     assert Target.of("davs+3rd://h").path == "/"
     assert Target.of("https://h:/").port == 443
     assert Target.of("http://u:p@h:81/").base == "http://h:81"
+    # A doubled slash is a join artifact a WebDAV server folds; send it folded,
+    # so a strict one (StoRM) does not 400 where others succeed.
+    folded = Target.of("davs://h/store//sub///f.bin")
+    assert folded.path == "/store/sub/f.bin"
+    assert folded.url.path == "/store//sub///f.bin"  # the parsed URL is left as given
+    assert Target.of("https://h//a/b").path == "/a/b"
+    # ... but an escaped slash inside a name is a character, not a separator.
+    assert Target.of("davs://h/store/a%2F%2Fb").path == "/store/a%2F%2Fb"
+    # S3 keys are literal: their slashes, doubled or not, are left exactly.
+    assert Target.of("s3://h/bucket/a//b", s3=True).path == "/bucket/a//b"
     # What neon's URI parser refuses, davix calls "not a valid HTTP or Webdav URL" (EIO)
     for bad in ("root://h/p", "https://h:x/", "https://[::1/x", "https://[::1]:bad/x"):
         with pytest.raises(GError) as caught:
@@ -488,8 +495,6 @@ def test_url_helpers() -> None:
     assert wire_url("davs://h/f?authz=x") == "https://h/f?authz=x"
     assert wire_url("cs3s://h/f") == "https://h/f"
     assert wire_url("s3s://h") == "https://h/"
-    assert _client._resolve("dav://h/a/b", "c") == "dav://h/a/c"
-    assert _client._resolve("dav://h/a/b", "https://o/x") == "https://o/x"
     assert config_group("davs://se.example:443/p") == "DAV:SE.EXAMPLE"
     assert config_group("https+3rd://h/p") == "HTTP:H"
     assert config_group("dav://h/p") == "DAV:H"
@@ -514,14 +519,14 @@ def test_transport_errors() -> None:
     same = TransportError("x", 1)
     assert transport_error(same) is same
     cases: list[tuple[BaseException, int]] = [
-        (socket.timeout(), errno.ETIMEDOUT),
+        (TimeoutError(), errno.ETIMEDOUT),
         (ConnectionRefusedError(), errno.ECONNREFUSED),
         (socket.gaierror(8, "nodename"), errno.EHOSTUNREACH),
-        (ssl.SSLError(1, "boom"), _client.ECOMM),
-        (http.client.RemoteDisconnected("gone"), _client.ECOMM),
+        (ssl.SSLError(1, "boom"), ECOMM),
+        (RemoteDisconnected("gone"), ECOMM),
         (OSError(errno.ENETUNREACH, "unreachable"), errno.ENETUNREACH),
-        (OSError("no errno"), _client.ECOMM),
-        (ValueError("odd"), _client.ECOMM),
+        (OSError("no errno"), ECOMM),
+        (ValueError("odd"), ECOMM),
     ]
     for exc, code in cases:
         assert transport_error(exc).code == code
@@ -533,147 +538,47 @@ def test_transport_errors() -> None:
     assert transport_error(verify).code == errno.EACCES
 
 
-def test_line_reader() -> None:
-    assert _client._line(io.BytesIO(b"abc\r\nrest")) == b"abc\r\n"  # type: ignore[arg-type]
-    assert _client._line(io.BytesIO(b"no newline")) == b"no newline"  # type: ignore[arg-type]
-    assert len(_client._line(io.BytesIO(b"x" * 70000))) == 65536  # type: ignore[arg-type]
-
-
-class _FakeSock:
-    def fileno(self) -> int:
-        return -1
-
-
-class _FakeConn:
-    def __init__(self, sock: Any = None) -> None:
-        self.sock = sock
-        self.closed = False
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _Raw:
-    """Stands in for an ``http.client.HTTPResponse``."""
-
-    status = 200
-    reason = "OK"
-    length: int | None = 10
-    fp = None
-    will_close = False
-
-    def __init__(self, fail: bool = True) -> None:
-        self.msg = http.client.HTTPMessage()
-        self.fail = fail
-        self.closed = False
-
-    def _boom(self, *args: Any) -> Any:
-        raise OSError(errno.ECONNRESET, "reset")
-
-    read = readinto = readline = _boom
-
-    def isclosed(self) -> bool:
-        return self.closed
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _Exchange:
-    def __init__(self, response: Any = None, send_error: BaseException | None = None) -> None:
-        self.closed = False
-        self.sent: list[bytes] = []
-        self._response = response
-        self._send_error = send_error
-        self.key = ("http", "h", 80, 0)
-        self.conn = _FakeConn()
-        self.reused = False
-
-    def close(self) -> None:
-        self.closed = True
-
-    def send(self, data: Any) -> None:
-        if self._send_error is not None:
-            raise self._send_error
-        self.sent.append(bytes(data))
-
-    send_body = send
-
-    def response(self) -> Any:
-        if isinstance(self._response, BaseException):
-            raise self._response
-        return self._response
-
-
-def test_response_failures(hctx: xgfalclient.Gfal2Context) -> None:
-    client = HTTPClient(hctx)
-    for method in ("read", "readinto", "readline"):
-        exchange = _Exchange()
-        response = Response(client, exchange, _Raw(), "dav://h/f")  # type: ignore[arg-type]
-        with pytest.raises(GError):
-            getattr(response, method)(bytearray(4) if method == "readinto" else 4)
-        assert exchange.closed and response.closed
-    exchange = _Exchange()
-    response = Response(client, exchange, _Raw(), "dav://h/f")  # type: ignore[arg-type]
-    response.close()  # the drain fails: the connection is dropped, not pooled
-    assert exchange.closed
-    assert response.length is None
-
-
-def test_send_body_hang_ups(hctx: xgfalclient.Gfal2Context) -> None:
-    client = HTTPClient(hctx)
-    raw = _Raw()
-    with pytest.raises(_client._Early) as early:
-        client._send_body(_Exchange(raw, BrokenPipeError()), b"x")  # type: ignore[arg-type]
-    assert early.value.response is raw
-    with pytest.raises(ConnectionResetError):
-        client._send_body(
-            _Exchange(OSError("no answer"), ConnectionResetError()),  # type: ignore[arg-type]
-            b"x",
-        )
-
-
-def test_perform_with_an_early_answer(
-    hctx: xgfalclient.Gfal2Context, monkeypatch: pytest.MonkeyPatch
+def test_the_upload_words_misuse_as_gfal2_does(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
 ) -> None:
-    client = HTTPClient(hctx)
-    raw = _Raw()
-    exchange = _Exchange(raw, BrokenPipeError())
-    exchange.send_head = lambda *args: None  # type: ignore[attr-defined]
-    monkeypatch.setattr(client, "_checkout", lambda *args: exchange)
-    found, used, reusable = client._perform("PUT", Target.of("dav://h/f"), {}, b"body", 5.0, None)
-    assert (found, used, reusable) == (raw, exchange, False)
-
-
-def test_upload_units(hctx: xgfalclient.Gfal2Context) -> None:
-    client = HTTPClient(hctx)
-    raw = _Raw()
-    raw.msg["Content-Length"] = "0"
-    # A hang-up mid-body with an answer waiting: the answer is what finish() gives.
-    upload = Upload(client, _Exchange(raw, BrokenPipeError()), "dav://h/f", 4)  # type: ignore[arg-type]
-    upload.write(b"ab")
-    upload.write(b"cd")  # ignored: the server has answered
-    assert upload.finish().status == 200
-    upload.abort()
-    # A hang-up with no answer.
-    exchange = _Exchange(OSError("gone"), BrokenPipeError())
-    upload = Upload(client, exchange, "dav://h/f", 4)  # type: ignore[arg-type]
-    with pytest.raises(GError):
-        upload.write(b"ab")
-    assert exchange.closed and upload.done
-    # Any other socket failure abandons the upload.
-    exchange = _Exchange(None, socket.timeout())
-    upload = Upload(client, exchange, "dav://h/f", 4)  # type: ignore[arg-type]
+    upload = plugin(hctx).client.upload(dav.url("/data/u"), 4)
     with pytest.raises(GError) as caught:
-        upload.write(b"ab")
-    assert caught.value.code == errno.ETIMEDOUT and exchange.closed
-    # The answer never comes.
-    exchange = _Exchange(http.client.RemoteDisconnected("gone"))
-    upload = Upload(client, exchange, "dav://h/f", 2)  # type: ignore[arg-type]
+        upload.write(b"abcde")
+    assert caught.value.code == errno.EFBIG
     upload.write(b"ab")
-    with pytest.raises(GError):
+    with pytest.raises(GError) as caught:
         upload.finish()
-    assert exchange.closed
+    assert caught.value.code == errno.EIO and "after 2 of 4 bytes" in caught.value.message
+    assert upload.done
+    upload = plugin(hctx).client.upload(dav.url("/data/u"), 2)
+    upload.abort()
+    assert upload.done and upload.early is None
+
+
+def test_session_failures_in_gfal2_words() -> None:
+    errors = _client._ERRORS
+    short = errors.transport(Failure("PUT", "dav://h/f", ShortFileError(3)))
+    assert type(short) is GError and short.code == errno.EIO
+    cut = errors.transport(Failure("GET", "dav://h/f", IncompleteRead(b"", 6)))
+    assert isinstance(cut, TransportError) and "6 bytes of the body never arrived" in str(cut)
+    reset = errors.transport(Failure("GET", "dav://h/f", ConnectionResetError()))
+    assert isinstance(reset, TransportError) and reset.code == ECOMM
+    loop = errors.redirect("GET", "dav://h/f", "more than 10 redirects")
+    assert isinstance(loop, GError) and loop.code == errno.ELOOP
+    with pytest.raises(ValueError) as refused:
+        _client._route("davs://h:port/x")
+    assert (
+        errors.redirect("GET", "davs://h:port/x", "bad", refused.value) is refused.value.__cause__
+    )
+    other = errors.redirect("GET", "ftp://h/x", "bad", ValueError("not HTTP"))
+    assert isinstance(other, GError) and other.code == errno.EIO
+
+
+def test_routes_read_gfal_schemes_and_prepared_hops_alike() -> None:
+    assert _client._route("s3s://bucket.host/k%20ey") == Route(
+        "https", "bucket.host", 443, "/k%20ey"
+    )
+    assert _client._route("http://h:8080/a%2Fb?x=1") == Route("http", "h", 8080, "/a%2Fb?x=1")
 
 
 def test_plugin_close_empties_the_pool(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:

@@ -3,9 +3,11 @@
 python3-gfal2 1.13.1 ships functional tests (``test/functional``, driven by a
 base URL in ``TEST_SRM_BASE`` and friends) and a unit test; gfal2-util 1.9.1
 ships functional tests that shell out to ``gfal-*``. Both run here in the
-``gfal-ref:latest`` image, once with the real toolkit and once with this
-package's ``gfal2`` shim (``src`` mounted on ``PYTHONPATH``), and every test
-that passes with gfal2 must pass here too.
+``gfal-ref:latest`` image, once with the real toolkit on the system Python
+(3.9) and once with this package's ``gfal2`` shim on AppStream Python 3.11
+(``src`` and the host's ``xrdclient`` mounted on ``PYTHONPATH``; see
+:mod:`_interop_image`), and every test that passes with gfal2 must pass here
+too.
 
 The gfal2-python tests are Python 2 (``except E, e``, ``0755``, tabs mixed
 with spaces): a file that does not compile under Python 3 has its tabs
@@ -36,6 +38,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from _interop_image import library_mounts, xgfal_image, xrdclient_src
 
 IMAGE = "gfal-ref:latest"
 ROOT = Path(__file__).resolve().parent.parent
@@ -115,7 +119,9 @@ unittest.TextTestRunner(stream=io.StringIO(), resultclass=Result).run(suite)
 print(json.dumps(results))
 """
 
-#: The driver, run with the image's python3 (3.9).
+#: The driver, run with the image's python3 (3.9). It ports the tests once,
+#: then runs each side's on that side's interpreter: gfal2's bindings exist
+#: only for the system python3, this package only for python3.11.
 DRIVER = r"""
 import glob, json, os, shutil, subprocess, sys, time
 
@@ -123,7 +129,7 @@ def sh(command):
     subprocess.run(command, shell=True, check=True)
 
 def module(side, directory, name, env):
-    proc = subprocess.run([sys.executable, "/io/module_runner.py", name], cwd=directory, env=env,
+    proc = subprocess.run([PYTHONS[side], "/io/module_runner.py", name], cwd=directory, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=900)
     lines = proc.stdout.decode().strip().splitlines()
     return json.loads(lines[-1]) if lines else {"(did not run) " + name: "ERROR"}
@@ -166,13 +172,15 @@ for root in ("/work/fbase", "/data/gt", "/data/gh"):
 BASES = {"file": "file:///work/fbase", "root": "root://localhost:1094//gt",
          "dav": "dav://localhost:8080/gh"}
 SIDES = {"real": dict(os.environ),
-         "ours": dict(os.environ, PYTHONPATH="/src:/xrdclient")}
+         "ours": dict(os.environ, PYTHONPATH="/src:/xrdclient:" + os.environ["PYTHONPATH"])}
+PYTHONS = {"real": sys.executable, "ours": "python3.11", "ours-cli": "python3.11",
+           "ours-scripts": "python3.11"}
 
 report = {"python": {}, "unit": {}, "util": {}}
 for side, env in SIDES.items():
     for label, base in BASES.items():
         for variant, func in (("", "/work/py/functional"), ("-mod", "/work/pymod")):
-            proc = subprocess.run([sys.executable, "/io/runner.py", func, base], env=env,
+            proc = subprocess.run([PYTHONS[side], "/io/runner.py", func, base], env=env,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=600)
             lines = proc.stdout.decode().strip().splitlines()
             found = json.loads(lines[-1]) if lines else {"(did not run)": "ERROR"}
@@ -192,21 +200,20 @@ for variant, env in (("real", SIDES["real"]), ("ours-cli", SIDES["ours"]),
         target = top + "/src/" + name
         if variant == "ours-cli":
             open(target, "w").write(
-                '#!/bin/sh\nexec python3 -m xgfalclient.cli %s "$@"\n' % name)
+                '#!/bin/sh\nexec python3.11 -m xgfalclient.cli %s "$@"\n' % name)
+            os.chmod(target, 0o755)
+        elif variant == "ours-scripts" and "python" in open(script, "rb").readline().decode():
+            # gfal2's scripts, with the shim on PYTHONPATH; their shebang is
+            # the system python3, which cannot import this package.
+            open(target, "w").write('#!/bin/sh\nexec python3.11 %s "$@"\n' % script)
             os.chmod(target, 0o755)
         else:
-            os.symlink(script, target)  # gfal2's scripts; with the shim on PYTHONPATH for ours
+            os.symlink(script, target)
     for test, outcome in module(variant, top + "/test/functional", "test_all", env).items():
         report["util"].setdefault(test, {})[variant] = outcome
     sh("rm -rf /tmp/make /tmp/f1_* /tmp/f2_* /tmp/test_*")
 json.dump(report, open("/io/report.json", "w"))
 """
-
-
-def _xrdclient_src() -> Path:
-    import xrdclient
-
-    return Path(xrdclient.__file__).resolve().parent.parent
 
 
 def run_suites() -> dict[str, dict[str, dict[str, str]]]:
@@ -225,21 +232,25 @@ def run_suites() -> dict[str, dict[str, dict[str, str]]]:
                 "-v",
                 f"{ROOT / 'src'}:/src:ro",
                 "-v",
-                f"{_xrdclient_src()}:/xrdclient:ro",
+                f"{xrdclient_src()}:/xrdclient:ro",
+                *library_mounts(),
                 "-v",
                 f"{PYTHON_SRC}:/upstream/python:ro",
                 "-v",
                 f"{UTIL_SRC}:/upstream/util:ro",
                 "-v",
                 f"{io_dir}:/io",
-                IMAGE,
+                xgfal_image(IMAGE),
                 "python3",
                 "/io/driver.py",
             ],
             check=True,
             timeout=3600,
         )
-        return json.loads(Path(io_dir, "report.json").read_text())  # type: ignore[no-any-return]
+        report: dict[str, dict[str, dict[str, str]]] = json.loads(
+            Path(io_dir, "report.json").read_text()
+        )
+        return report
 
 
 def regressions(report: dict[str, dict[str, dict[str, str]]]) -> list[str]:

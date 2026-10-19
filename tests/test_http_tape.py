@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """The WLCG Tape REST API: bring_online, polls, release, abort, archive status, xattrs."""
 
 from __future__ import annotations
@@ -9,9 +8,9 @@ import json
 import pytest
 
 import xgfalclient
-from test_http_helpers import dav, hctx  # noqa: F401 - fixtures
+from test_http_helpers import dav as dav
+from test_http_helpers import hctx as hctx
 from xgfalclient import GError
-from xgfalclient.plugins.http import _tape
 from xgfalclient.testing.webdav import Tape, WebDAVServer
 
 WELL_KNOWN = "/.well-known/wlcg-tape-rest-api"
@@ -71,8 +70,8 @@ def test_discovery_xattrs(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tap
     url = dav.url("/data/a")
     assert hctx.getxattr(url, "taperestapi.version") == "v1"
     assert hctx.getxattr(url, "taperestapi.uri") == f"{dav.base}/api/v1/"  # as served
-    assert hctx.getxattr(url, "taperestapi.sitename") == "XGFAL-TEST"
-    assert [r.path for r in dav.requests].count(WELL_KNOWN) == 1  # cached
+    assert hctx.getxattr(url, "taperestapi.sitename") == tape.sitename == "fake-site"
+    assert [r.target for r in dav.requests].count(WELL_KNOWN) == 1  # cached
 
 
 @pytest.mark.parametrize(
@@ -128,8 +127,10 @@ def test_discovery_takes_the_highest_version_leniently(
     assert hctx.getxattr(url, "taperestapi.sitename") == "7"
     # A URI without its trailing slash still has calls made under it.
     assert hctx.getxattr(url, "user.status") == "NEARLINE"
-    assert dav.requests[-1].path == "/api/v1/archiveinfo"
-    assert [_tape._parse_version(v) for v in ("v", "v1.2", "", "x1")] == [0, 1, 0, -1]
+    assert dav.requests[-1].target == "/api/v1/archiveinfo"
+    from xrdhttp.tape import api_version
+
+    assert [api_version(v) for v in ("v", "v1.2", "", "x1")] == [0, 1, 0, -1]
 
 
 def test_user_status(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tape: Tape) -> None:
@@ -183,7 +184,7 @@ def test_bring_online_stages_and_returns(
         dav.clear()
         status, token = hctx.bring_online(dav.url("/data/a"), 3600, 60, is_async)
         assert status == 0 and token in tape.requests
-        assert [r.path for r in dav.requests if r.path.startswith("/api")] == ["/api/v1/stage"]
+        assert [r.target for r in dav.requests if r.target.startswith("/api")] == ["/api/v1/stage"]
     stage = dav.requests[-1]
     assert json.loads(stage.body) == {"files": [{"path": "/data/a"}]}  # no pin time
     assert hctx.bring_online_poll(dav.url("/data/a"), token) == 1
@@ -204,7 +205,7 @@ def test_bring_online_lists_and_metadata(
     urls = [dav.url("/data/a"), dav.url("/data/b")]
     errors, token = hctx.bring_online(urls, ['{"activity": "x"}', "[1, 2]"], 3600, 60, True)
     assert errors == [None, None]
-    stage = next(r for r in dav.requests if r.path == "/api/v1/stage")
+    stage = next(r for r in dav.requests if r.target == "/api/v1/stage")
     files = json.loads(stage.body)["files"]
     # Any JSON at all, inserted as it is.
     assert [f.get("targetedMetadata") for f in files] == [{"activity": "x"}, [1, 2]]
@@ -238,7 +239,8 @@ def test_poll_outcomes(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, tape: 
         hctx.bring_online_poll(urls[0], "no-such-request")
     assert (caught.value.code, caught.value.message) == (
         errno.EINVAL,
-        "[Tape REST API] Stage call failed: HTTP 404 : File not found : no such request)",
+        "[Tape REST API] Stage call failed: HTTP 404 : File not found : "
+        '{"message": "no such staging request"})',
     )
 
 

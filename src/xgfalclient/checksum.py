@@ -8,154 +8,86 @@ digest as it goes::
     >>> digest.hexdigest()
     '1e720467'
 
-ADLER32, CRC32, MD5 and the SHA family come from ``zlib`` and ``hashlib``,
-which are C. CRC-32C has no stdlib implementation; a slice-by-eight pure
-Python one is used unless ``google-crc32c`` happens to be importable, in
-which case that is.
+The digests themselves are xrdcore's (:mod:`xrdcore.checksum`,
+:mod:`xrdcore.crc32c`; until 0.4.0 they were reached through xrdclient's
+``crypto.checksum``): ADLER32, CRC32, MD5 and the SHA family come from
+``zlib`` and ``hashlib``, and CRC-32C is ``google-crc32c``'s C extension when
+that is installed, else xrdcore's slice-by-eight pure Python one. One
+implementation serves every client, so a CRC-32C an XRootD paged read checks
+and one a gfal2 copy compares are the same function.
+
+What stays here is gfal2's *naming policy*, which is not XrdCl's:
+
+* the algorithm set is gfal2's - ADLER32, CRC32, CRC32C, MD5 and the SHAs -
+  so an algorithm gfal2 would not know (xrdcore's ``crc64``) is still the
+  ``ValueError`` callers turn into gfal2's "not supported" answer;
+* names are case- and space-insensitive, ``SHA-256`` is ``sha256``, and
+  ``UNIXcksum`` is answered as CRC32, as gfal2's file plugin does;
+* the ADLER32 zero-padding and the leading-zero-insensitive comparison gfal2
+  applies before calling two checksums different.
 """
 
 from __future__ import annotations
 
-import hashlib
-import importlib
-import zlib
-from collections.abc import Callable, Iterable
-from typing import Protocol, Union
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from xrdcore.crc32c import IS_ACCELERATED as IS_ACCELERATED
+    from xrdcore.crc32c import crc32c as crc32c
+    from xrdcore.crc32c import crc32c_py as crc32c_py
 
 __all__ = [
+    "IS_ACCELERATED",
     "Digest",
-    "new",
     "algorithms",
-    "normalise_name",
     "checksum_bytes",
     "checksum_chunks",
     "checksums_match",
-    "format_adler32",
     "crc32c",
-    "IS_ACCELERATED",
+    "crc32c_py",
+    "format_adler32",
+    "new",
+    "normalise_name",
 ]
 
-Buffer = Union[bytes, bytearray, memoryview]
+Buffer = bytes | bytearray | memoryview
 
-_POLY = 0x82F63B78
-_MASK = 0xFFFFFFFF
-
-
-def _tables() -> list[list[int]]:
-    first = []
-    for n in range(256):
-        crc = n
-        for _ in range(8):
-            crc = (crc >> 1) ^ _POLY if crc & 1 else crc >> 1
-        first.append(crc)
-    tables = [first]
-    for k in range(1, 8):
-        tables.append([(v >> 8) ^ first[v & 0xFF] for v in tables[k - 1]])
-    return tables
-
-
-_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7 = _tables()
-
-
-def crc32c_py(data: Buffer, crc: int = 0) -> int:
-    """Slice-by-eight software CRC-32C, chained onto ``crc``."""
-    view = memoryview(data).cast("B")
-    size = len(view)
-    value = (crc ^ _MASK) & _MASK
-    index = 0
-    limit = size - (size % 8)
-    while index < limit:
-        value ^= int.from_bytes(view[index : index + 4], "little")
-        value = (
-            _T7[value & 0xFF]
-            ^ _T6[(value >> 8) & 0xFF]
-            ^ _T5[(value >> 16) & 0xFF]
-            ^ _T4[value >> 24]
-            ^ _T3[view[index + 4]]
-            ^ _T2[view[index + 5]]
-            ^ _T1[view[index + 6]]
-            ^ _T0[view[index + 7]]
-        )
-        index += 8
-    while index < size:
-        value = _T0[(value ^ view[index]) & 0xFF] ^ (value >> 8)
-        index += 1
-    return value ^ _MASK
-
-
-def _accelerated(module: str = "google_crc32c") -> Callable[[Buffer, int], int] | None:
-    """A C CRC-32C from an optional package, if one is importable."""
-    try:
-        extend = importlib.import_module(module).extend
-    except (ImportError, AttributeError):
-        return None
-
-    def crc32c_c(data: Buffer, crc: int = 0) -> int:
-        return int(extend(crc, bytes(data)))
-
-    return crc32c_c
-
-
-def _select(fast: Callable[[Buffer, int], int] | None) -> Callable[[Buffer, int], int]:
-    """The accelerated CRC-32C if there is one, else the pure Python one."""
-    return fast or crc32c_py
-
-
-_FAST = _accelerated()
-crc32c: Callable[[Buffer, int], int] = _select(_FAST)
-IS_ACCELERATED = _FAST is not None
+#: What gfal2 can compute, in the order gfal2 lists them: the rolling
+#: checksums first, then the hashes.
+_GFAL2_ALGORITHMS = (
+    "adler32",
+    "crc32",
+    "crc32c",
+    "md5",
+    "sha1",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+)
+#: Spellings servers and users use for the same algorithm. ``UNIXcksum`` is
+#: answered with CRC32 because gfal2's file plugin does so; it is *not* the
+#: POSIX ``cksum`` algorithm, and a value from a real ``cksum`` will differ.
+_ALIASES = {"sha-1": "sha1", "sha-256": "sha256", "sha-512": "sha512", "unixcksum": "crc32"}
 
 
 class Digest(Protocol):
+    """The incremental digest shape every algorithm here has."""
+
+    #: The algorithm's lower-case name, as :func:`normalise_name` spells it.
     name: str
 
-    def update(self, data: Buffer) -> None: ...
-
-    def hexdigest(self) -> str: ...
-
-
-class _Rolling:
-    """A 32-bit rolling checksum (``zlib.adler32`` shaped) as a digest."""
-
-    __slots__ = ("_step", "_value", "name")
-
-    def __init__(self, name: str, step: Callable[[Buffer, int], int], seed: int) -> None:
-        self.name = name
-        self._step = step
-        self._value = seed
-
     def update(self, data: Buffer) -> None:
-        self._value = self._step(data, self._value)
-
-    @property
-    def value(self) -> int:
-        return self._value
+        """Feed ``data`` in; may be called any number of times, in stream order."""
 
     def hexdigest(self) -> str:
-        return f"{self._value:08x}"
+        """The digest of everything fed so far, as lower-case hex.
 
-
-class _Hash:
-    __slots__ = ("_hash", "name")
-
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self._hash = hashlib.new(name)
-
-    def update(self, data: Buffer) -> None:
-        self._hash.update(data)
-
-    def hexdigest(self) -> str:
-        return self._hash.hexdigest()
-
-
-_ROLLING: dict[str, tuple[Callable[[Buffer, int], int], int]] = {
-    "adler32": (zlib.adler32, 1),
-    "crc32": (zlib.crc32, 0),
-    "crc32c": (lambda data, crc: crc32c(data, crc), 0),
-}
-_HASHES = ("md5", "sha1", "sha224", "sha256", "sha384", "sha512")
-_ALIASES = {"sha-1": "sha1", "sha-256": "sha256", "sha-512": "sha512", "unixcksum": "crc32"}
+        For ADLER32 and the CRCs this is the 32-bit value as eight hex
+        digits; storage elements that drop leading zeros are reconciled by
+        :func:`format_adler32` and :func:`checksums_match`, not here.
+        """
 
 
 def normalise_name(name: str) -> str:
@@ -165,27 +97,54 @@ def normalise_name(name: str) -> str:
 
 
 def algorithms() -> tuple[str, ...]:
-    return (*_ROLLING, *_HASHES)
+    """Every algorithm gfal2 (and so this module) computes."""
+    return _GFAL2_ALGORITHMS
 
 
-def new(name: str) -> _Rolling | _Hash:
-    """A fresh incremental digest; ``ValueError`` for an unknown algorithm."""
+def new(name: str) -> Digest:
+    """A fresh incremental digest; ``ValueError`` for an algorithm gfal2 does not know."""
+    from xrdcore.checksum import new as shared_new
+
     key = normalise_name(name)
-    if key in _ROLLING:
-        step, seed = _ROLLING[key]
-        return _Rolling(key, step, seed)
-    if key in _HASHES:
-        return _Hash(key)
-    raise ValueError(f"unknown checksum algorithm {name!r}")
+    if key not in _GFAL2_ALGORITHMS:
+        raise ValueError(f"unknown checksum algorithm {name!r}")
+    return shared_new(key)
+
+
+#: The names resolved from :mod:`xrdcore.crc32c` on first use. ``crc32c_py``
+#: is the pure Python CRC-32C, accelerator or no, which the test servers use
+#: to compute what a client must match.
+_SHARED = frozenset({"crc32c", "IS_ACCELERATED", "crc32c_py"})
+
+
+def __getattr__(name: str) -> object:
+    """``crc32c``, ``crc32c_py`` and ``IS_ACCELERATED``, from xrdcore when first asked for.
+
+    ``import gfal2`` must stay cheap (tests/test_import_cost.py): probing for
+    the ``google-crc32c`` accelerator is not free, and the copy core imports
+    this module for its comparison helpers alone.
+    """
+    if name in _SHARED:
+        import importlib
+
+        # By path: the ``xrdcore.crc32c`` module itself, never an attribute
+        # of the package that might shadow it.
+        shared = importlib.import_module("xrdcore.crc32c")
+        value = getattr(shared, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def checksum_bytes(name: str, data: Buffer) -> str:
+    """Hex digest of ``data``."""
     digest = new(name)
     digest.update(data)
     return digest.hexdigest()
 
 
 def checksum_chunks(name: str, chunks: Iterable[Buffer]) -> str:
+    """Hex digest of a stream of chunks."""
     digest = new(name)
     for chunk in chunks:
         digest.update(chunk)
@@ -203,7 +162,13 @@ def format_adler32(value: str) -> str:
 
 
 def checksums_match(first: str, second: str) -> bool:
-    """Equal ignoring case, surrounding space, and leading zeros."""
+    """Equal ignoring case, surrounding space, and leading zeros.
+
+    gfal2's copy compares checksums this way so that a server's unpadded
+    ADLER32 (``"1e72"``) and a locally computed one (``"00001e72"``) agree;
+    hex digests of the hash family are fixed-width, so stripping zeros
+    cannot make two different ones equal.
+    """
     left = first.strip().lower().lstrip("0")
     right = second.strip().lower().lstrip("0")
     return left == right

@@ -13,7 +13,20 @@ installation.
 $ python3 -m venv .venv
 $ .venv/bin/python -m pip install xgfalclient          # includes root://
 $ .venv/bin/python -m pip install 'xgfalclient[krb5]'    # optional native Kerberos
+$ .venv/bin/python -m pip install 'xgfalclient[sftp]'    # paramiko, for sftp:// with a password
 ```
+
+`sftp://` picks a transport per connection (`[SFTP PLUGIN] TRANSPORT`, default
+`auto`): the system `ssh` when there is one and no password is configured,
+otherwise paramiko from the `sftp` extra. Without paramiko it falls back to a
+built-in Python SSH transport, so a base install still reaches an SFTP
+server, with a password too.
+Sessions are pooled per endpoint: `[SFTP PLUGIN] MAX_IDLE` (default 4, 0 to
+disable) idle sessions are kept, for at most `MAX_IDLE_SECONDS` (default 60).
+With the system `ssh`, `SSH_OPTIONS` (extra `-o` settings) take precedence over
+the plugin's defaults, since ssh uses the first value it sees for an option;
+`BatchMode=yes`, the password-prompt and forwarding settings and the URL's
+port and user cannot be overridden.
 
 ## Create and close a context
 

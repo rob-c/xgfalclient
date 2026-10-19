@@ -1,7 +1,6 @@
 """The in-process SRM server's own edges, driven with raw requests."""
 
 # The shared fixtures come from test_srm; ruff sees each use as a redefinition.
-# ruff: noqa: F811
 
 from __future__ import annotations
 
@@ -12,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from test_srm import root  # noqa: F401
+from test_srm import root as root
 from xgfalclient.plugins.srm import soap
 from xgfalclient.testing.pki import PKI
 from xgfalclient.testing.srm import SRMServer

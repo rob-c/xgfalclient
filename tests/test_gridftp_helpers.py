@@ -19,8 +19,8 @@ from xgfalclient.testing.pki import PKI, test_key
 
 __all__ = [
     "GROUP",
-    "FakeServer",
     "Events",
+    "FakeServer",
     "code_of",
     "ftp",
     "gctx",

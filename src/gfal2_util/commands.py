@@ -10,6 +10,8 @@ __all__ = ["GfalCommands"]
 
 
 class GfalCommands(base.CommandBase):
+    """gfal2-util's ``GfalCommands``: the single-operation commands, one method each."""
+
     execute_mkdir = base._method(SPECS["mkdir"])
     execute_save = base._method(SPECS["save"])
     execute_cat = base._method(SPECS["cat"])

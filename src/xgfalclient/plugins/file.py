@@ -18,6 +18,15 @@ Files ``ctx.open`` creates are ``0744`` before the umask, the mode gfal2's
 ``open`` passes; a FIFO or other unseekable file is read and written in
 order rather than by offset, so the core can stream from ``/proc`` and pipes.
 
+Reads of a read-only handle survive transient failures of the filesystem
+underneath (an NFS or FUSE mount hiccuping): ``EAGAIN``, ``EBUSY``,
+``EINTR``, ``ESTALE`` and ``ETIMEDOUT`` reopen the file and try again, up to
+``[CORE] CONN_RETRY`` times, but only if the reopened file is the same
+generation (device, inode, size, nanosecond times) - otherwise ``ESTALE``,
+so a copy never splices two versions of a file together. Writers are never
+retried: whether a failed write reached the disk is unknown. See
+``docs/reliability.md``.
+
 Knowingly different: ``symlink`` takes any target text (a relative path, or
 a URL of another scheme, written into the link as it is); gfal2 wants the
 target to be a ``file://`` URL too and refuses anything else with
@@ -45,7 +54,10 @@ __all__ = ["FilePlugin", "LocalFile", "local_path"]
 
 T = TypeVar("T")
 
+#: How much one read asks for while a checksum is computed.
 _CHUNK = 4 << 20
+#: The errnos a read (or a read-only open) is retried after; the names that a
+#: platform lacks are left out.
 _TRANSIENT_READ_ERRORS = frozenset(
     getattr(errno, name)
     for name in ("EAGAIN", "EBUSY", "EINTR", "ESTALE", "ETIMEDOUT")
@@ -59,6 +71,12 @@ def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
 
 
 def _retry_pause(options: Any, attempts: int) -> None:
+    """Wait before retry number ``attempts``, as the core's retry policy does.
+
+    An explicit ``[CORE] CONN_RETRY_INTERVAL`` is a fixed wait in seconds (0
+    or less: none, for tests and fail-fast setups); without one the wait is
+    50 ms, doubling per attempt up to one second.
+    """
     interval = options.integer("CORE", "CONN_RETRY_INTERVAL", 0)
     if options.has("CORE", "CONN_RETRY_INTERVAL"):
         if interval > 0:
@@ -68,17 +86,33 @@ def _retry_pause(options: Any, attempts: int) -> None:
 
 
 def local_path(url: str) -> str:
-    """The filesystem path in a ``file:///`` URL."""
+    """The filesystem path in a ``file:///`` URL.
+
+    Taken as written, with no percent-decoding: ``file:///a%20b`` names a
+    file called ``a%20b``. The URL is assumed to be one
+    :meth:`FilePlugin.handles` accepted.
+    """
     return url[len("file://") :]
 
 
 class LocalFile(PluginFile):
     """An open local file: unbuffered, positional, GIL-releasing I/O.
 
-    Errors are worded as gfal2's file plugin words them.
+    Errors are worded as gfal2's file plugin words them. Reads and writes go
+    by :attr:`position` (``pread``/``pwrite`` or a seek first), not by the
+    descriptor's own offset, so the cursor is the one truth; a pipe, which
+    has no position, is read and written in order instead. Not thread-safe:
+    the cursor and the recovery state belong to one caller at a time.
     """
 
     def __init__(self, url: str, path: str, flags: int, mode: int, options: Any = None) -> None:
+        """Open ``path`` with ``os.open(path, flags, mode)``; ``OSError`` as is.
+
+        ``options`` (the context's) supply the read-retry budget; without
+        them reads are not retried. ``flags`` and ``mode`` are kept so that a
+        recovery can reopen the file the same way, and the opened file's
+        identity is recorded for that reopen to be checked against.
+        """
         super().__init__(url)
         self._path = path
         self._flags = flags
@@ -95,19 +129,31 @@ class LocalFile(PluginFile):
             self._raw.close()
             raise
         self._identity = _file_identity(info)
+        #: Once a read has needed recovery, the most one read asks for: small
+        #: requests make progress on a mount that fails large ones, while a
+        #: handle that never faults keeps full-size reads.
         self._recovery_chunk: int | None = None
 
     def fileno(self) -> int:
+        """The current descriptor; a recovery replaces it, so do not keep it.
+
+        The core's ``copy_file_range`` path uses it, and calls
+        :meth:`recover_read` when the kernel's read fails.
+        """
         return self._raw.fileno()
 
     def read(self, size: int) -> bytes:
+        """Up to ``size`` bytes at the cursor; ``b""`` at the end of the file."""
         buffer = bytearray(size)
         count = self.readinto(buffer)
         del buffer[count:]
         return bytes(buffer)
 
     def readinto(self, buffer: memoryview | bytearray) -> int:
+        """One ``readinto`` at the cursor (short reads are possible), with recovery."""
+
         def read() -> int:
+            """A single attempt; the seek is redone each time, as a reopen loses it."""
             if self._seekable:  # by position; a pipe has none and is read in order
                 _os(self._raw.seek, self.position)
             view = memoryview(buffer)
@@ -120,7 +166,10 @@ class LocalFile(PluginFile):
         return count
 
     def pread(self, offset: int, size: int) -> bytes:
+        """``os.pread`` at ``offset``, with recovery; the cursor is not moved."""
+
         def read() -> bytes:
+            """A single attempt, asking for no more than the recovery chunk."""
             wanted = min(size, self._recovery_chunk) if self._recovery_chunk is not None else size
             return _os(os.pread, self.fileno(), wanted, offset)
 
@@ -139,6 +188,12 @@ class LocalFile(PluginFile):
                 self._reopen_read(attempts, exc)
 
     def _can_recover_read(self, exc: GError, attempts: int) -> bool:
+        """Whether failure number ``attempts`` may be retried.
+
+        Only for a seekable, read-only handle (a pipe cannot be reopened at
+        an offset; a writer's state is unknown), a transient errno, and
+        within ``[CORE] CONN_RETRY`` (default 3).
+        """
         retries = (
             max(0, int(self._options.integer("CORE", "CONN_RETRY", 3)))
             if self._options is not None
@@ -150,6 +205,21 @@ class LocalFile(PluginFile):
             and exc.code in _TRANSIENT_READ_ERRORS
             and attempts <= retries
         )
+
+    def recover_read(self, cause: GError) -> bool:
+        """Recover from a read that failed outside :meth:`readinto` and :meth:`pread`.
+
+        The core's ``copy_file_range`` fast path reads this file's descriptor
+        in the kernel; a transient failure there gets the recovery a read here
+        would - the same retry budget's first attempt, the same pause, and a
+        reopen that must find the same file - and ``True`` says the caller
+        may carry on reading through this handle. ``False``: not a failure a
+        read recovers from (or not a read-only handle); the caller raises it.
+        """
+        if not self._can_recover_read(cause, 1):
+            return False
+        self._reopen_read(1, cause)
+        return True
 
     def _reopen_read(self, attempts: int, cause: GError) -> None:
         """Replace a stale descriptor, refusing a different file generation."""
@@ -171,6 +241,11 @@ class LocalFile(PluginFile):
         self._raw = replacement
 
     def pwrite(self, data: bytes | bytearray | memoryview, offset: int) -> int:
+        """Write all of ``data`` at ``offset`` (in order, on a pipe), looping on short writes.
+
+        A write that makes no progress is ``EIO`` rather than a busy loop.
+        Never retried (see the module docstring).
+        """
         view = memoryview(data)
         done = 0
         while done < len(view):
@@ -184,6 +259,7 @@ class LocalFile(PluginFile):
         return done
 
     def lseek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        """Move the cursor with the real ``lseek(2)``, so its errors are the system's."""
         # The real lseek(2), for its errors (EINVAL, ESPIPE on a pipe); the
         # descriptor's offset is synced first, as reads go by position.
         fd = self.fileno()
@@ -192,20 +268,28 @@ class LocalFile(PluginFile):
         return self.position
 
     def size(self) -> int:
+        """The current size (``fstat``), for ``SEEK_END`` and the copy engine."""
         return _os(os.fstat, self.fileno()).st_size
 
     def close(self) -> None:
+        """Close the descriptor; a second close does nothing."""
         if not self.closed:
             self._raw.close()
         super().close()
 
 
 def _mode(flags: int) -> str:
+    """The :class:`io.FileIO` mode for ``flags`` other than ``O_RDWR``."""
     return "w" if flags & os.O_WRONLY else "r"
 
 
 class FilePlugin(Plugin):
-    """The ``file`` plugin."""
+    """The ``file`` plugin: every operation is the matching ``os`` call.
+
+    Stateless apart from the context's options, so it is thread-safe as the
+    system calls are. Each ``OSError`` becomes a :class:`GError` with the
+    same ``errno`` and gfal2's wording (:func:`_os`).
+    """
 
     name = "file"
     schemes = ("file",)
@@ -214,17 +298,21 @@ class FilePlugin(Plugin):
     event_domain = "GFAL2::PLUGINS::FILE"
 
     def handles(self, url: str, operation: str) -> bool:
+        """``file:///...`` only: a URL with a host part is left unclaimed, as in gfal2."""
         return scheme_of(url) == "file" and url.startswith("file:///")
 
     # -- namespace ---------------------------------------------------------------
 
     def stat(self, url: str) -> Stat:
+        """``stat(2)``, links followed."""
         return Stat.from_os(_os(os.stat, local_path(url)))
 
     def lstat(self, url: str) -> Stat:
+        """``lstat(2)``: a link describes itself."""
         return Stat.from_os(_os(os.lstat, local_path(url)))
 
     def access(self, url: str, mode: int) -> None:
+        """``access(2)`` with its real errno: ``ENOENT``, ``EINVAL``, ``EROFS``, ``EACCES``..."""
         # os.access only says yes or no; access(2)'s errno is recovered in
         # its order: the path (ENOENT, ENOTDIR, ELOOP...), then the mode
         # word, then a read-only filesystem, then the permission bits.
@@ -241,35 +329,53 @@ class FilePlugin(Plugin):
         raise from_oserror(OSError(code, os.strerror(code)))
 
     def chmod(self, url: str, mode: int) -> None:
+        """``chmod(2)``; on a link, its target's mode."""
         _os(os.chmod, local_path(url), mode)
 
     def mkdir(self, url: str, mode: int) -> None:
+        """``mkdir(2)`` of one level; ``mode`` is subject to the umask."""
         _os(os.mkdir, local_path(url), mode)
 
     def rmdir(self, url: str) -> None:
+        """``rmdir(2)``: ``ENOTEMPTY`` for a directory with entries."""
         _os(os.rmdir, local_path(url))
 
     def unlink(self, url: str) -> None:
+        """``unlink(2)``, but ``EISDIR`` for a directory on every platform.
+
+        Linux says ``EISDIR``, macOS ``EPERM``; gfal2's answer is Linux's,
+        so it is checked first. A link to a directory is unlinked normally.
+        """
         path = local_path(url)
         if os.path.isdir(path) and not os.path.islink(path):
             raise from_oserror(OSError(errno.EISDIR, os.strerror(errno.EISDIR)))
         _os(os.unlink, path)
 
     def rename(self, old: str, new: str) -> None:
+        """``rename(2)``: atomic, replacing ``new``; ``EXDEV`` across filesystems."""
         _os(os.rename, local_path(old), local_path(new))
 
     def readlink(self, url: str) -> str:
+        """The link's target text, as stored (a path, not a URL)."""
         return str(_os(os.readlink, local_path(url)))
 
     def symlink(self, target: str, link: str) -> None:
+        """Create ``link`` pointing at ``target``: a ``file://`` URL's path, or any text."""
         destination = local_path(target) if target.startswith("file://") else target
         _os(os.symlink, destination, local_path(link))
 
     def opendir(self, url: str) -> Iterator[DirEntry]:
+        """Every entry with its stat and ``d_type``; the directory is read up front.
+
+        Reading it whole first makes ``ENOENT``/``ENOTDIR``/``EACCES`` an
+        error of this call, not of the first iteration; the per-entry stats
+        are taken lazily, as the iterator is consumed.
+        """
         path = local_path(url)
         return self._entries(path, _os(_read, path))
 
     def _entries(self, path: str, listing: list[tuple[str, int]]) -> Iterator[DirEntry]:
+        """``(name, stat or None, d_type)`` for each of ``listing``'s entries."""
         for name, kind in listing:
             # d_type is the entry's own, as readdir reports it: a link is DT_LNK
             # although its stat (followed, as gfal2's) describes the target.
@@ -281,11 +387,18 @@ class FilePlugin(Plugin):
                 yield name, None, kind
 
     def listdir(self, url: str) -> list[str]:
+        """The names alone, ``.`` and ``..`` included, in ``readdir``'s order; no stats."""
         return [name for name, _ in _os(_read, local_path(url))]
 
     # -- I/O ---------------------------------------------------------------------
 
     def open(self, url: str, flags: int, mode: int = 0o744, size: int | None = None) -> PluginFile:
+        """A :class:`LocalFile`; a read-only open retries transient errnos as reads do.
+
+        ``size`` is ignored: nothing needs to be reserved locally. An open
+        for writing is never retried, since ``O_CREAT``/``O_TRUNC`` may
+        already have taken effect.
+        """
         attempts = 0
         while True:
             try:
@@ -304,6 +417,11 @@ class FilePlugin(Plugin):
     # -- metadata ------------------------------------------------------------------
 
     def getxattr(self, url: str, name: str) -> str:
+        """The attribute's value as text (undecodable bytes replaced).
+
+        Where Python has no ``os.getxattr`` (macOS), every name is
+        ``ENODATA``, as if the file had no attributes.
+        """
         getter = getattr(os, "getxattr", None)
         if getter is None:
             raise from_oserror(OSError(errno.ENODATA, os.strerror(errno.ENODATA)))
@@ -311,18 +429,29 @@ class FilePlugin(Plugin):
         return value.decode("utf-8", "replace")
 
     def setxattr(self, url: str, name: str, value: str, flags: int) -> None:
+        """Set ``name`` to ``value`` (UTF-8); ``flags`` are ``XATTR_CREATE``/``XATTR_REPLACE``.
+
+        ``ENOTSUP`` where Python has no ``os.setxattr`` (macOS).
+        """
         setter = getattr(os, "setxattr", None)
         if setter is None:
             raise from_oserror(OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP)))
         _os(setter, local_path(url), name, value.encode("utf-8"), flags)
 
     def listxattr(self, url: str) -> list[str]:
+        """The attribute names; ``[]`` where Python has no ``os.listxattr`` (macOS)."""
         lister = getattr(os, "listxattr", None)
         if lister is None:
             return []
         return list(_os(lister, local_path(url)))
 
     def checksum(self, url: str, algorithm: str, offset: int, length: int) -> str:
+        """ADLER32, CRC32 or MD5 of ``length`` bytes from ``offset`` (0: to the end).
+
+        Case is ignored in ``algorithm``; anything else is ``ENOSYS``. A
+        failed read is reported with gfal2's "Error during checksum
+        calculation" wording and the read's errno.
+        """
         kind = algorithm.lower()
         if kind not in ("adler32", "crc32", "md5"):
             raise GError(f"Checksum type {algorithm} not supported for local files", errno.ENOSYS)
@@ -363,29 +492,52 @@ def _scandir(path: str) -> list[tuple[str, int]]:
 
 
 def _digest(kind: str, fd: int, offset: int, length: int) -> str:
+    """Hash ``fd`` from ``offset``: ``length`` bytes, or to the end when it is not positive.
+
+    The format is gfal2's: ADLER32 as eight lower-case hex digits, CRC32 in
+    decimal, MD5 as hex. ``OSError`` propagates for the caller to word.
+    ``readv`` into one reused buffer avoids allocating per chunk.
+    """
     os.lseek(fd, offset, os.SEEK_SET)
+    hasher = hashlib.md5() if kind == "md5" else _ZlibSum(adler=kind == "adler32")
+    for chunk in _chunks(fd, length):
+        hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+class _ZlibSum:
+    """A running ADLER32 or CRC32 with gfal2's spelling: eight hex digits, or decimal."""
+
+    def __init__(self, *, adler: bool) -> None:
+        """Start the sum (ADLER32 at 1, CRC32 at 0)."""
+        self.adler = adler
+        self.value = 1 if adler else 0
+
+    def update(self, chunk: memoryview) -> None:
+        """Fold ``chunk`` into the sum."""
+        fold = zlib.adler32 if self.adler else zlib.crc32
+        self.value = fold(chunk, self.value)
+
+    def hexdigest(self) -> str:
+        """The sum as gfal2 prints it (ADLER32 in hex, CRC32 in decimal)."""
+        return f"{self.value:08x}" if self.adler else str(self.value)
+
+
+def _chunks(fd: int, length: int) -> Iterator[memoryview]:
+    """Read ``fd`` from its position: ``length`` bytes, or to the end when it is not positive.
+
+    Each chunk is a view of one reused buffer, valid until the next is asked for.
+    """
     remaining = length if length > 0 else -1
-    buffer = bytearray(_CHUNK)
-    view = memoryview(buffer)
-    rolling = 1 if kind == "adler32" else 0
-    md5 = hashlib.md5() if kind == "md5" else None
+    view = memoryview(bytearray(_CHUNK))
     while remaining:
         want = _CHUNK if remaining < 0 else min(_CHUNK, remaining)
         count = os.readv(fd, [view[:want]])
         if not count:
-            break
-        chunk = view[:count]
-        if md5 is not None:
-            md5.update(chunk)
-        elif kind == "adler32":
-            rolling = zlib.adler32(chunk, rolling)
-        else:
-            rolling = zlib.crc32(chunk, rolling)
+            return
+        yield view[:count]
         if remaining > 0:
             remaining -= count
-    if md5 is not None:
-        return md5.hexdigest()
-    return f"{rolling:08x}" if kind == "adler32" else str(rolling)
 
 
 def _os(function: Callable[..., T], *args: Any) -> T:

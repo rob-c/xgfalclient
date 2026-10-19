@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import FunctionType
 from typing import Any
 
 import pytest
@@ -23,7 +24,9 @@ def run(source: str, **names: Any) -> tuple[dict[str, Any], set[int]]:
         return value
 
     namespace = {"__condcov__": probe, **names}
-    exec(compile(tree, "<test>", "exec"), namespace)
+    # Module code run as a function whose globals are ``namespace`` - what an
+    # import does with a module's dict - so the names it binds land there.
+    FunctionType(compile(tree, "<test>", "exec"), namespace)()
     return namespace, seen
 
 

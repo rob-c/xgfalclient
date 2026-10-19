@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """The in-process GridFTP server's own corners: what a well-behaved client never sends."""
 
 from __future__ import annotations
@@ -15,15 +14,11 @@ from typing import Any
 import pytest
 
 import xgfalclient
-from test_gridftp_helpers import (  # noqa: F401 - fixtures
-    GROUP,
-    _fast_polls,
-    code_of,
-    ftp,
-    gctx,
-    gsi,
-    write,
-)
+from test_gridftp_helpers import _fast_polls as _fast_polls
+from test_gridftp_helpers import code_of, write
+from test_gridftp_helpers import ftp as ftp
+from test_gridftp_helpers import gctx as gctx
+from test_gridftp_helpers import gsi as gsi
 from xgfalclient.crypto.rsa import private_key_pem
 from xgfalclient.crypto.x509 import (
     build_certificate,
@@ -33,12 +28,15 @@ from xgfalclient.crypto.x509 import (
 )
 from xgfalclient.plugins.gridftp import control as control_module
 from xgfalclient.plugins.gridftp.control import Control
-from xgfalclient.plugins.gridftp.data import DataConn, Ranges, send_blocks
+from xgfalclient.plugins.gridftp.data import DataConn, Feed, Ranges, send_blocks
 from xgfalclient.plugins.gridftp.gsi import GlobusContext
 from xgfalclient.plugins.gridftp.protocol import parse_pasv
 from xgfalclient.testing import gridftp as server_module
 from xgfalclient.testing.gridftp import GridFTPServer
 from xgfalclient.testing.pki import PKI, test_key
+
+#: Control sessions the tests leave mid-failure are hung up at teardown.
+pytestmark = pytest.mark.usefixtures("hang_up_controls")
 
 Ctx = xgfalclient.Gfal2Context
 
@@ -184,7 +182,8 @@ def test_protection_is_enforced(gsi: GridFTPServer, grid_env: PKI, gctx: Ctx) ->
     control.sock.sendall(b"PWD\r\n")
     assert control.reply().code == 533
     control.security = control.security  # still in step
-    token = control.security.wrap(b"PWD\r\n")  # type: ignore[union-attr]
+    assert control.security is not None
+    token = control.security.wrap(b"PWD\r\n")
     import base64
 
     control.sock.sendall(b"MIC " + base64.b64encode(token) + b"\r\n")
@@ -280,10 +279,7 @@ def _minted(pki: PKI, directory: Path, subject: tuple[tuple[str, str], ...]) -> 
     )
     pem = directory / "minted.pem"
     pem.write_bytes(certificate.pem() + private_key_pem(key))
-    context = ssl.create_default_context(cafile=str(pki.ca_file))
-    context.check_hostname = False
-    context.load_cert_chain(str(pem))
-    return context
+    return pki.client_context(proxy=pem, check_hostname=False)
 
 
 @pytest.mark.parametrize(
@@ -318,8 +314,7 @@ def test_anonymous_client_that_does_not_wait_for_the_turn(
     monkeypatch.setattr(
         control_module, "GlobusContext", functools.partial(GlobusContext, turn=False)
     )
-    tls = ssl.create_default_context(cafile=str(pki.ca_file))
-    tls.check_hostname = False
+    tls = pki.client_context(anonymous=True, check_hostname=False)
     context = pki.server_context(require_client=False)
     with GridFTPServer(tmp_path, gsi=context, gridmap={"": "nobody"}) as server:
         control = Control(server.host, server.port, timeout=5)
@@ -348,7 +343,7 @@ def test_active_mode_e_upload(ftp: GridFTPServer) -> None:
         assert control.reply().code == 150
         sock, _ = listener.accept()
     with sock:
-        send_blocks(DataConn(sock), read, Ranges(0, len(data), 4), lambda n: None, 4, 1)
+        send_blocks(DataConn(sock), Feed(read, 4, lambda n: None), Ranges(0, len(data), 4), 1)
     control.final()
     assert (Path(ftp.root) / "g").read_bytes() == data
     control.close()

@@ -237,7 +237,7 @@ def test_double_close(root: Path, ctx: xgfalclient.Gfal2Context) -> None:
     with_dcap(ctx)
     with DcapServer(root) as door:
         handle = ctx.open(door.url("/data/hello.txt"), "r")
-        inner = handle._file  # type: ignore[attr-defined]
+        inner = handle._file
         inner.close()
         inner.close()
         assert handle.closed
@@ -247,11 +247,13 @@ def test_gsi_server_rejects_garbage(root: Path, pki: object) -> None:
     from xgfalclient.testing.pki import PKI
 
     assert isinstance(pki, PKI)
-    with DcapServer(root, gsi=pki.server_context()) as door:  # noqa: SIM117 - 3.9 syntax
-        with socket.create_connection(("127.0.0.1", door.port)) as sock:
-            sock.sendall(b"enc " + base64.b64encode(b"GET / HTTP/1.0\r\n\r\n") + b"\n")
-            sock.settimeout(10)
-            assert sock.recv(100) == b""
+    with (
+        DcapServer(root, gsi=pki.server_context()) as door,
+        socket.create_connection(("127.0.0.1", door.port)) as sock,
+    ):
+        sock.sendall(b"enc " + base64.b64encode(b"GET / HTTP/1.0\r\n\r\n") + b"\n")
+        sock.settimeout(10)
+        assert sock.recv(100) == b""
 
 
 def test_listing_chunk_constant() -> None:

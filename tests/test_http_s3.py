@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """Object stores through the http plugin: S3 (SigV4) and Google Cloud Storage (signed URLs)."""
 
 from __future__ import annotations
@@ -8,19 +7,22 @@ import hashlib
 import json
 import os
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 import xgfalclient
-from test_http_helpers import dav2, hctx, make_server, write  # noqa: F401 - fixtures
+from test_http_helpers import dav2 as dav2
+from test_http_helpers import hctx as hctx
+from test_http_helpers import make_server, write
 from xgfalclient import GError
 from xgfalclient.crypto.rsa import private_key_pem
 from xgfalclient.plugin import O_CREAT, O_TRUNC, O_WRONLY
-from xgfalclient.plugins.http import _client, _gcloud, _s3
+from xgfalclient.plugins.http import _client, _gcloud, _io, _s3, _swift
+from xgfalclient.plugins.http.plugin import HTTPPlugin
 from xgfalclient.testing.pki import test_key
-from xgfalclient.testing.webdav import S3, WebDAVServer
+from xgfalclient.testing.webdav import S3, Request, WebDAVServer
 from xgfalclient.url import parse
 
 WRITE = O_WRONLY | O_CREAT | O_TRUNC
@@ -58,11 +60,39 @@ def s3url(server: WebDAVServer, path: str, scheme: str = "s3") -> str:
     return server.url(path, scheme=scheme)
 
 
-def plugin(context: xgfalclient.Gfal2Context):  # type: ignore[no-untyped-def]
-    return context.plugin("davs://h/", "open")
+def plugin(context: xgfalclient.Gfal2Context) -> HTTPPlugin:
+    found = context.plugin("davs://h/", "open")
+    assert isinstance(found, HTTPPlugin)
+    return found
+
+
+def store(server: WebDAVServer) -> S3:
+    """The object store a server fixture was given."""
+    assert server.s3 is not None
+    return server.s3
+
+
+def header(request: Request, name: str) -> str:
+    """A header the request must have carried."""
+    value = request.header(name)
+    assert value is not None
+    return value
 
 
 # -- S3 -------------------------------------------------------------------------------------
+
+
+def test_a_small_sized_s3_upload_is_one_put(
+    hctx: xgfalclient.Gfal2Context, s3: WebDAVServer
+) -> None:
+    handle = plugin(hctx).open(s3url(s3, "/bucket/small"), WRITE, 0o644, 10)
+    assert isinstance(handle, _io.HTTPWriteFile)
+    handle.write(b"0123456789")
+    handle.close()
+    assert s3.local("/bucket/small").read_bytes() == b"0123456789"
+    # The head is signed before the body is written: never with the empty
+    # body's hash, which the fake (as S3) checks against what arrives.
+    assert header(s3.requests[-1], "x-amz-content-sha256") == "UNSIGNED-PAYLOAD"
 
 
 def test_s3_namespace(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
@@ -71,7 +101,7 @@ def test_s3_namespace(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
     write(s3, "/bucket/top", b"333")
     assert hctx.stat(s3url(s3, "/bucket/top")).st_size == 3
     head = s3.requests[-1]
-    assert head.method == "HEAD" and head.header("Authorization").startswith("AWS4-HMAC-SHA256 ")
+    assert head.method == "HEAD" and header(head, "Authorization").startswith("AWS4-HMAC-SHA256 ")
     assert hctx.stat(s3url(s3, "/bucket/dir")).is_dir()
     assert hctx.stat(s3url(s3, "/bucket")).is_dir()
     with pytest.raises(GError) as caught:
@@ -97,12 +127,12 @@ def test_s3_namespace(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
     assert caught.value.code == errno.ENOENT
     hctx.mkdir(s3url(s3, "/bucket/newdir"), 0o755)
     put = s3.requests[-1]
-    assert (put.method, put.path, put.header("Content-Length")) == ("PUT", "/bucket/newdir/", "0")
+    assert (put.method, put.target, put.header("Content-Length")) == ("PUT", "/bucket/newdir/", "0")
     assert hctx.stat(s3url(s3, "/bucket/newdir")).st_mode == 0o40755  # davix's mode
     assert hctx.stat(s3url(s3, "/bucket/newdir/")).st_mode == 0o40755  # the marker itself
     assert hctx.listdir(s3url(s3, "/bucket/newdir")) == []
     hctx.mkdir_rec(s3url(s3, "/bucket/x/y"), 0o755)
-    assert s3.requests[-1].path == "/bucket/x/y/"
+    assert s3.requests[-1].target == "/bucket/x/y/"
     assert hctx.stat(s3url(s3, "/bucket/top")).st_mode == 0o100755
     s3.fault("HEAD", status=200, headers={"Content-Length": "3"}, body=b"abc")
     assert hctx.stat(s3url(s3, "/bucket/x/")).st_mode == 0o100755  # "key/" with content
@@ -140,7 +170,7 @@ def test_s3_streamed_into_parts(
     write(dav2, "/data/big", data)
     hctx.filecopy(dav2.url("/data/big"), s3url(s3, "/bucket/big"))
     assert s3.local("/bucket/big").read_bytes() == data
-    assert [r for r in s3.requests if "partNumber" in r.path]
+    assert [r for r in s3.requests if "partNumber" in r.target]
 
 
 def test_s3_rename(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
@@ -152,7 +182,7 @@ def test_s3_rename(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
     assert not s3.local("/bucket/dir/a").exists()
     copy, delete = s3.requests[-2:]
     assert (copy.method, copy.header("x-amz-copy-source")) == ("PUT", "/bucket/dir/a")
-    assert (delete.method, delete.path) == ("DELETE", "/bucket/dir/a")
+    assert (delete.method, delete.target) == ("DELETE", "/bucket/dir/a")
     with pytest.raises(GError) as caught:
         hctx.rename(s3url(s3, "/bucket/dir/nope"), s3url(s3, "/bucket/dir/c"))
     assert (caught.value.code, caught.value.message) == (
@@ -193,26 +223,13 @@ def test_s3_copy_body_failure_never_deletes_the_original(
 def _s3_copy_source(context: xgfalclient.Gfal2Context, url: str) -> str:
     seen: list[str] = []
 
-    def fake(plugin: object, old: str, new: str, **kwargs: object) -> None:
-        seen.append(str(kwargs["source"]))
+    def fake(plugin: object, old: str, new: str, how: _swift.ServerCopy) -> None:
+        seen.append(how.source)
 
-    original = _s3._swift.rename
-    _s3._swift.rename = fake  # type: ignore[assignment]
-    try:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_swift, "rename", fake)
         _s3.rename(plugin(context), url, url)
-    finally:
-        _s3._swift.rename = original  # type: ignore[assignment]
     return seen[0]
-
-
-def test_s3_listing_pages(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
-    s3.s3.page_size = 2  # type: ignore[union-attr]
-    for name in "abcde":
-        write(s3, f"/bucket/p/{name}", b"x")
-    write(s3, "/bucket/p/deeper/f", b"x")
-    assert sorted(hctx.listdir(s3url(s3, "/bucket/p"))) == ["a", "b", "c", "d", "deeper", "e"]
-    tokens = [r.path for r in s3.requests if "continuation-token" in r.path]
-    assert len(tokens) == 2
 
 
 def test_s3_listing_skips_the_odd_entries(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> None:
@@ -232,7 +249,7 @@ def test_s3_virtual_host_style(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer)
     write(s3, "/bucket/k/a", b"1")
     # The "bucket" is now part of the key, under the server's root.
     assert hctx.listdir(s3url(s3, "/bucket/k")) == ["a"]
-    assert s3.requests[-1].path.startswith("/?")
+    assert s3.requests[-1].target.startswith("/?")
 
 
 def test_s3_io_and_checksums(
@@ -262,8 +279,8 @@ def test_s3_io_and_checksums(
     response = plugin(hctx)._request(
         "PUT", s3url(s3, "/bucket/meta"), headers={"x-amz-meta-owner": "me"}, body=b"m"
     )
-    assert response.body() == b"" and response.status == 201  # the header is signed, and checks
-    assert "x-amz-meta-owner" in s3.requests[-1].header("Authorization")
+    assert response.body() == b"" and response.status == 200  # the header is signed, and checks
+    assert "x-amz-meta-owner" in header(s3.requests[-1], "Authorization")
     source = tmp_path / "up"
     source.write_bytes(b"uploaded")
     hctx.filecopy("file://" + str(source), s3url(s3, "/bucket/new/up"))
@@ -279,7 +296,7 @@ def test_s3_bad_keys_and_tokens(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer
         hctx.stat(s3url(s3, "/bucket/f"))
     assert caught.value.code == errno.EPERM
     hctx.set_opt_string("S3", "SECRET_KEY", "SECRETTEST")
-    s3.s3.token = "SESSION"  # type: ignore[union-attr]
+    store(s3).token = "SESSION"
     with pytest.raises(GError):
         hctx.stat(s3url(s3, "/bucket/f"))
     hctx.set_opt_string("S3", "TOKEN", "SESSION")
@@ -305,14 +322,14 @@ def test_s3_keys_per_host(hctx: xgfalclient.Gfal2Context, s3: WebDAVServer) -> N
     hctx.set_opt_string(group, "ACCESS_KEY", "AKIDTEST")
     hctx.set_opt_string(group, "SECRET_KEY", "SECRETTEST")
     hctx.set_opt_string(group, "REGION", "eu-west-1")
-    s3.s3.region = "eu-west-1"  # type: ignore[union-attr]
+    store(s3).region = "eu-west-1"
     write(s3, "/bucket/f", b"xyz")
     assert hctx.stat(s3url(s3, "/bucket/f")).st_size == 3
-    assert "eu-west-1" in s3.requests[-1].header("Authorization")
+    assert "eu-west-1" in header(s3.requests[-1], "Authorization")
     hctx.remove_opt(group, "REGION")
     hctx.set_opt_string("S3", "REGION", "eu-west-1")  # the [S3] region, for want of the host's
     assert hctx.stat(s3url(s3, "/bucket/f")).st_size == 3
-    assert "eu-west-1" in s3.requests[-1].header("Authorization")
+    assert "eu-west-1" in header(s3.requests[-1], "Authorization")
     # Keys make no https:// URL an S3 one: gfal2 sends it unsigned, as WebDAV.
     with pytest.raises(GError):
         hctx.stat(s3.url("/bucket/f", scheme="http"))
@@ -347,9 +364,9 @@ def test_s3_groups_and_legacy_names(hctx: xgfalclient.Gfal2Context, s3: WebDAVSe
     hctx.set_opt_boolean("S3:0.0.1", "ALTERNATE", True)
     hctx.set_opt_string("S3:127.0.0.1", "ALTERNATE", "neither")  # not a boolean: skipped
     assert hctx.stat(s3url(s3, "/bucket/f")).st_size == 3
-    assert "Credential=AKIDTEST/" in s3.requests[-1].header("Authorization")
+    assert "Credential=AKIDTEST/" in header(s3.requests[-1], "Authorization")
     # The session token may come from a broader group than the keys.
-    s3.s3.token = "SESSION"  # type: ignore[union-attr]
+    store(s3).token = "SESSION"
     hctx.set_opt_string("S3", "TOKEN", "SESSION")
     assert hctx.stat(s3url(s3, "/bucket/f")).st_size == 3
     keys = _s3.s3_keys(hctx.options, parse("s3://h/b"))
@@ -369,7 +386,7 @@ def test_s3_multipart(
     source.write_bytes(data)
     hctx.filecopy("file://" + str(source), s3url(s3, "/bucket/mp1"))
     assert s3.local("/bucket/mp1").read_bytes() == data
-    parts = [r for r in s3.requests if "partNumber" in r.path]
+    parts = [r for r in s3.requests if "partNumber" in r.target]
     assert len(parts) == 4
     writer = plugin(hctx).open(s3url(s3, "/bucket/mp2"), WRITE, 0o644, len(data))
     writer.write(data[:1200])
@@ -394,7 +411,7 @@ def test_s3_multipart(
         writer.write(data[:2000])
         writer.close()
         assert s3.local("/bucket/mp5").read_bytes() == data[:2000]
-        paths = [r.path for r in s3.requests if r.method in ("POST", "PUT")]
+        paths = [r.target for r in s3.requests if r.method in ("POST", "PUT")]
         assert all(p.startswith("/bucket/mp5" + suffix.rstrip("?")) for p in paths)
         assert all(("versioning=x&" in p) == (suffix != "?") for p in paths)
 
@@ -410,7 +427,7 @@ def test_s3_multipart_failures(
     source = tmp_path / "big"
     source.write_bytes(b"x" * 25)
     url = s3url(s3, "/bucket/mp")
-    uploads = s3.s3.uploads  # type: ignore[union-attr]
+    uploads = store(s3).uploads
     s3.fault("POST", status=500)
     with pytest.raises(GError):
         hctx.filecopy("file://" + str(source), url)
@@ -460,7 +477,7 @@ def test_s3_presigned_urls() -> None:
     keys = _s3.S3Keys(
         "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "", "us-east-1"
     )
-    when = datetime(2013, 5, 24, tzinfo=timezone.utc)
+    when = datetime(2013, 5, 24, tzinfo=UTC)
     url = _s3.S3Signer(keys).presign(
         "GET", "s3s://examplebucket.s3.amazonaws.com/test.txt", 86400, when=when
     )
@@ -481,7 +498,7 @@ def test_s3_tpc_with_presigned_urls(
     hctx.filecopy(s3url(s3, "/bucket/src"), dav2.url("/data/dst"))
     assert dav2.local("/data/dst").read_bytes() == b"from s3"
     copy_request = next(r for r in dav2.requests if r.method == "COPY")
-    assert "X-Amz-Signature=" in copy_request.header("Source")
+    assert "X-Amz-Signature=" in header(copy_request, "Source")
     assert copy_request.header("Credential") == "none"
     assert copy_request.header("Copy-Flags") == "NoHead"  # davix's hint for lcgdm-dav
     hctx.set_opt_string("HTTP PLUGIN", "DEFAULT_COPY_MODE", "3rd push")
@@ -494,9 +511,10 @@ def test_presigned_url_is_not_signed_again(
     hctx: xgfalclient.Gfal2Context, s3: WebDAVServer
 ) -> None:
     write(s3, "/bucket/f", b"abc")
-    signer = hctx.plugin("davs://h/", "stat").presigner_for(s3url(s3, "/bucket/f"))
+    signer = plugin(hctx).presigner_for(s3url(s3, "/bucket/f"))
+    assert signer is not None
     presigned = signer.presign("GET", s3url(s3, "/bucket/f"))
-    response = hctx.plugin("davs://h/", "stat")._request("GET", presigned)
+    response = plugin(hctx)._request("GET", presigned)
     assert (response.status, response.body()) == (200, b"abc")
     assert s3.requests[-1].header("Authorization") is None
 
@@ -505,15 +523,15 @@ def test_presigned_url_is_not_signed_again(
 
 
 def test_gcs(hctx: xgfalclient.Gfal2Context, gcs: WebDAVServer, tmp_path: Path) -> None:
-    gcs.s3.page_size = 2  # type: ignore[union-attr]
+    store(gcs).page_size = 2
     for name in "abc":
         write(gcs, f"/bucket/d/{name}", name.encode() * 3)
     url = gcs.url("/bucket/d/a", scheme="gcloud")
     assert hctx.stat(url).st_size == 3
-    assert "X-Goog-Signature=" in gcs.requests[-1].path
+    assert "X-Goog-Signature=" in gcs.requests[-1].target
     assert sorted(hctx.listdir(gcs.url("/bucket/d", scheme="gcloud"))) == ["a", "b", "c"]
-    assert any("marker=" in r.path for r in gcs.requests)
-    assert not any("list-type" in r.path for r in gcs.requests)
+    assert any("marker=" in r.target for r in gcs.requests)
+    assert not any("list-type" in r.target for r in gcs.requests)
     assert hctx.checksum(url, "md5") == hashlib.md5(b"aaa").hexdigest()
     crc = hctx.checksum(url, "crc32c")
     assert len(crc) == 8
@@ -543,7 +561,7 @@ def test_gcs_large_uploads_are_single_puts(
     source = tmp_path / "f"
     source.write_bytes(b"x" * 100)
     hctx.filecopy("file://" + str(source), gcs.url("/bucket/f", scheme="gcloud"))
-    assert not [r for r in gcs.requests if "uploads" in r.path]
+    assert not [r for r in gcs.requests if "uploads" in r.target]
     writer = plugin(hctx).open(gcs.url("/bucket/g", scheme="gcloud"), WRITE, 0o644, 20)
     writer.write(b"y" * 20)
     writer.close()
@@ -619,7 +637,7 @@ def test_gcloud_helpers() -> None:
     assert "X-Goog-Expires=604800" in url and url.startswith("https://storage.googleapis.com/b/k?")
     target = _client.Target.of("gcloud://h/b/k", s3=True)
     assert signer.sign("GET", target, {}, None) == {}
-    when = datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    when = datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
     signed = signer.signed_path("GET", target, when=when)
     assert "X-Goog-Date=20240102T030405Z" in signed
     assert "X-Goog-Credential=" + EMAIL.replace("@", "%40") + "%2F20240102%2F" in signed

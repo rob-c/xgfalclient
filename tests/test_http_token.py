@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """SE-issued tokens (``token_retrieve``) and CDMI QoS."""
 
 from __future__ import annotations
@@ -9,7 +8,10 @@ import urllib.parse
 import pytest
 
 import xgfalclient
-from test_http_helpers import dav, davs, hctx, write  # noqa: F401 - fixtures
+from test_http_helpers import dav as dav
+from test_http_helpers import davs as davs
+from test_http_helpers import hctx as hctx
+from test_http_helpers import write
 from xgfalclient import GError
 from xgfalclient.testing.pki import PKI
 from xgfalclient.testing.webdav import WebDAVServer
@@ -96,7 +98,7 @@ def test_issuer(hctx: xgfalclient.Gfal2Context, davs: WebDAVServer, grid_env: PK
     url = davs.url("/data/f")
     token = hctx.token_retrieve(url, davs.base.replace("https", "davs") + "/", 10, False)
     assert token.startswith("mac-")
-    assert [(r.method, r.path) for r in davs.requests] == [
+    assert [(r.method, r.target) for r in davs.requests] == [
         ("GET", "/.well-known/oauth-authorization-server"),
         ("GET", "/.well-known/oauth-authorization-server"),
         ("POST", "/data/f"),
@@ -115,7 +117,7 @@ def test_issuer_with_a_token_endpoint(
     token = hctx.token_retrieve(davs.url("/data/f"), davs.base + "/realm", 10, True)
     assert token.startswith("oauth-")
     discovery, post = davs.requests
-    assert discovery.path == "/.well-known/oauth-authorization-server/realm"
+    assert discovery.target == "/.well-known/oauth-authorization-server/realm"
     # SciTokens asks for client credentials, and nothing else.
     assert post.body == b"grant_type=client_credentials"
     assert post.header("Accept") == "application/json"
@@ -190,7 +192,7 @@ def test_qos(
         "/cdmi_capabilities/dataobject/disk/",
         "/cdmi_capabilities/dataobject/tape/",
     ]
-    assert qos.requests[-1].path == "/cdmi_capabilities/dataobject"
+    assert qos.requests[-1].target == "/cdmi_capabilities/dataobject"
     assert hctx.qos_check_classes(base, "container") == ["/cdmi_capabilities/container/disk/"]
     hctx.change_object_qos(qos.url("/data/f"), "/cdmi_capabilities/dataobject/tape")
     put = qos.requests[-1]
@@ -211,7 +213,7 @@ def test_qos_errors(
     with pytest.raises(GError) as caught:
         hctx.qos_check_classes(qos.url("/data/f"), "dataobject")  # the path is kept: 404
     assert (caught.value.code, caught.value.message) == (errno.ENOENT, "HTTP 404 : File not found ")
-    assert qos.requests[-1].path == "/data/f/cdmi_capabilities/dataobject"
+    assert qos.requests[-1].target == "/data/f/cdmi_capabilities/dataobject"
     assert capsys.readouterr().err == (
         " error in request of getting available QoS classes: HTTP 404 : File not found \n"
     )

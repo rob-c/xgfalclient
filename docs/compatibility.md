@@ -20,6 +20,17 @@ imports edited. Call it before any module imports the system `gfal2`; replacing
 an already imported extension module would leave two incompatible type worlds
 inside one process.
 
+## Python version
+
+xgfalclient 0.4.0 needs Python 3.11 or later. The system bindings it replaces
+are built for the distribution's own interpreter (`python3-gfal2` on
+AlmaLinux/RHEL 9 is a Python 3.9 module), so a drop-in on EL8 or EL9 means
+installing AppStream's `python3.11` or `python3.12` and running the
+application with that interpreter, for example `python3.11 -m venv` and a
+script shebang naming the venv. The system `python3` there is not supported;
+0.3.0 was the last release to declare Python 3.9 (its dependencies could not
+be resolved there), and 0.3.2 the last for Python 3.10.
+
 ## Version meanings
 
 The names intentionally answer different questions:

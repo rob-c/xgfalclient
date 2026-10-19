@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """The http plugin's namespace: stat, mkdir, rmdir, unlink, rename, listings, xattrs."""
 
 from __future__ import annotations
@@ -10,7 +9,10 @@ from pathlib import Path
 import pytest
 
 import xgfalclient
-from test_http_helpers import dav, dav2, hctx, write  # noqa: F401 - fixtures
+from test_http_helpers import dav as dav
+from test_http_helpers import dav2 as dav2
+from test_http_helpers import hctx as hctx
+from test_http_helpers import write
 from xgfalclient import GError
 from xgfalclient.testing.webdav import WebDAVServer
 
@@ -88,7 +90,7 @@ def test_stat_over_plain_http_falls_back_to_head(
     hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
 ) -> None:
     write(dav, "/data/f", b"12345")
-    dav.webdav = False
+    dav.no_dav = True
     info = hctx.stat(dav.url("/data/f", scheme="http"))
     # What davix makes of a HEAD: a 0755 file of that size, and no times.
     assert (info.st_size, info.st_mode, info.st_mtime) == (5, _stat.S_IFREG | 0o755, 0)
@@ -101,7 +103,7 @@ def test_stat_over_plain_http_falls_back_to_head(
 
 
 def test_dav_scheme_does_not_fall_back(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
-    dav.webdav = False
+    dav.no_dav = True
     with pytest.raises(GError) as caught:
         hctx.stat(dav.url("/data"))
     assert caught.value.code == errno.EPERM  # 405 -> EPERM, as davix maps it
@@ -145,10 +147,10 @@ def test_mkdir(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     )
 
 
-def test_mkdir_rec(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
-    hctx.mkdir_rec(dav.url("/data/a/b/c"), 0o755)
-    assert dav.local("/data/a/b/c").is_dir()
-    hctx.mkdir_rec(dav.url("/data/a/b/c"), 0o755)  # already there
+def test_mkdir_rec_accepts_a_file_on_the_name(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
+    """Making the collections is the shared suite's; this is gfal2's own leniency."""
     write(dav, "/data/file", b"x")
     hctx.mkdir_rec(dav.url("/data/file"), 0o755)  # a file there counts too, as in gfal2
     assert dav.local("/data/file").is_file()
@@ -190,7 +192,7 @@ def test_rmdir(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     dav.local("/data/d").mkdir()
     hctx.rmdir(dav.url("/data/d"))
     assert not dav.local("/data/d").exists()
-    assert dav.requests[-1].path == "/data/d/"
+    assert dav.requests[-1].target == "/data/d/"
     root = f"dav://127.0.0.1:{dav.port}"  # no path at all: the collection is "/"
     with pytest.raises(GError) as caught:
         hctx.rmdir(root)
@@ -268,27 +270,24 @@ def test_unlink_over_plain_http_is_just_a_delete(
 def test_bulk_unlink(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
     write(dav, "/data/a", b"x")
     results = hctx.unlink([dav.url("/data/a"), dav.url("/data/b")])
+    assert isinstance(results, list)
     assert results[0] is None and isinstance(results[1], GError)
 
 
-def test_rename(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
-    write(dav, "/data/old", b"x")
-    hctx.rename(dav.url("/data/old"), dav.url("/data/new"))
-    assert dav.local("/data/new").read_bytes() == b"x"
-    move = dav.requests[-1]
-    assert move.header("Destination") == f"http://127.0.0.1:{dav.port}/data/new"
+def test_a_failed_rename_is_worded_like_davix(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
     with pytest.raises(GError) as caught:
         hctx.rename(dav.url("/data/old"), dav.url("/data/x"))
     assert caught.value.message == (f"HTTP 404 : File not found  with url {dav.url('/data/old')}")
 
 
-def test_listdir_and_opendir(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
+def test_opendir_reads_entries_with_their_stat(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
     write(dav, "/data/dir/a", b"1")
     write(dav, "/data/dir/b c", b"22")
     dav.local("/data/dir/sub").mkdir()
-    assert sorted(hctx.listdir(dav.url("/data/dir"))) == ["a", "b c", "sub"]
-    listing = dav.requests[-1]
-    assert listing.header("Depth") == "1" and b"propfind" in listing.body
     directory = hctx.opendir(dav.url("/data/dir/"))
     found = {}
     while True:
@@ -353,19 +352,18 @@ def test_hostile_xml_is_refused(hctx: xgfalclient.Gfal2Context, dav: WebDAVServe
     assert caught.value.code == errno.EIO
 
 
-def test_propstat_statuses(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
+def test_creationdate_and_an_empty_length(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
     body = (
         b'<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/data/f'
-        b"</D:href><D:propstat><D:prop><D:getcontentlength>99</D:getcontentlength></D:prop>"
-        b"<D:status>HTTP/1.1 404 Not Found</D:status></D:propstat><D:propstat><D:prop>"
-        b"<D:getcontentlength>7</D:getcontentlength><D:getlastmodified>not a date"
-        b"</D:getlastmodified><D:creationdate>2024-01-02T03:04:05Z</D:creationdate>"
+        b"</D:href><D:propstat><D:prop><D:getcontentlength>7</D:getcontentlength>"
+        b"<D:creationdate>2024-01-02T03:04:05Z</D:creationdate>"
         b"</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
         b"</D:multistatus>"
     )
     dav.fault("PROPFIND", status=207, body=body)
-    info = hctx.stat(dav.url("/data/f"))
-    assert (info.st_size, info.st_mtime, info.st_ctime) == (7, 0, 1704164645)
+    assert hctx.stat(dav.url("/data/f")).st_ctime == 1704164645  # davix reads creationdate
     body = (
         b'<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/data/f'
         b"</D:href><D:propstat><D:prop><D:getcontentlength/></D:prop></D:propstat>"
@@ -416,10 +414,10 @@ def test_urls_are_quoted_and_queries_kept(
 ) -> None:
     write(dav, "/data/with space", b"x")
     assert hctx.stat(dav.url("/data/with space")).st_size == 1
-    assert dav.requests[-1].path == "/data/with%20space"
+    assert dav.requests[-1].target == "/data/with%20space"
     assert hctx.stat(dav.url("/data/with%20space?x=1&authz=secret")).st_size == 1
     request = dav.requests[-1]
-    assert request.path == "/data/with%20space?x=1&authz=secret"
+    assert request.target == "/data/with%20space?x=1&authz=secret"
     assert request.header("Authorization") is None
 
 

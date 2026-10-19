@@ -18,4 +18,10 @@ The modules and public names are gfal2-util's (``base``, ``shell``,
 ``progress``, ``gfal2_utils_parameters``); the commands behind them are
 :mod:`xgfalclient.cli`'s, so they behave exactly as the installed
 ``gfal-*`` scripts do.
+
+Each module here is a thin adapter: it re-exports names or builds
+gfal2-util-shaped classes around the :class:`xgfalclient.cli._base.Spec`
+objects, so there is one implementation of every command. Signatures of
+the public names must stay gfal2-util's; anything new belongs in
+:mod:`xgfalclient.cli`.
 """

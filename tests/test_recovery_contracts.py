@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import errno
 import os
+import time
+from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, NoReturn, cast
 
 import pytest
 
+import xgfalclient
 from xgfalclient.errors import GError
 from xgfalclient.plugins import file as local
 from xgfalclient.plugins.http import _io
-from xgfalclient.transfer import _sync_local_destination
+from xgfalclient.plugins.http._client import Response
+from xgfalclient.transfer import Transfer, _sync_local_destination
 
 
-def options(interval=None):
+def options(interval: int | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         integer=lambda group, key, default: default if interval is None else interval,
         has=lambda group, key: interval is not None,
@@ -22,28 +28,32 @@ def options(interval=None):
 
 
 @pytest.mark.parametrize("interval,expected", [(None, 0.1), (0, None), (2, 2.0)])
-def test_local_retry_pause_policy(monkeypatch, interval, expected):
-    calls = []
-    monkeypatch.setattr(local.time, "sleep", calls.append)
+def test_local_retry_pause_policy(
+    monkeypatch: pytest.MonkeyPatch, interval: int | None, expected: float | None
+) -> None:
+    calls: list[float] = []
+    monkeypatch.setattr(time, "sleep", calls.append)
     local._retry_pause(options(interval), 2)
     assert calls == ([] if expected is None else [expected])
 
 
 @pytest.mark.parametrize("method", ["pread", "readinto"])
-def test_local_read_reopens_once_without_changing_source(tmp_path, monkeypatch, method):
+def test_local_read_reopens_once_without_changing_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
     path = tmp_path / "data"
     path.write_bytes(b"a" * 5000)
-    calls = []
+    calls: list[str] = []
     original = local._os
 
-    def interrupted(function, *args):
+    def interrupted(function: Callable[..., Any], *args: Any) -> Any:
         if function.__name__ == method and not calls:
             calls.append(function.__name__)
             raise GError("stale descriptor", errno.ESTALE)
         return original(function, *args)
 
     monkeypatch.setattr(local, "_os", interrupted)
-    monkeypatch.setattr(local.time, "sleep", lambda _: None)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
     handle = local.LocalFile(path.as_uri(), str(path), os.O_RDONLY, 0o600, options())
     try:
         if method == "pread":
@@ -57,12 +67,12 @@ def test_local_read_reopens_once_without_changing_source(tmp_path, monkeypatch, 
         handle.close()
 
 
-def test_local_read_without_recovery_options_preserves_error(tmp_path):
+def test_local_read_without_recovery_options_preserves_error(tmp_path: Path) -> None:
     path = tmp_path / "data"
     path.write_bytes(b"data")
     handle = local.LocalFile(path.as_uri(), str(path), os.O_RDONLY, 0o600)
 
-    def failed():
+    def failed() -> NoReturn:
         raise GError("stale descriptor", errno.ESTALE)
 
     try:
@@ -73,18 +83,20 @@ def test_local_read_without_recovery_options_preserves_error(tmp_path):
 
 
 @pytest.mark.parametrize("failure", ["open", "stat", "changed"])
-def test_local_reopen_rejects_errors_and_changed_generation(tmp_path, monkeypatch, failure):
+def test_local_reopen_rejects_errors_and_changed_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
     path = tmp_path / "data"
     path.write_bytes(b"data")
     handle = local.LocalFile(path.as_uri(), str(path), os.O_RDONLY, 0o600, options(0))
 
-    def failed(*args):
+    def failed(*args: object) -> NoReturn:
         raise OSError(errno.EIO, "unavailable")
 
     if failure == "changed":
         handle._identity = (0, 0, 0, 0, 0)
     else:
-        monkeypatch.setattr(local.os, "open" if failure == "open" else "fstat", failed)
+        monkeypatch.setattr(os, "open" if failure == "open" else "fstat", failed)
     try:
         with pytest.raises(GError) as caught:
             handle._reopen_read(1, GError("stale descriptor", errno.ESTALE))
@@ -93,17 +105,19 @@ def test_local_reopen_rejects_errors_and_changed_generation(tmp_path, monkeypatc
         handle.close()
 
 
-def test_local_constructor_closes_descriptor_when_stat_fails(tmp_path, monkeypatch):
+def test_local_constructor_closes_descriptor_when_stat_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "data"
     path.write_bytes(b"data")
-    descriptor = []
+    descriptor: list[int] = []
     original = os.fstat
 
-    def failed(fd):
+    def failed(fd: int) -> NoReturn:
         descriptor.append(fd)
         raise OSError(errno.EIO, "stat failed")
 
-    monkeypatch.setattr(local.os, "fstat", failed)
+    monkeypatch.setattr(os, "fstat", failed)
     with pytest.raises(OSError, match="stat failed"):
         local.LocalFile(path.as_uri(), str(path), os.O_RDONLY, 0o600)
     with pytest.raises(OSError) as caught:
@@ -111,47 +125,51 @@ def test_local_constructor_closes_descriptor_when_stat_fails(tmp_path, monkeypat
     assert caught.value.errno == errno.EBADF
 
 
-def test_plugin_open_retries_a_transient_read_failure(tmp_path, monkeypatch, ctx):
+def test_plugin_open_retries_a_transient_read_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ctx: xgfalclient.Gfal2Context
+) -> None:
     path = tmp_path / "data"
     path.write_bytes(b"data")
     original = local.LocalFile
-    calls = []
+    calls: list[tuple[Any, ...]] = []
 
-    def interrupted(*args):
+    def interrupted(*args: Any) -> local.LocalFile:
         calls.append(args)
         if len(calls) == 1:
             raise OSError(errno.ESTALE, "stale mount")
         return original(*args)
 
     monkeypatch.setattr(local, "LocalFile", interrupted)
-    monkeypatch.setattr(local.time, "sleep", lambda _: None)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
     with ctx.open(path.as_uri(), "r") as handle:
         assert handle.read_bytes(4) == b"data"
     assert len(calls) == 2
 
 
 @pytest.mark.parametrize("failure", ["size", "sync"])
-def test_destination_sync_failure_is_not_reported_as_success(tmp_path, monkeypatch, failure):
+def test_destination_sync_failure_is_not_reported_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
     path = tmp_path / "data"
     path.write_bytes(b"data")
     transfer = SimpleNamespace(destination=path.as_uri(), transferred=3 if failure == "size" else 4)
 
-    def failed(fd):
+    def failed(fd: int) -> NoReturn:
         raise OSError(errno.ENOSPC, "disk full")
 
     if failure == "sync":
         monkeypatch.setattr(os, "fsync", failed)
     with pytest.raises(GError, match="Could not sync destination") as caught:
-        _sync_local_destination(transfer)
+        _sync_local_destination(cast(Transfer, transfer))
     assert caught.value.code == (errno.EIO if failure == "size" else errno.ENOSPC)
 
 
-def test_skipping_an_ignored_range_stops_at_eof():
-    calls = []
+def test_skipping_an_ignored_range_stops_at_eof() -> None:
+    calls: list[int] = []
 
-    def eof(view):
+    def eof(view: memoryview) -> int:
         calls.append(len(view))
         return 0
 
-    _io._skip(SimpleNamespace(readinto=eof), 4)
+    _io._skip(cast(Response, SimpleNamespace(readinto=eof)), 4)
     assert calls == [4]

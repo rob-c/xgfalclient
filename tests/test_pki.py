@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from xrdsec import tls
 
 from xgfalclient.crypto import x509
 from xgfalclient.testing import pki as pki_module
@@ -62,7 +63,7 @@ def test_tls_contexts_interoperate(pki: PKI) -> None:
     assert server.verify_mode in (ssl.CERT_REQUIRED, ssl.CERT_NONE)
     assert pki.server_context(require_client=False).verify_mode == ssl.CERT_NONE
     client = pki.client_context()
-    capath = ssl.create_default_context(capath=str(pki.ca_dir))
+    capath = tls.client_context(ca_path=pki.ca_dir)  # trusting the CA directory, presenting nothing
     anonymous = pki.server_context(require_client=False)
     for context, responder in ((client, server), (capath, anonymous)):
         incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
@@ -103,9 +104,10 @@ def test_proxy_variants_and_custom_paths(pki: PKI, tmp_path: Path) -> None:
 def test_custom_hosts(tmp_path: Path) -> None:
     other = create_pki(tmp_path, hosts=("se.example.org", "10.0.0.1"), host_cn="se.example.org")
     assert other.host.subject.cn == "se.example.org"
-    from xgfalclient.crypto.gsi import dns_names
+    from xrdsec.gsi.gss import dns_names
+    from xrdsec.x509 import certificate_data
 
-    assert dns_names(other.host) == ["se.example.org"]
+    assert dns_names(certificate_data(other.host.der)) == ["se.example.org"]
     assert os.path.isdir(other.ca_dir)
 
 

@@ -7,13 +7,16 @@ import io
 import os
 import socket
 import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
 from xgfalclient.plugins.sftp import protocol as fx
 from xgfalclient.plugins.sftp.client import SFTPClient
 from xgfalclient.plugins.sftp.protocol import Attrs, StatusError
+from xgfalclient.plugins.sftp.ssh import MSG_CHANNEL_CLOSE, MSG_CHANNEL_EOF
 from xgfalclient.testing import sftp as tsftp
 from xgfalclient.testing.sftp import (
     FAKE_HOSTS,
@@ -27,17 +30,19 @@ from xgfalclient.testing.sftp import (
 # -- portable_status ----------------------------------------------------------
 
 
-def test_eof_fault_always_emits_eof_and_close_before_dropping_the_wire() -> None:
-    packets = []
+def test_eof_fault_always_emits_eof_and_close_before_dropping_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packets: list[bytes] = []
     peer = tsftp._SSHServerConn.__new__(tsftp._SSHServerConn)
     peer.remote_channel = 7
     peer.server = type("Fault", (), {"fault": "eof_close"})()
-    peer.send_packet = packets.append
+    monkeypatch.setattr(peer, "send_packet", packets.append)
     with pytest.raises(EOFError):
         peer._emit_channel_faults()
     assert [packet[0] for packet in packets] == [
-        tsftp._ssh.MSG_CHANNEL_EOF,
-        tsftp._ssh.MSG_CHANNEL_CLOSE,
+        MSG_CHANNEL_EOF,
+        MSG_CHANNEL_CLOSE,
     ]
 
 
@@ -76,13 +81,14 @@ def test_socketstream_close_is_tolerant() -> None:
 
 
 @pytest.fixture
-def client(tmp_path: Path) -> SFTPClient:
+def client(tmp_path: Path) -> Iterator[SFTPClient]:
     (tmp_path / "file.txt").write_bytes(b"contents\n")
     (tmp_path / "dir").mkdir()
     server = SFTPServer(tmp_path)
     c = SFTPClient(server.pair())
     c.handshake()
-    return c
+    yield c
+    c.close()
 
 
 def test_setstat_times_and_size(client: SFTPClient, tmp_path: Path) -> None:
@@ -99,7 +105,8 @@ def test_fsetstat_and_fstat(client: SFTPClient) -> None:
         client.request(fx.FSETSTAT, tsftp.string(handle), Attrs(permissions=0o600).encode())
     )
     client.close_handle(handle)
-    assert client.stat(b"/w.txt").permissions & 0o777 == 0o600
+    permissions = client.stat(b"/w.txt").permissions
+    assert permissions is not None and permissions & 0o777 == 0o600
 
 
 def test_mkdir_default_mode_and_empty_realpath(client: SFTPClient, tmp_path: Path) -> None:
@@ -256,8 +263,8 @@ def test_ssh_username_mismatch(tmp_path: Path) -> None:
     )
     from xgfalclient.errors import GError
 
-    with pytest.raises(GError, match="authentication methods failed"):
-        ssh.connect(endpoint, ssh.Auth(username="bob", password="pw"), sock=server.pair())
+    with server.pair() as sock, pytest.raises(GError, match="authentication methods failed"):
+        ssh.connect(endpoint, ssh.Auth(username="bob", password="pw"), sock=sock)
 
 
 # -- fake ssh -----------------------------------------------------------------
@@ -313,7 +320,7 @@ def test_write_fake_ssh(tmp_path: Path) -> None:
     assert "fake_ssh_main" in text and text.startswith("#!")
 
 
-def _packets(*chunks: bytes):  # type: ignore[no-untyped-def]
+def _packets(*chunks: bytes) -> Callable[[int], bytes]:
     buf = bytearray(b"".join(chunks))
 
     def read_exact(n: int) -> bytes:
@@ -375,7 +382,7 @@ def test_readdir_skips_unlstatable_entries(tmp_path: Path, monkeypatch: pytest.M
     server = SFTPServer(tmp_path)
     real_lstat = os.lstat
 
-    def flaky_lstat(path, *a, **k):  # type: ignore[no-untyped-def]
+    def flaky_lstat(path: Any, *a: Any, **k: Any) -> os.stat_result:
         if os.fspath(path).endswith("skipme"):
             raise OSError(errno.ENOENT, "vanished")
         return real_lstat(path, *a, **k)
@@ -403,9 +410,9 @@ class _FakeConnSock:
         self.sent.extend(data)
 
 
-def _server_conn() -> tsftp._SSHServerConn:
+def _server_conn(sock: _FakeConnSock | None = None) -> tsftp._SSHServerConn:
     dummy = type("S", (), {})()
-    conn = tsftp._SSHServerConn(dummy, _FakeConnSock())
+    conn = tsftp._SSHServerConn(dummy, cast(socket.socket, sock or _FakeConnSock()))
     conn.remote_channel = 1
     conn.client_maxpacket = 100
     conn.client_window = 0
@@ -413,7 +420,8 @@ def _server_conn() -> tsftp._SSHServerConn:
 
 
 def test_server_chan_write_blocks_then_grants() -> None:
-    conn = _server_conn()
+    sock = _FakeConnSock()
+    conn = _server_conn(sock)
 
     def grant() -> None:
         with conn.cond:
@@ -424,7 +432,7 @@ def test_server_chan_write_blocks_then_grants() -> None:
     timer.start()
     conn._chan_write(b"x" * 40)  # blocks until the window opens
     timer.join()
-    assert conn.sock.sent
+    assert sock.sent
 
 
 def test_server_chan_write_aborts_on_error() -> None:

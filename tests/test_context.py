@@ -247,7 +247,8 @@ def test_guard_translates_oserror_and_refuses_after_free(fctx: Gfal2Context) -> 
         fctx._guard(boom, None)
     assert caught.value.code == errno.EIO
     # bytes arguments are strings, as Boost.Python converts them
-    assert fctx.stat(b"fake://h/f").st_size == fctx.stat("fake://h/f").st_size
+    # Deliberately bytes: the bindings accept them, and the runtime must too.
+    assert fctx.stat(b"fake://h/f").st_size == fctx.stat("fake://h/f").st_size  # type: ignore[arg-type]
     handle = fctx.open("fake://h/f", "r")
     fctx.free()
     for call in (
@@ -399,8 +400,9 @@ def test_mkdir_rec_prefers_the_plugin(fctx: Gfal2Context) -> None:
                 raise GError("io", errno.EIO)
 
     plugin = fctx.add_plugin(WithRec)
+    assert isinstance(plugin, WithRec)
     assert fctx.mkdir_rec("rec://h/x/y", 0o700) == 0
-    assert plugin.calls == [("mkdir_rec", "rec://h/x/y")]  # type: ignore[attr-defined]
+    assert plugin.calls == [("mkdir_rec", "rec://h/x/y")]
     assert fctx.mkdir_rec("rec://h/there", 0o700) == 0
     with pytest.raises(GError):
         fctx.mkdir_rec("rec://h/broken", 0o700)
@@ -453,7 +455,8 @@ def test_plugins_may_give_each_entry_its_own_type(
     monkeypatch.setattr(plugin, "opendir", lambda url: iter(listing))
     assert [(e.d_name, e.d_type) for e in fctx.opendir("fake://h/d")] == [("l", 10), ("x", 1)]
     entry, info = fctx.opendir("fake://h/d").readpp()
-    assert (entry.d_type, info.st_size) == (10, 3)  # type: ignore[union-attr]
+    assert entry is not None and info is not None
+    assert (entry.d_type, info.st_size) == (10, 3)
     assert fctx.listdir("fake://h/d") == ["l", "x"]  # Fake has no listdir: from opendir
 
 
@@ -466,10 +469,24 @@ def test_readpp_child_url_keeps_query(fctx: Gfal2Context, monkeypatch: pytest.Mo
     assert fctx.opendir("fake://h/q?x=1").readpp()[1] == DIR
     handle = fctx.opendir("fake://h/q?x=1")
     handle.readpp()
-    assert handle.readpp()[1].st_size == 2  # type: ignore[union-attr]
+    assert _size(handle.readpp()[1]) == 2
     handle = fctx.opendir("fake://h/s/")
     handle.readpp()
-    assert handle.readpp()[1].st_size == 1  # type: ignore[union-attr]
+    assert _size(handle.readpp()[1]) == 1
+
+
+def _size(info: Stat | None) -> int:
+    """The size of a listing entry that must have a stat."""
+    assert info is not None
+    return info.st_size
+
+
+def _each(results: int | list[GError | None]) -> list[GError]:
+    """A list-form call's answers, every one a failure."""
+    assert isinstance(results, list)
+    failures = [result for result in results if isinstance(result, GError)]
+    assert len(failures) == len(results)
+    return failures
 
 
 def test_unlink_list_forms(fctx: Gfal2Context) -> None:
@@ -477,6 +494,7 @@ def test_unlink_list_forms(fctx: Gfal2Context) -> None:
         fctx.unlink([])
     assert caught.value.args == ("Empty list of files", errno.EINVAL)
     results = fctx.unlink(["fake://h/f", "fake://h/nope"])
+    assert isinstance(results, list)
     assert results[0] is None
     assert isinstance(results[1], GError) and results[1].code == errno.ENOENT
 
@@ -509,10 +527,10 @@ def test_urls_of_2048_bytes_are_refused_as_gfal2_does(fctx: Gfal2Context) -> Non
     # Unchecked lookups reach the plugin.
     assert fctx.readlink(long) == "target"
     # List forms check the first URL only.
-    first = fctx.unlink([long, "fake://h/f"])
-    assert [e.args for e in first] == [invalid, invalid]  # type: ignore[union-attr]
-    later = fctx.unlink(["fake://h/nope", long, "nope://h/x"])
-    assert [e.code for e in later] == [errno.ENOENT] * 2 + [errno.EPROTONOSUPPORT]  # type: ignore[union-attr]
+    first = _each(fctx.unlink([long, "fake://h/f"]))
+    assert [e.args for e in first] == [invalid, invalid]
+    later = _each(fctx.unlink(["fake://h/nope", long, "nope://h/x"]))
+    assert [e.code for e in later] == [errno.ENOENT] * 2 + [errno.EPROTONOSUPPORT]
 
 
 # -- files ----------------------------------------------------------------------------
@@ -867,18 +885,18 @@ def test_lifecycle(caplog: pytest.LogCaptureFixture) -> None:
     assert context._freed
     with context:  # leaving a with block on a freed context does not free it again
         pass
-    assert context.Stat is Stat
+    assert vars(Gfal2Context)["Stat"] is Stat
     assert isinstance(xgfalclient.creat_context(), Gfal2Context)
 
 
 def test_nested_names_are_the_bindings(fctx: Gfal2Context) -> None:
-    assert Gfal2Context.TransferParameters is xgfalclient.TransferParameters
+    assert vars(Gfal2Context)["TransferParameters"] is xgfalclient.TransferParameters
     assert Gfal2Context.transfer_parameters is xgfalclient.TransferParameters
     assert isinstance(fctx.transfer_parameters(), fctx.transfer_parameters)
-    assert Gfal2Context.cred_new is Credential is Gfal2Context.Credential
-    assert Gfal2Context.event_side is xgfalclient.event_side  # type: ignore[attr-defined]
-    assert Gfal2Context.gfalt_event is xgfalclient.GfaltEvent  # type: ignore[attr-defined]
-    assert Gfal2Context.NullHandler is logging.NullHandler  # type: ignore[attr-defined]
+    assert Gfal2Context.cred_new is Credential is vars(Gfal2Context)["Credential"]
+    assert Gfal2Context.event_side is xgfalclient.event_side
+    assert Gfal2Context.gfalt_event is xgfalclient.GfaltEvent
+    assert Gfal2Context.NullHandler is logging.NullHandler
 
 
 def test_cancel_waits_for_other_threads(fctx: Gfal2Context) -> None:
@@ -960,7 +978,7 @@ def test_cancel_drains_when_the_last_operation_leaves(fctx: Gfal2Context) -> Non
 
 def test_cancel_from_inside_an_operation_does_not_wait_for_it(fctx: Gfal2Context) -> None:
     def nested() -> int:
-        return fctx._guard(fctx.cancel)  # type: ignore[no-any-return]
+        return fctx._guard(fctx.cancel)
 
     assert fctx._guard(nested) == 2
     assert fctx._running == 0
@@ -968,12 +986,17 @@ def test_cancel_from_inside_an_operation_does_not_wait_for_it(fctx: Gfal2Context
 
 def test_filecopy_overloads(fctx: Gfal2Context, monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[tuple[Any, ...]] = []
+
+    def bulk(ctx: Gfal2Context, params: Any, srcs: Any, dsts: Any, cks: Any) -> list[None]:
+        seen.append(("bulk", srcs, dsts, cks))
+        return [None]
+
     monkeypatch.setattr(
         "xgfalclient.context.run_copy", lambda ctx, params, src, dst: seen.append(("one", src, dst))
     )
     monkeypatch.setattr(
         "xgfalclient.context.run_bulk",
-        lambda ctx, params, srcs, dsts, cks: seen.append(("bulk", srcs, dsts, cks)) or [None],
+        bulk,
     )
     params = fctx.transfer_parameters()
     assert fctx.filecopy(params, "fake://h/a", "fake://h/b") == 0

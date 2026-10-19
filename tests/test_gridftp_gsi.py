@@ -9,10 +9,11 @@ import threading
 from pathlib import Path
 
 import pytest
+from xrdsec.gsi import gss
+from xrdsec.gsi.gss import GSIError, SecurityContext
+from xrdsec.testing.gsi import exchange_tokens
 
-from conftest import needs_peer_chain
 from xgfalclient.crypto.der import sequence
-from xgfalclient.crypto.gsi import GSIError, SecurityContext
 from xgfalclient.crypto.proxy import make_request
 from xgfalclient.plugins.gridftp import gsi
 from xgfalclient.plugins.gridftp.data import authenticate
@@ -21,32 +22,16 @@ from xgfalclient.testing.pki import PKI, create_pki, test_key
 
 
 def client_tls(pki: PKI, *, tls12: bool = False) -> ssl.SSLContext:
-    context = ssl.create_default_context(cafile=str(pki.ca_file))
-    context.check_hostname = False
-    context.load_cert_chain(str(pki.proxy_path))
+    context = pki.client_context(check_hostname=False)  # fresh, so the TLS cap below is ours
     if tls12:
         context.maximum_version = ssl.TLSVersion.TLSv1_2
     return context
 
 
-def drive(client: SecurityContext, server: SecurityContext) -> list[bytes]:
-    """Ferry tokens until both are complete; the tokens the server sent."""
-    sent = []
-    token = client.step()
-    for _ in range(20):
-        token = server.step(token)
-        sent.append(token)
-        token = client.step(token)
-        if client.complete and server.complete and not token:
-            return sent
-    raise AssertionError("the GSI exchange did not converge")
-
-
-@needs_peer_chain
 def test_tls13_turn_and_one_certificate_delegation(pki: PKI) -> None:
     client = GlobusContext(client_tls(pki), delegate=pki.credential())
     server = GlobusContext(pki.server_context(), server_side=True, delegation_key=test_key(4))
-    sent = drive(client, server)
+    sent = exchange_tokens(client, server)
     assert client.tls.version() == "TLSv1.3"
     # The server's reply to the client's Finished carries the one-byte turn.
     assert any(len(token) >= 23 for token in sent[1:])
@@ -63,23 +48,22 @@ def test_tls13_turn_and_one_certificate_delegation(pki: PKI) -> None:
 def test_tls13_without_delegation(pki: PKI) -> None:
     client = GlobusContext(client_tls(pki))
     server = GlobusContext(pki.server_context(), server_side=True)
-    drive(client, server)
+    exchange_tokens(client, server)
     assert server.delegated is None
 
 
 def test_tls12_flag_follows_the_handshake(pki: PKI) -> None:
     client = GlobusContext(client_tls(pki, tls12=True), delegate=pki.credential())
     server = GlobusContext(pki.server_context(), server_side=True, delegation_key=test_key(4))
-    drive(client, server)
+    exchange_tokens(client, server)
     assert client.tls.version() == "TLSv1.2"
     assert server.delegated is not None
 
 
-@needs_peer_chain
 def test_a_core_client_that_sends_the_whole_chain(pki: PKI) -> None:
     client = SecurityContext(client_tls(pki, tls12=True), delegate=pki.credential())
     server = GlobusContext(pki.server_context(), server_side=True, delegation_key=test_key(4))
-    drive(client, server)
+    exchange_tokens(client, server)
     assert server.delegated is not None
     assert len(server.delegated.chain) == 1 + len(pki.credential().chain)
 
@@ -87,7 +71,7 @@ def test_a_core_client_that_sends_the_whole_chain(pki: PKI) -> None:
 def test_ssl_compatible_is_plain_tls(pki: PKI) -> None:
     client = GlobusContext(client_tls(pki), ssl_compatible=True)
     server = GlobusContext(pki.server_context(), server_side=True, ssl_compatible=True)
-    drive(client, server)
+    exchange_tokens(client, server)
     assert client.unwrap(server.wrap(b"data")) == b"data"
 
 
@@ -96,7 +80,7 @@ def test_handshake_failure(pki: PKI, tmp_path: Path) -> None:
     client = GlobusContext(client_tls(other))
     server = GlobusContext(pki.server_context(), server_side=True)
     with pytest.raises(GSIError, match="handshake failed"):
-        drive(client, server)
+        exchange_tokens(client, server)
 
 
 def test_delegation_request_edge_cases(pki: PKI) -> None:
@@ -130,16 +114,15 @@ def test_same_identity(pki: PKI) -> None:
     assert not same_identity(None, user.subject.rdns)
 
 
-def test_data_contexts_are_cached(pki: PKI) -> None:
-    path = str(pki.proxy_path)
-    first = data_contexts(path, path, str(pki.ca_dir))
-    assert data_contexts(path, path, str(pki.ca_dir)) is first
-    initiator, acceptor = data_contexts(path, path, None)
-    assert initiator.verify_mode == ssl.CERT_REQUIRED
-    assert acceptor.verify_flags & gsi.ALLOW_PROXY
+def test_data_contexts_are_xrdsecs() -> None:
+    """The DCAU pair is built and cached by xrdsec (whose suite tests it); the old name stays."""
+    assert data_contexts is gss.data_contexts
+    assert gsi.ALLOW_PROXY == ssl.VERIFY_ALLOW_PROXY_CERTS
 
 
-def _pair(pki: PKI, *, ssl_compatible: bool, identity: tuple[tuple[str, str], ...] | None = None):  # type: ignore[no-untyped-def]
+def _pair(
+    pki: PKI, *, ssl_compatible: bool, identity: tuple[tuple[str, str], ...] | None = None
+) -> dict[str, object]:
     path = str(pki.proxy_path)
     initiator, acceptor = data_contexts(path, path, str(pki.ca_dir))
     person = identity or pki.credential().chain[1].subject.rdns

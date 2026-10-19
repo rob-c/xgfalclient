@@ -18,6 +18,12 @@ srm-ifce releases whose behaviour is reproduced.
 
 For code that imports gfal2-util itself (``from gfal2_util.shell import
 Gfal2Shell``), the ``gfal2_util`` package runs these same commands.
+
+Layout: :mod:`._base` is the shared machinery (parser, logging, the worker
+thread, exit statuses); each ``_<module>`` holds commands and a ``SPECS``
+dict, which :data:`COMMANDS` maps names to. The functions below are the
+console-script entry points named in ``pyproject.toml``; each is one line
+because all the work is in :func:`run`.
 """
 
 from __future__ import annotations
@@ -86,6 +92,12 @@ SRM_IFCE_VERSION = "1.24.8"
 
 
 def run(command: str, argv: Sequence[str] | None = None) -> int:
+    """Run ``gfal-<command>`` with ``argv`` (default ``sys.argv[1:]``); its exit status.
+
+    The command's module is imported only now, so ``gfal-ls`` never pays
+    for ``gfal-copy``'s imports. The run is wrapped in a report context
+    for ``--json``/``--xml``.
+    """
     return output.run_cli(f"gfal-{command}", argv, lambda: _run(command, argv))
 
 
@@ -108,78 +120,97 @@ def _run(command: str, argv: Sequence[str] | None = None) -> int:
 
 
 def archivepoll(argv: Sequence[str] | None = None) -> int:
+    """``gfal-archivepoll``: is each file on tape yet (see :mod:`._tape`)."""
     return run("archivepoll", argv)
 
 
 def bringonline(argv: Sequence[str] | None = None) -> int:
+    """``gfal-bringonline``: stage files from tape (see :mod:`._tape`)."""
     return run("bringonline", argv)
 
 
 def cat(argv: Sequence[str] | None = None) -> int:
+    """``gfal-cat``: files' bytes to stdout."""
     return run("cat", argv)
 
 
 def chmod(argv: Sequence[str] | None = None) -> int:
+    """``gfal-chmod``: set permission bits."""
     return run("chmod", argv)
 
 
 def copy(argv: Sequence[str] | None = None) -> int:
+    """``gfal-copy``: files, chains and trees (see :mod:`._copy`)."""
     return run("copy", argv)
 
 
 def evict(argv: Sequence[str] | None = None) -> int:
+    """``gfal-evict``: release a staged file's disk copy."""
     return run("evict", argv)
 
 
 def legacy_bringonline(argv: Sequence[str] | None = None) -> int:
+    """gfal2-util's deprecated ``gfal-legacy-bringonline``, mirrored, with its notice."""
     return run("legacy-bringonline", argv)
 
 
 def legacy_register(argv: Sequence[str] | None = None) -> int:
+    """``gfal-legacy-register``: add a replica to an LFC entry."""
     return run("legacy-register", argv)
 
 
 def legacy_replicas(argv: Sequence[str] | None = None) -> int:
+    """``gfal-legacy-replicas``: list an LFC entry's replicas."""
     return run("legacy-replicas", argv)
 
 
 def legacy_unregister(argv: Sequence[str] | None = None) -> int:
+    """``gfal-legacy-unregister``: remove a replica from an LFC entry."""
     return run("legacy-unregister", argv)
 
 
 def ls(argv: Sequence[str] | None = None) -> int:
+    """``gfal-ls``: list a directory or describe a file (see :mod:`._ls`)."""
     return run("ls", argv)
 
 
 def mkdir(argv: Sequence[str] | None = None) -> int:
+    """``gfal-mkdir``: create directories."""
     return run("mkdir", argv)
 
 
 def rename(argv: Sequence[str] | None = None) -> int:
+    """``gfal-rename``: rename within one storage."""
     return run("rename", argv)
 
 
 def rm(argv: Sequence[str] | None = None) -> int:
+    """``gfal-rm``: remove files or trees (see :mod:`._rm`)."""
     return run("rm", argv)
 
 
 def save(argv: Sequence[str] | None = None) -> int:
+    """``gfal-save``: stdin to a remote file."""
     return run("save", argv)
 
 
 def stat(argv: Sequence[str] | None = None) -> int:
+    """``gfal-stat``: one entry's metadata."""
     return run("stat", argv)
 
 
 def sum(argv: Sequence[str] | None = None) -> int:
+    """``gfal-sum``: a file's checksum."""
     return run("sum", argv)
 
 
 def token(argv: Sequence[str] | None = None) -> int:
+    """``gfal-token``: a storage-issued token."""
     return run("token", argv)
 
 
 def xattr(argv: Sequence[str] | None = None) -> int:
+    """``gfal-xattr``: list, get or set extended attributes."""
     return run("xattr", argv)
 
 
@@ -200,6 +231,7 @@ def gfal_srm_ifce_version(argv: Sequence[str] | None = None) -> int:
 
 
 def _version(text: str, version: str) -> int:
+    """Print a version tool's line and record the version for a report; status 0."""
     from ._base import out
 
     output.record("version", version=version)

@@ -36,55 +36,57 @@ import stat as _stat
 import struct
 from dataclasses import dataclass
 
-from ..._compat import SLOTS
 from ...errors import GError
 from ...types import Stat
 from ...url import parse as parse_url_parts
 
 __all__ = [
+    "ADLER32",
+    "DATA_SUM",
     "DEFAULT_PORTS",
+    "HEADER",
+    "INT",
+    "IOCMD_ACK",
+    "IOCMD_CLOSE",
+    "IOCMD_DATA",
+    "IOCMD_FIN",
+    "IOCMD_LOCATE",
+    "IOCMD_READ",
+    "IOCMD_SEEK",
+    "IOCMD_SEEK_READ",
+    "IOCMD_SEEK_WRITE",
+    "IOCMD_WRITE",
     "SCHEMES",
+    "SEEK_CURRENT",
+    "SEEK_END",
+    "SEEK_SET",
     "VERSION",
     "DcapURL",
     "Reply",
-    "parse_url",
     "encode_path",
-    "tokenize",
-    "quote",
-    "parse_reply",
-    "options",
-    "parse_stat",
-    "stat_fields",
-    "mode_string",
     "error_code",
-    "IOCMD_WRITE",
-    "IOCMD_READ",
-    "IOCMD_SEEK",
-    "IOCMD_CLOSE",
-    "IOCMD_ACK",
-    "IOCMD_FIN",
-    "IOCMD_DATA",
-    "IOCMD_LOCATE",
-    "IOCMD_SEEK_READ",
-    "IOCMD_SEEK_WRITE",
-    "SEEK_SET",
-    "SEEK_CURRENT",
-    "SEEK_END",
-    "DATA_SUM",
-    "ADLER32",
-    "INT",
-    "HEADER",
+    "mode_string",
+    "options",
+    "parse_reply",
+    "parse_stat",
+    "parse_url",
+    "quote",
+    "stat_fields",
+    "tokenize",
 ]
 
 #: The dcap schemes and their door ports (``dcap.net.port.*`` in dCache).
 DEFAULT_PORTS = {"dcap": 22125, "gsidcap": 22128, "kdcap": 22725}
+#: Every scheme :func:`parse_url` accepts.
 SCHEMES = tuple(DEFAULT_PORTS)
 
 #: The libdcap release this client presents itself as in ``hello``:
 #: protocol 2, library 47.14 (dcap 2.47.14, what EL9 ships).
 VERSION = (2, 47, 14)
 
-# Data-channel commands (dcap_protocol.h / DCapConstants).
+# Data-channel commands (dcap_protocol.h / DCapConstants). Requests use the
+# I/O commands; the mover answers with ACK (accepted, with its result),
+# DATA (blocks follow) and FIN (the blocks are done, with the final result).
 IOCMD_WRITE = 1
 IOCMD_READ = 2
 IOCMD_SEEK = 3
@@ -96,6 +98,7 @@ IOCMD_LOCATE = 9
 IOCMD_SEEK_READ = 11
 IOCMD_SEEK_WRITE = 12
 
+# The ``whence`` of SEEK, SEEK_AND_READ and SEEK_AND_WRITE, as lseek's.
 SEEK_SET = 0
 SEEK_CURRENT = 1
 SEEK_END = 2
@@ -104,6 +107,8 @@ SEEK_END = 2
 DATA_SUM = 1
 ADLER32 = 1
 
+#: The data channel's integers are big-endian signed 32-bit ones, except
+#: offsets, sizes and read lengths (64-bit) and the checksum (unsigned).
 INT = struct.Struct(">i")
 #: ``[length][command]`` - the start of every data-channel message.
 HEADER = struct.Struct(">ii")
@@ -114,9 +119,13 @@ HEADER = struct.Struct(">ii")
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class DcapURL:
-    """A dcap URL in the parts the protocol needs."""
+    """A dcap URL in the parts the protocol needs.
+
+    ``port`` is always set (the scheme's default when the URL has none).
+    ``host`` keeps its case; code that compares doors lowers it.
+    """
 
     scheme: str
     host: str
@@ -131,6 +140,7 @@ class DcapURL:
 
     @property
     def netloc(self) -> str:
+        """The host as it goes in a URL: an IPv6 literal in brackets, without the port."""
         return f"[{self.host}]" if ":" in self.host else self.host
 
     def wire(self) -> str:
@@ -213,9 +223,13 @@ def quote(value: str) -> str:
     return f'"{value}"'
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Reply:
-    """One line from the door: ``<session> <id> <partner> <verb> <args...>``."""
+    """One line from the door: ``<session> <id> <partner> <verb> <args...>``.
+
+    ``partner`` (always ``client`` in a door's answer) is not kept. ``args``
+    are the tokens after the verb, quotes already removed.
+    """
 
     session: int
     command_id: int
@@ -223,6 +237,7 @@ class Reply:
     args: tuple[str, ...]
 
     def option(self, key: str) -> str | None:
+        """The value of ``-key=value``; ``""`` for a bare ``-key``, ``None`` if absent."""
         return options(self.args).get(key)
 
 

@@ -30,6 +30,12 @@ into silent data corruption or unintended repeated mutations.
   logging may contain secrets.
 - Credential lookup uses URL-prefix boundaries, so a token for `/alice` does
   not match `/alice-other`.
+- Discovered bearer-token files (`$BEARER_TOKEN_FILE`,
+  `$XDG_RUNTIME_DIR/bt_u<uid>`, `/tmp/bt_u<uid>`) are used only when they are
+  regular files owned by the caller with no group or other access, and a
+  symbolic link at the two predictable names is refused, so a token planted
+  in `/tmp` or leaked by its mode is never presented; the operation fails
+  with `EACCES` instead (see `docs/security.md`).
 - SFTP host keys default to `accept-new`: first contact is recorded and a
   changed or revoked key is rejected. Passwords are never placed in an
   OpenSSH subprocess's arguments or environment.

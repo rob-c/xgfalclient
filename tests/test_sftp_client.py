@@ -12,7 +12,7 @@ import pytest
 from xgfalclient.crypto.sshkeys import string
 from xgfalclient.errors import GError
 from xgfalclient.plugins.sftp import protocol as fx
-from xgfalclient.plugins.sftp.client import MAX_PACKET, SFTPClient, WriteBehind
+from xgfalclient.plugins.sftp.client import MAX_PACKET, SFTPClient, StreamOptions, WriteBehind
 from xgfalclient.plugins.sftp.protocol import Attrs, StatusError
 from xgfalclient.testing.sftp import SFTPServer
 
@@ -56,6 +56,7 @@ def test_handshake_rejects_banner(tmp_path: Path) -> None:
     client = SFTPClient(server.pair())
     with pytest.raises(GError, match=r"login shell printing text|length"):
         client.handshake()
+    client.close()
 
 
 def test_stat_and_missing(server: SFTPServer) -> None:
@@ -90,7 +91,8 @@ def test_namespace_operations(server: SFTPServer) -> None:
     client = connect(server)
     client.mkdir(b"/d", Attrs(permissions=0o755))
     client.setstat(b"/hello.txt", Attrs(permissions=0o600))
-    assert client.stat(b"/hello.txt").permissions & 0o777 == 0o600
+    permissions = client.stat(b"/hello.txt").permissions
+    assert permissions is not None and permissions & 0o777 == 0o600
     client.rename(b"/hello.txt", b"/d/renamed.txt")  # posix-rename
     assert client.stat(b"/d/renamed.txt").size == 12
     client.symlink(b"/d/renamed.txt", b"/link")
@@ -218,7 +220,7 @@ def test_stream_read(tmp_path: Path) -> None:
     handle = client.open(b"/big.bin", fx.FXF_READ)
     chunks: dict[int, bytes] = {}
     total = client.stream_read(
-        handle, 0, None, lambda off, mv: chunks.__setitem__(off, bytes(mv)), depth=4
+        handle, 0, None, lambda off, mv: chunks.__setitem__(off, bytes(mv)), StreamOptions(depth=4)
     )
     assert total == len(payload)
     joined = b"".join(chunks[k] for k in sorted(chunks))
@@ -234,7 +236,9 @@ def test_stream_read_with_length(tmp_path: Path) -> None:
     client = connect(server)
     handle = client.open(b"/big.bin", fx.FXF_READ)
     seen = bytearray()
-    total = client.stream_read(handle, 10, 5000, lambda off, mv: seen.extend(mv), depth=2)
+    total = client.stream_read(
+        handle, 10, 5000, lambda off, mv: seen.extend(mv), StreamOptions(depth=2)
+    )
     assert total == 5000 and bytes(seen) == payload[10:5010]
     client.close_handle(handle)
     client.close()
@@ -270,7 +274,7 @@ def test_pipelined_multithreaded(tmp_path: Path) -> None:
         (tmp_path / f"f{i}").write_bytes(bytes([i]) * 1000)
     server = SFTPServer(tmp_path)
     client = connect(server)
-    results: dict[int, int] = {}
+    results: dict[int, int | None] = {}
     errors: list[BaseException] = []
 
     def worker(i: int) -> None:
@@ -434,7 +438,7 @@ def test_stream_read_error_status(tmp_path: Path) -> None:
     handle = client.open(b"/big.bin", fx.FXF_READ)
     server.inject(fx.READ, fx.FX_FAILURE, "io error")
     with pytest.raises(StatusError):
-        client.stream_read(handle, 0, None, lambda off, mv: None, depth=4)
+        client.stream_read(handle, 0, None, lambda off, mv: None, StreamOptions(depth=4))
     client.close()
 
 
@@ -480,9 +484,7 @@ def test_stream_read_clean_eof_with_check(tmp_path: Path) -> None:
         0,
         None,
         lambda off, mv: seen.extend(mv),
-        chunk=10_000,
-        depth=8,
-        check=lambda: calls.append(1),
+        StreamOptions(chunk=10_000, depth=8, check=lambda: calls.append(1)),
     )
     assert total == len(payload) and bytes(seen) == payload and calls
     client.close()
@@ -495,7 +497,7 @@ def test_stream_read_answered_with_ok(tmp_path: Path) -> None:
     handle = client.open(b"/f.bin", fx.FXF_READ)
     server.inject(fx.READ, fx.FX_OK, "")
     with pytest.raises(GError, match="answered with OK"):
-        client.stream_read(handle, 0, None, lambda off, mv: None, depth=4)
+        client.stream_read(handle, 0, None, lambda off, mv: None, StreamOptions(depth=4))
     client.close()
 
 
@@ -507,7 +509,9 @@ def test_stream_read_short_to_eof(tmp_path: Path) -> None:
     client = connect(server)
     handle = client.open(b"/big.bin", fx.FXF_READ)
     seen = bytearray()
-    total = client.stream_read(handle, 0, None, lambda off, mv: seen.extend(mv), depth=8)
+    total = client.stream_read(
+        handle, 0, None, lambda off, mv: seen.extend(mv), StreamOptions(depth=8)
+    )
     assert total == len(payload) and bytes(seen) == payload
     client.close()
 
@@ -523,4 +527,38 @@ def test_write_behind_flush_reraises_stored_error(server: SFTPServer) -> None:
     # The error is stored; flush re-raises it rather than hanging.
     with pytest.raises(StatusError):
         writer.flush()
+    client.close()
+
+
+# -- sinks answered with STATUS -------------------------------------------------
+
+
+def test_status_reply_releases_the_read_sink(tmp_path: Path) -> None:
+    # A READ past the end is answered STATUS EOF, not DATA, so the reader never
+    # takes the sink out of the table on its own. It must still be released:
+    # a stale sink pins the caller's buffer (here: no resize while exported).
+    (tmp_path / "f").write_bytes(b"0123456789")
+    client = connect(SFTPServer(tmp_path))
+    handle = client.open(b"/f", fx.FXF_READ)
+    buffer = bytearray(64)
+    assert client.read_into(handle, 0, memoryview(buffer)) == 10
+    assert client._sinks == {}
+    buffer.extend(b"!")  # BufferError while a slice of it is still registered
+    seen = bytearray()
+    client.stream_read(handle, 0, None, lambda _off, view: seen.extend(view))
+    assert bytes(seen) == b"0123456789" and client._sinks == {}
+    client.close()
+
+
+def test_stale_sink_never_receives_a_later_reply(tmp_path: Path) -> None:
+    # Request ids wrap at 2**32. A sink left behind by a STATUS reply would
+    # capture the DATA of whatever later request reuses its id - here a plain
+    # read(), which must get its bytes back rather than a length.
+    (tmp_path / "f").write_bytes(b"0123456789")
+    client = connect(SFTPServer(tmp_path))
+    handle = client.open(b"/f", fx.FXF_READ)
+    rid = client._next_id
+    assert client.read_into(handle, 10, memoryview(bytearray(8))) == 0  # one READ: EOF
+    client._next_id = rid
+    assert client.read(handle, 0, 4) == b"0123"
     client.close()

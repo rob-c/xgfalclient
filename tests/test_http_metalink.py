@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """Davix-compatible HTTP Metalink discovery and failover."""
 
 from __future__ import annotations
@@ -9,13 +8,19 @@ import shutil
 import subprocess
 from email.message import Message
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 import xgfalclient
-from test_http_helpers import dav, dav2, hctx, write  # noqa: F401 - fixtures
+from test_http_helpers import dav as dav
+from test_http_helpers import dav2 as dav2
+from test_http_helpers import hctx as hctx
+from test_http_helpers import write
 from xgfalclient import GError
-from xgfalclient.plugins.http import _copy, _metalink
+from xgfalclient.plugins.http import _metalink, _ranged
+from xgfalclient.plugins.http._client import Response
+from xgfalclient.plugins.http.plugin import HTTPPlugin
 from xgfalclient.testing.webdav import WebDAVServer
 
 
@@ -80,9 +85,9 @@ def test_filecopy_discovers_a_link_and_uses_the_first_working_replica(
     assert (tmp_path / "out").read_bytes() == body
     discovery = next(request for request in dav.requests if request.method == "HEAD")
     assert discovery.header("Accept") == _metalink.ACCEPT
-    assert any(request.path == "/catalog/f.meta4" for request in dav.requests)
+    assert any(request.target == "/catalog/f.meta4" for request in dav.requests)
     assert any(
-        request.method == "GET" and request.path == "/data/good" for request in dav2.requests
+        request.method == "GET" and request.target == "/data/good" for request in dav2.requests
     )
 
 
@@ -124,7 +129,7 @@ def test_official_davix_and_this_client_follow_the_same_metalink(
         text=True,
         timeout=30,
     )
-    trace = [(request.method, request.path, request.header("Accept")) for request in dav.requests]
+    trace = [(request.method, request.target, request.header("Accept")) for request in dav.requests]
     assert completed.returncode == 0, f"{completed.stderr}\nrequests={trace!r}"
     assert ours.read_bytes() == theirs.read_bytes() == body
 
@@ -225,12 +230,12 @@ def test_parallel_copy_restarts_on_a_metalink_replica_only_after_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     enabled(hctx)
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", 1)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", 1)
     body = os.urandom((2 << 20) + 17)
     write(dav, "/data/original", body)
     write(dav2, "/data/mirror", body)
     write(dav, "/parallel.meta4", document([(1, dav2.url("/data/mirror"))], len(body)))
-    dav.fault("GET", "/data/original", status=500, times=_copy.DEFAULT_STREAMS)
+    dav.fault("GET", "/data/original", status=500, times=_ranged.DEFAULT_STREAMS)
     advertise(dav, "/data/original", dav.url("/parallel.meta4"))
     params = hctx.transfer_parameters()
     params.nbstreams = 2
@@ -247,11 +252,11 @@ def test_parallel_copy_preserves_failure_when_metalink_discovery_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     enabled(hctx)
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", 1)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", 1)
     body = os.urandom(10_000)
     write(dav, "/data/original", body)
     write(dav, "/invalid.meta4", b"<broken")
-    dav.fault("GET", "/data/original", status=500, times=_copy.DEFAULT_STREAMS)
+    dav.fault("GET", "/data/original", status=500, times=_ranged.DEFAULT_STREAMS)
     advertise(dav, "/data/original", dav.url("/invalid.meta4"))
     params = hctx.transfer_parameters()
     params.nbstreams = 2
@@ -275,12 +280,12 @@ def test_parallel_copy_does_not_fail_over_after_cancel_or_timeout(
     write(dav2, "/data/mirror", body)
     write(dav, "/catalog.meta4", document([(1, dav2.url("/data/mirror"))], len(body)))
     advertise(dav, "/data/original", dav.url("/catalog.meta4"))
-    monkeypatch.setattr(_copy, "PARALLEL_THRESHOLD", 1)
+    monkeypatch.setattr(_ranged, "PARALLEL_THRESHOLD", 1)
 
     def stopped(*args: object, **kwargs: object) -> None:
         raise GError("stop", code)
 
-    monkeypatch.setattr(_copy, "_parallel", stopped)
+    monkeypatch.setattr(_ranged, "_parallel", stopped)
     params = hctx.transfer_parameters()
     params.nbstreams = 2
 
@@ -342,6 +347,7 @@ def test_discovery_cache_and_absent_or_failed_descriptors(
     write(dav, "/cached.meta4", document([(1, dav2.url("/data/mirror"))], 1))
     advertise(dav, "/cached", descriptor)
     http = hctx.plugin(source, "stat")
+    assert isinstance(http, HTTPPlugin)
     replicas = http._metalink_replicas(source)
     requests = len(dav.requests)
     assert http._metalink_replicas(source) == replicas
@@ -427,19 +433,18 @@ def test_discovery_link_parser_handles_multiple_and_malformed_fields() -> None:
         ]
     )
     assert (
-        _metalink.descriptor_url(response, "https://origin.example/data")  # type: ignore[arg-type]
+        _metalink.descriptor_url(cast(Response, response), "https://origin.example/data")
         == "https://mirror.example/meta"
     )
     assert (
-        _metalink.descriptor_url(  # type: ignore[arg-type]
-            Discovery([], "application/metalink+xml"), "https://origin.example/data"
+        _metalink.descriptor_url(
+            cast(Response, Discovery([], "application/metalink+xml")),
+            "https://origin.example/data",
         )
         == "https://origin.example/data"
     )
     assert (
-        _metalink.descriptor_url(  # type: ignore[arg-type]
-            Discovery([]), "https://origin.example/data"
-        )
+        _metalink.descriptor_url(cast(Response, Discovery([])), "https://origin.example/data")
         is None
     )
     assert _metalink._links("no angle brackets") == []

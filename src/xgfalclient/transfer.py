@@ -39,6 +39,13 @@ The stream is pipelined. A reader thread fills a small ring of buffers while
 the calling thread drains them into the destination, so the source and the
 destination are both busy at once instead of taking turns; ``readinto`` on a
 socket and ``write`` on a file both release the GIL, so the overlap is real.
+A copy from one regular ``file://`` file to another, where the platform has
+``copy_file_range(2)`` (Linux), skips the pipeline: the kernel moves the
+bytes, one ``COPY_BUFFERSIZE`` at a time so that progress and cancellation
+behave as they do for the pipeline, and may share or offload them (a reflink
+on btrfs or XFS, a server-side copy on NFS 4.2). A kernel or filesystem that
+cannot (across filesystems on older kernels, ``ENOSYS``, ``EOPNOTSUPP``...)
+hands over to the pipeline at the offset reached; see :func:`copy_range`.
 
 Where this differs from gfal2, deliberately:
 
@@ -63,6 +70,14 @@ Where this differs from gfal2, deliberately:
   caller's parameters are not modified, the algorithm name is not cut one
   character short, and a bulk copy with no checksum list keeps the
   parameters' algorithm and value instead of dropping them.
+
+Layout: this module is the copy *sequence* - :class:`Transfer`, the event
+and checksum steps, destination preparation and cleanup, :func:`run_copy`
+and :func:`run_bulk`. The byte-moving half - :func:`stream`, :func:`pump`
+and :func:`copy_range` - is in :mod:`xgfalclient._stream` and re-exported
+here, so ``from xgfalclient.transfer import pump`` and patches of this
+module's tunables (``MONITOR_INTERVAL``, ``STREAM_MONITOR_INTERVAL``) work
+as they always have.
 """
 
 from __future__ import annotations
@@ -73,34 +88,52 @@ import stat as stat_module
 import threading
 import time
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
-
-from xrdclient.copy._pipeline import pump as _pump
+from contextlib import AbstractContextManager
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from . import events as ev
 from ._log import LOGGER
+
+# The streamed copy and the local ``copy_file_range`` fast path live in
+# :mod:`xgfalclient._stream`; they are re-exported here, where plugins and
+# programs have always imported them from. ``PIPELINE_DEPTH`` is defined
+# there (it is ``pump``'s default) and re-exported as this module's too.
+from ._stream import PIPELINE_DEPTH as PIPELINE_DEPTH
+from ._stream import copy_range as copy_range
+from ._stream import pump as pump
+from ._stream import stream as stream
 from .checksum import checksums_match, format_adler32, normalise_name
 from .enums import checksum_mode
 from .errors import GError, from_oserror
-from .plugin import O_CREAT, O_RDONLY, O_TRUNC, O_WRONLY, Plugin, PluginFile
+from .plugin import Plugin
 from .types import TransferParameters
 from .url import parent
 
 if TYPE_CHECKING:
     from .context import Gfal2Context
 
-__all__ = ["TransferParameters", "Transfer", "emit", "run_copy", "run_bulk", "pump", "stream"]
+__all__ = [
+    "Transfer",
+    "TransferParameters",
+    "copy_range",
+    "emit",
+    "pump",
+    "run_bulk",
+    "run_copy",
+    "stream",
+]
 
 
+# The callback shapes, as in :mod:`xgfalclient.types` (kept here for plugins
+# that annotate against this module).
 EventCallback = Callable[[ev.GfaltEvent], Any]
 MonitorCallback = Callable[[str, str, int, int, int, int], Any]
 
 #: How often ``monitor_callback`` may fire during a plugin copy, in seconds.
 MONITOR_INTERVAL = 1.0
 #: The same for the core's streamed copy: gfal2 waits more than five seconds.
+#: (Read by :func:`stream` from here at call time, so patching it works.)
 STREAM_MONITOR_INTERVAL = 5.0
-#: Buffers in flight between the reader thread and the writer.
-PIPELINE_DEPTH = 4
 
 
 def emit(
@@ -127,6 +160,12 @@ _FROM_CALLBACK = "_xgfal_from_callback"
 
 
 def _call(callback: Callable[..., Any], *args: Any) -> None:
+    """Call a user callback, marking anything it raises with :data:`_FROM_CALLBACK`.
+
+    The mark is what lets every layer above tell "the user's code asked to
+    stop" (re-raised untouched, ending even a bulk copy) from an ordinary
+    copy failure (reported, cleaned up, possibly per file).
+    """
     try:
         callback(*args)
     except Exception as exc:
@@ -135,6 +174,7 @@ def _call(callback: Callable[..., Any], *args: Any) -> None:
 
 
 def _from_callback(exc: BaseException) -> bool:
+    """Whether ``exc`` came out of a user callback (see :func:`_call`)."""
     return getattr(exc, _FROM_CALLBACK, False) is True
 
 
@@ -158,6 +198,17 @@ class Transfer:
         domain: str = ev.DOMAIN_LOCAL,
         user_checksum: tuple[str, str] | None = None,
     ) -> None:
+        """Start the clocks (timeout and monitor) and fix the checksum the copy is held to.
+
+        ``domain`` names the plugin in events (``GFAL2:CORE:COPY:LOCAL`` for
+        the streamed copy). ``user_checksum`` is a bulk entry's own
+        ``(algorithm, value)``, replacing the parameters' pair but keeping
+        their mode. The cancel generation is captured now, so a ``cancel()``
+        issued before this copy started does not cancel it.
+
+        Public, plugin-facing API (plugins and tests construct it), hence
+        the keyword-only extras rather than a parameter object.
+        """
         self.context = context
         self.params = params
         self.source = source
@@ -194,6 +245,12 @@ class Transfer:
     def event(
         self, stage: str, description: str = "", side: int = ev.BOTH, domain: str | None = None
     ) -> None:
+        """Emit one event in this copy's domain (or ``domain``); a callback's exception propagates.
+
+        The exception is also recorded, so a plugin that catches it on its
+        way out (inside a library callback, say) still has the copy fail with
+        it at the next :meth:`check` or when ``copy`` returns.
+        """
         try:
             emit(self.params, domain or self.domain, stage, description, side)
         except Exception as exc:
@@ -201,12 +258,14 @@ class Transfer:
             raise
 
     def _failed(self, exc: Exception) -> None:
+        """Keep the first callback exception; later ones are consequences of it."""
         with self._lock:
             if self.callback_error is None:
                 self.callback_error = exc
 
     @property
     def pair(self) -> str:
+        """``source => destination``: the description gfal2 gives ``TRANSFER:ENTER``/``EXIT``."""
         return f"{self.source} => {self.destination}"
 
     # -- limits ------------------------------------------------------------------
@@ -218,15 +277,40 @@ class Transfer:
         return self.started + timeout if timeout > 0 else None
 
     def remaining(self) -> float | None:
+        """Seconds left before :attr:`deadline` (never negative), or None for no limit.
+
+        For plugins that hand a timeout to a library call; pass it on rather
+        than the parameters' ``timeout``, which counts from the copy's start.
+        """
         deadline = self.deadline
         return None if deadline is None else max(0.0, deadline - time.monotonic())
 
+    @property
+    def cancelled(self) -> bool:
+        """Whether the context was cancelled after this copy began."""
+        return self.context._cancel_generation != self._generation
+
+    def abort_on_cancel(self, resource: object) -> AbstractContextManager[None]:
+        """While the ``with`` block runs, ``cancel()`` aborts ``resource`` (a socket...).
+
+        :meth:`check` notices a cancel only between chunks; a plugin blocked
+        in a ``recv`` on a server that has stopped sending registers the
+        socket here, and ``cancel()`` shuts it down so the copy fails at
+        once - as ``ECANCELED``, however the broken read reports it (see
+        :func:`run_copy`). See :meth:`~xgfalclient.Gfal2Context.register_abort`.
+        """
+        return self.context.abort_on_cancel(resource)
+
     def check(self) -> None:
-        """Raise a callback's exception, ``ECANCELED`` or ``ETIMEDOUT`` if the copy must stop."""
+        """Raise a callback's exception, ``ECANCELED`` or ``ETIMEDOUT`` if the copy must stop.
+
+        Cheap (no lock, no system call beyond the clock), so call it per
+        chunk. The messages are gfal2's for the same conditions.
+        """
         error = self.callback_error
         if error is not None:
             raise error
-        if self.context._cancel_generation != self._generation:
+        if self.cancelled:
             raise GError("Transfer canceled", errno.ECANCELED)
         deadline = self.deadline
         if deadline is not None and time.monotonic() > deadline:
@@ -253,6 +337,12 @@ class Transfer:
         self._report(False, False)
 
     def _report(self, force: bool, always: bool) -> None:
+        """Fire ``monitor_callback`` if the interval rules allow; see :meth:`progress`.
+
+        The rates are computed under the lock, the callback called outside
+        it: a slow callback must not stall the threads still adding bytes.
+        ``average`` is over the whole copy, ``instant`` since the last report.
+        """
         callback = self.params.monitor_callback
         if callback is None:
             return
@@ -287,6 +377,7 @@ class Transfer:
 
 
 def _checksum_algorithm(transfer: Transfer, plugin: Plugin | None) -> str:
+    """The user's algorithm, else the copying plugin's ``COPY_CHECKSUM_TYPE``, else ADLER32."""
     if transfer.checksum_algorithm:
         return transfer.checksum_algorithm
     return plugin.checksum_type() if plugin is not None else "ADLER32"
@@ -301,6 +392,7 @@ def _checksum_value(context: Gfal2Context, url: str, algorithm: str) -> str:
 
 
 def _compute_checksum(context: Gfal2Context, url: str, algorithm: str, side: str) -> str:
+    """:func:`_checksum_value`, with a failure reworded to say which end (``side``) it was."""
     try:
         return _checksum_value(context, url, algorithm)
     except GError as exc:
@@ -308,6 +400,12 @@ def _compute_checksum(context: Gfal2Context, url: str, algorithm: str, side: str
 
 
 def _verify_source(transfer: Transfer, algorithm: str) -> None:
+    """``source``/``both`` modes: checksum the source before copying, against the user's value.
+
+    Done first so a corrupt source fails before any byte moves; the value is
+    kept for the destination comparison in ``both`` mode. The mismatch text
+    is gfal2's, prefix included, because tools match on it.
+    """
     if transfer.checksum_mode not in (checksum_mode.source, checksum_mode.both):
         return
     transfer.event(ev.CHECKSUM_ENTER, side=ev.SOURCE)
@@ -323,6 +421,13 @@ def _verify_source(transfer: Transfer, algorithm: str) -> None:
 
 
 def _verify_destination(transfer: Transfer, algorithm: str) -> None:
+    """``target``/``both`` modes: checksum the finished destination.
+
+    Against the source's value when one was taken (``both``), else against
+    the user's (``target``, where :meth:`TransferParameters.set_checksum`
+    guaranteed one). A mismatch is ``EIO`` with gfal2's wording, and the
+    caller's clean-up then removes the bad copy.
+    """
     if transfer.checksum_mode not in (checksum_mode.target, checksum_mode.both):
         return
     transfer.event(ev.CHECKSUM_ENTER, side=ev.DESTINATION)
@@ -400,6 +505,7 @@ def _prepare_destination(transfer: Transfer) -> None:
 
 
 def _is_special(mode: int) -> bool:
+    """A character device, FIFO or socket: something written into, never replaced or removed."""
     return stat_module.S_ISCHR(mode) or stat_module.S_ISFIFO(mode) or stat_module.S_ISSOCK(mode)
 
 
@@ -454,7 +560,8 @@ def _cleanup(transfer: Transfer, plugin_copy: bool) -> None:
             return  # nothing there to remove
     code = 0
     try:
-        context.unlink(transfer.destination)
+        with context.abort_exempt():  # a cancelled copy still removes what it wrote
+            context.unlink(transfer.destination)
     except GError as exc:
         if exc.code != errno.ENOENT:
             LOGGER.warning("When trying to clean the destination: %s", exc.message)
@@ -472,18 +579,7 @@ def run_copy(
 ) -> None:
     """Copy one file, raising ``GError`` (or a callback's exception) on failure."""
     _list_events(params, [(source, destination)])
-    if source == destination and (params.overwrite or params.strict_copy):
-        # gfal2 deletes the source here (overwrite), or rewrites it in place
-        # (strict, which truncates here); refuse instead. Otherwise the
-        # existence check below answers EEXIST, as gfal2's does.
-        raise GError("Source and destination are the same file", errno.EINVAL)
-    plugin = context._copy_plugin(source, destination)
-    if plugin is None and not params.local_transfers:
-        raise GError(
-            f"No plugin supports a transfer from {source} to {destination}, "
-            "and local streaming is disabled",
-            errno.EPROTONOSUPPORT,
-        )
+    plugin = _copier(context, params, source, destination)
     domain = _domain(plugin) if plugin is not None else ev.DOMAIN_LOCAL
     transfer = Transfer(
         context, params, source, destination, domain=domain, user_checksum=user_checksum
@@ -501,15 +597,7 @@ def run_copy(
     if narrate:
         transfer.event(ev.TRANSFER_ENTER, transfer.pair)
     try:
-        if plugin is not None:
-            # In strict mode nobody looked at what was there before.
-            transfer.owns_destination = not manages and not params.strict_copy
-            plugin.copy(transfer)
-            if transfer.callback_error is not None:
-                raise transfer.callback_error  # the plugin swallowed it
-        else:
-            transfer.event(ev.TRANSFER_TYPE, "streamed")
-            stream(transfer)
+        _move(transfer, plugin, manages)
         _sync_local_destination(transfer)
         if narrate:
             transfer.event(ev.TRANSFER_EXIT, transfer.pair)
@@ -518,20 +606,73 @@ def run_copy(
         _verify_third_party(transfer, algorithm)
     except Exception as exc:
         _cleanup(transfer, plugin_copy=plugin is not None)
-        error = transfer.callback_error
-        if error is not None and error is not exc:
-            raise error from exc  # a plugin wrapped the callback's exception
-        if isinstance(exc, GError) or _from_callback(exc):
-            raise
-        # A plugin bug is still a failed copy, not a crash.
-        raise GError(f"Transfer failed: {exc}", errno.EIO) from exc
+        _raise_failure(transfer, exc)
+
+
+def _copier(
+    context: Gfal2Context, params: TransferParameters, source: str, destination: str
+) -> Plugin | None:
+    """The plugin that copies the pair, or None for the core's streamed copy.
+
+    A copy onto its own source is refused with ``overwrite`` or a strict
+    copy, and a pair no plugin copies needs ``local_transfers``.
+    """
+    if source == destination and (params.overwrite or params.strict_copy):
+        # gfal2 deletes the source here (overwrite), or rewrites it in place
+        # (strict, which truncates here); refuse instead. Otherwise the
+        # existence check answers EEXIST, as gfal2's does.
+        raise GError("Source and destination are the same file", errno.EINVAL)
+    plugin = context._copy_plugin(source, destination)
+    if plugin is None and not params.local_transfers:
+        raise GError(
+            f"No plugin supports a transfer from {source} to {destination}, "
+            "and local streaming is disabled",
+            errno.EPROTONOSUPPORT,
+        )
+    return plugin
+
+
+def _move(transfer: Transfer, plugin: Plugin | None, manages: bool) -> None:
+    """The copy itself: the plugin's, or the core's stream when there is none."""
+    if plugin is None:
+        transfer.event(ev.TRANSFER_TYPE, "streamed")
+        stream(transfer)
+        return
+    # In strict mode nobody looked at what was there before.
+    transfer.owns_destination = not manages and not transfer.params.strict_copy
+    plugin.copy(transfer)
+    if transfer.callback_error is not None:
+        raise transfer.callback_error  # the plugin swallowed it
+
+
+def _raise_failure(transfer: Transfer, exc: Exception) -> NoReturn:
+    """Raise what a failed copy reports, given what made it fail."""
+    error = transfer.callback_error
+    if error is not None and error is not exc:
+        raise error from exc  # a plugin wrapped the callback's exception
+    if _from_callback(exc):
+        raise exc
+    if transfer.cancelled and not (isinstance(exc, GError) and exc.code == errno.ECANCELED):
+        # A cancel that shut the copy's socket down: whatever the broken
+        # connection looked like to the plugin, the copy was cancelled.
+        raise GError("Transfer canceled", errno.ECANCELED) from exc
+    if isinstance(exc, GError):
+        raise exc
+    # A plugin bug is still a failed copy, not a crash.
+    raise GError(f"Transfer failed: {exc}", errno.EIO) from exc
 
 
 def _domain(plugin: Plugin) -> str:
+    """The event domain for ``plugin``'s copies: its declared one, else its name."""
     return plugin.event_domain or plugin.name
 
 
 def _list_events(params: TransferParameters, pairs: Sequence[tuple[str, str]]) -> None:
+    """``LIST:ENTER``, one ``LIST:ITEM`` per pair (URLs markup-escaped), ``LIST:EXIT``.
+
+    gfal2 narrates the list even for a single copy, so FTS's parsers see the
+    same frame either way.
+    """
     emit(params, ev.DOMAIN_COPY, ev.LIST_ENTER)
     for source, destination in pairs:
         text = f"{ev.markup_escape(source)} => {ev.markup_escape(destination)}"
@@ -560,117 +701,45 @@ def run_bulk(
         raise GError("Number of sources and destinations do not match", errno.EINVAL)
     if checksums and len(checksums) != len(sources):
         raise GError("Number of pairs and checksums do not match", errno.EINVAL)
-    _list_events(params, list(zip(sources, destinations)))
+    _list_events(params, list(zip(sources, destinations, strict=False)))
     # As gfal2 does, the first pair picks the plugin; one with a bulk copy
     # (GridFTP pipelining) takes the whole list and does its own checks.
     plugin = context._copy_plugin(sources[0], destinations[0]) if sources else None
+    users: list[tuple[str, str] | None] = [_split_checksum(entry) for entry in checksums]
+    users = users or [None] * len(sources)
     if plugin is not None and plugin.implements("copy_bulk"):
         domain = _domain(plugin)
         transfers = [
-            Transfer(
-                context,
-                params,
-                source,
-                destination,
-                domain=domain,
-                user_checksum=_split_checksum(checksums[index]) if checksums else None,
-            )
-            for index, (source, destination) in enumerate(zip(sources, destinations))
+            Transfer(context, params, source, destination, domain=domain, user_checksum=user)
+            for source, destination, user in zip(sources, destinations, users, strict=False)
         ]
         return plugin.copy_bulk(params, transfers)
     mode = params.get_checksum()[0]
-    results: list[GError | None] = []
-    for index, (source, destination) in enumerate(zip(sources, destinations)):
-        try:
-            user = None
-            if checksums:
-                user = _split_checksum(checksums[index])
-                if mode in (checksum_mode.source, checksum_mode.target) and not user[1]:
-                    raise GError("Checksum value required if mode is not end to end", errno.EINVAL)
-            run_copy(context, params, source, destination, user)
-            results.append(None)
-        except GError as exc:
-            if _from_callback(exc):
-                raise
-            results.append(exc)
-    return results
+    return [
+        _bulk_item(context, params, (source, destination), user, mode)
+        for source, destination, user in zip(sources, destinations, users, strict=False)
+    ]
 
 
-# ---------------------------------------------------------------------------
-# The streamed copy
-# ---------------------------------------------------------------------------
+def _bulk_item(
+    context: Gfal2Context,
+    params: TransferParameters,
+    pair: tuple[str, str],
+    user: tuple[str, str] | None,
+    mode: checksum_mode,
+) -> GError | None:
+    """One ``(source, destination)`` of a bulk copy through :func:`run_copy`: None, or its error.
 
-
-def pump(
-    transfer: Transfer,
-    source: PluginFile,
-    destination: PluginFile,
-    *,
-    buffer_size: int | None = None,
-    depth: int = PIPELINE_DEPTH,
-    final_report: bool = True,
-) -> int:
-    """Stream through the shared pipeline, retaining GFAL progress/cancel policy."""
-    size = buffer_size or transfer.context.options.integer("CORE", "COPY_BUFFERSIZE", 4194304)
-
-    def report(done: int, total: int | None) -> None:
-        transfer.progress(done)
-        transfer.check()
-
-    total = _pump(
-        source,
-        destination,
-        None,
-        size,
-        report,
-        None,
-        max(depth, 2),
-        recycle=True,
-        thread_name="xgfal-reader",
-        short_write=lambda: GError("The destination stopped accepting data", errno.EIO),
-    )
-    transfer.progress(total, force=final_report)
-    return total
-
-
-def stream(transfer: Transfer) -> None:
-    """The core's streamed copy: read through one plugin, write through another.
-
-    The source is read to EOF. Its size is only a hint for writers that must
-    declare a length (HTTP ``PUT``), given for a non-empty regular file - a
-    ``/proc`` file says 0 and has content - and a copy that comes up short of
-    it is an error; one that finds more (a growing file) is not.
+    A user checksum without a value needs end-to-end ``mode``; a callback's
+    exception is re-raised, since it ends the whole call.
     """
-    context = transfer.context
     try:
-        info = context.stat(transfer.source)
+        one_sided = mode in (checksum_mode.source, checksum_mode.target)
+        if user is not None and one_sided and not user[1]:
+            raise GError("Checksum value required if mode is not end to end", errno.EINVAL)
+        run_copy(context, params, *pair, user)
     except GError as exc:
-        raise GError(f"Could not open source: {exc.message}", exc.code) from exc
-    if info.is_dir():
-        # gfal2 opens it and fails on the first read, in the file plugin's words.
-        raise from_oserror(OSError(errno.EISDIR, ""))
-    transfer.source_size = info.st_size
-    size = info.st_size if stat_module.S_ISREG(info.st_mode) and info.st_size > 0 else None
-    try:
-        reader = context._open(transfer.source, O_RDONLY)
-    except GError as exc:
-        raise GError(f"Could not open source: {exc.message}", exc.code) from exc
-    try:
-        try:
-            plugin = context.plugin(transfer.destination, "open")
-            # 0755, as gfal2's streamed copy creates its destination.
-            writer: PluginFile = context._guard(
-                plugin.open, transfer.destination, O_WRONLY | O_CREAT | O_TRUNC, 0o755, size
-            )
-        except GError as exc:
-            raise GError(f"Could not open destination: {exc.message}", exc.code) from exc
-        transfer.owns_destination = True
-        transfer.monitor_interval = STREAM_MONITOR_INTERVAL
-        try:
-            total = pump(transfer, reader, writer, final_report=False)
-        finally:
-            writer.close()
-    finally:
-        reader.close()
-    if size is not None and total < size:
-        raise GError(f"Short copy: {total} bytes transferred, the source has {size}", errno.EIO)
+        if _from_callback(exc):
+            raise
+        return exc
+    return None

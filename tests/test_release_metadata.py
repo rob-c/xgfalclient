@@ -1,26 +1,27 @@
-"""Release metadata stays connected to the public runtime version."""
+"""xgfalclient's release metadata: xrd-devtools' release gate, run on this checkout.
 
-from pathlib import Path
+One version source (``src/xgfalclient/_version.py``), a CHANGELOG led by exactly
+that version's section, project metadata and README that name this
+repository, and a release workflow that builds through the shared publish
+action: the checks every repository of the chain shares
+(``xrddevtools.release``). The gate is found in an xrd-devtools checkout (a
+sibling ``../xrd-devtools``, CI's ``.dependencies/xrd-devtools``, or one
+installed or on ``PYTHONPATH``); where there is none, it skips with that
+environmental reason.
+"""
 
-import xgfalclient
+import pytest
 
-ROOT = Path(__file__).parents[1]
+plugin = pytest.importorskip(
+    "xrddevtools.pytest_plugin",
+    reason="environmental: no xrd-devtools checkout (../xrd-devtools, .dependencies/xrd-devtools)",
+)
+
+test_xgfalclient_release_metadata_is_consistent = plugin.release_gate(__file__)
 
 
-def test_version_has_one_build_source_and_release_notes() -> None:
-    project = (ROOT / "pyproject.toml").read_text()
-    changelog = (ROOT / "CHANGELOG.md").read_text()
+def test_the_gfal2_style_version_is_the_package_version() -> None:
+    """``VERSION`` is python3-gfal2's spelling; it must never disagree with ``__version__``."""
+    import xgfalclient
 
-    assert 'dynamic = ["version"]' in project
-    assert 'path = "src/xgfalclient/_version.py"' in project
-    headings = [line for line in changelog.splitlines() if line.startswith("## [")]
-    assert headings[0].startswith(f"## [{xgfalclient.VERSION}] - ")
-    assert sum(line.startswith(f"## [{xgfalclient.VERSION}]") for line in headings) == 1
-    assert f"[{xgfalclient.VERSION}]: https://github.com/rob-c/xgfalclient/compare/" in changelog
-    assert "## [0.2.0] - 2026-10-01" in headings
     assert xgfalclient.__version__ == xgfalclient.VERSION
-    assert xgfalclient.VERSION.count(".") == 2
-
-
-def test_generated_documentation_is_excluded_from_source_distributions() -> None:
-    assert "site/" in (ROOT / ".gitignore").read_text().splitlines()

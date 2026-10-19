@@ -1,10 +1,11 @@
 """Published test vectors and cross-checks for the SFTP plugin's crypto.
 
-Every primitive is pinned to a standard vector - RFC 7748 (X25519), RFC 8032
-(Ed25519), RFC 6979 (deterministic ECDSA P-256), FIPS-197/SP 800-38A (AES and
-CTR), NIST SP 800-38D / McGrew-Viega (AES-GCM), RFC 8439 (ChaCha20 and
-Poly1305) and the OpenBSD/Go ``bcrypt_pbkdf``
-known-answers. All production primitives now use cryptography.
+Every primitive is pinned to a standard vector - RFC 7748 (X25519),
+FIPS-197/SP 800-38A (AES and CTR), NIST SP 800-38D / McGrew-Viega (AES-GCM),
+RFC 8439 (ChaCha20 and Poly1305) and the OpenBSD/Go ``bcrypt_pbkdf``
+known-answers. All production primitives now use cryptography. Ed25519 and
+P-256 are xrdsec's (``xgfalclient.crypto.ed25519``/``p256`` are those modules),
+so their RFC 8032 and RFC 6979 vectors are xrdsec's tests, not copies here.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from binascii import unhexlify as U
 
 import pytest
 
-from xgfalclient.crypto import aes, bcrypt, chacha, ciphers, ed25519, p256, x25519
+from xgfalclient.crypto import aes, bcrypt, chacha, ciphers, x25519
 
 # ---------------------------------------------------------------------------
 # X25519 - RFC 7748 section 5.2
@@ -57,107 +58,6 @@ def test_x25519_rejects_bad_lengths_and_zero() -> None:
     # A small-order u that yields the all-zero shared secret is refused (RFC 8731).
     with pytest.raises(ValueError, match="all-zero"):
         x25519.x25519(os.urandom(32), bytes(32))
-
-
-# ---------------------------------------------------------------------------
-# Ed25519 - RFC 8032 section 7.1
-# ---------------------------------------------------------------------------
-
-ED25519_VECTORS = [
-    (
-        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
-        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
-        "",
-        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
-        "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
-    ),
-    (
-        "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
-        "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
-        "72",
-        "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
-        "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
-    ),
-]
-
-
-@pytest.mark.parametrize(("sk", "pk", "msg", "sig"), ED25519_VECTORS)
-def test_ed25519_rfc8032(sk: str, pk: str, msg: str, sig: str) -> None:
-    message = U(msg) if msg else b""
-    assert ed25519.public_key(U(sk)).hex() == pk
-    assert ed25519.sign(U(sk), message).hex() == sig
-    assert ed25519.verify(U(pk), message, U(sig))
-
-
-def test_ed25519_rejects_bad_signatures() -> None:
-    sk = U("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
-    pk = ed25519.public_key(sk)
-    good = ed25519.sign(sk, b"hi")
-    assert not ed25519.verify(pk, b"hi", good[:-1])  # wrong length
-    tampered = bytearray(good)
-    tampered[0] ^= 1
-    assert not ed25519.verify(pk, b"hi", bytes(tampered))
-    # S out of range, a bad R and a non-canonical public key are all rejected.
-    assert not ed25519.verify(pk, b"hi", good[:32] + (ed25519.L + 1).to_bytes(32, "little"))
-    assert not ed25519.verify(pk, b"hi", b"\xff" * 32 + good[32:])
-    assert not ed25519.verify(b"\xff" * 32, b"hi", good)
-
-
-def test_ed25519_expand_rejects_bad_seed() -> None:
-    with pytest.raises(ValueError, match="32 bytes"):
-        ed25519.public_key(b"short")
-
-
-# ---------------------------------------------------------------------------
-# ECDSA P-256 - RFC 6979 appendix A.2.5
-# ---------------------------------------------------------------------------
-
-P256_X = int("C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721", 16)
-P256_UX = int("60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6", 16)
-P256_UY = int("7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299", 16)
-P256_SIGS = {
-    b"sample": (
-        int("EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716", 16),
-        int("F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8", 16),
-    ),
-    b"test": (
-        int("F1ABB023518351CD71D881567B1EA663ED3EFCF6C5132B354F28D3B0B7D38367", 16),
-        int("019F4113742A2B14BD25926B49C649155F267E60D3814B4C0CC84250E46F0083", 16),
-    ),
-}
-
-
-def test_p256_public_key() -> None:
-    assert p256.public_key(P256_X) == (P256_UX, P256_UY)
-
-
-@pytest.mark.parametrize("message", list(P256_SIGS))
-def test_p256_rfc6979(message: bytes) -> None:
-    r, s = p256.sign(P256_X, message)
-    assert (r, s) == P256_SIGS[message]
-    assert p256.verify((P256_UX, P256_UY), message, r, s)
-
-
-def test_p256_point_encoding_round_trip() -> None:
-    point = p256.public_key(P256_X)
-    blob = p256.encode_point(point)
-    assert p256.decode_point(blob) == point
-    with pytest.raises(ValueError, match="uncompressed"):
-        p256.decode_point(b"\x02" + b"\x00" * 32)
-    with pytest.raises(ValueError, match="not on P-256"):
-        p256.decode_point(b"\x04" + b"\x00" * 64)
-
-
-def test_p256_rejects_bad_scalars_and_signatures() -> None:
-    with pytest.raises(ValueError, match="out of range"):
-        p256.public_key(0)
-    with pytest.raises(ValueError, match="out of range"):
-        p256.public_key(p256.N)
-    pub = p256.public_key(P256_X)
-    assert not p256.verify(pub, b"sample", 0, 1)
-    assert not p256.verify(pub, b"sample", 1, 0)
-    r, s = p256.sign(P256_X, b"sample")
-    assert not p256.verify(pub, b"other", r, s)
 
 
 # ---------------------------------------------------------------------------
@@ -274,30 +174,23 @@ def test_bcrypt_pbkdf_known_answers() -> None:
 
 
 def test_bcrypt_pbkdf_validates_arguments() -> None:
-    for kwargs in (
-        dict(password=b"", salt=b"salt", length=32, rounds=1),
-        dict(password=b"p", salt=b"", length=32, rounds=1),
-        dict(password=b"p", salt=b"s", length=0, rounds=1),
-        dict(password=b"p", salt=b"s", length=32, rounds=0),
+    for password, salt, length, rounds in (
+        (b"", b"salt", 32, 1),
+        (b"p", b"", 32, 1),
+        (b"p", b"s", 0, 1),
+        (b"p", b"s", 32, 0),
+        (b"p", b"s", 513, 1),
     ):
         with pytest.raises(ValueError):
-            bcrypt.bcrypt_pbkdf(**kwargs)  # type: ignore[arg-type]
+            bcrypt.bcrypt_pbkdf(password=password, salt=salt, length=length, rounds=rounds)
 
 
 def test_bcrypt_pbkdf_output_striping_overshoot() -> None:
-    # A length whose stride overshoots the key end exercises the guard that
-    # stops writing past it; rounds=1 keeps it fast.
+    # A length whose output stride overshoots the key end (OpenBSD's striping
+    # of 32-byte blocks); rounds=1 keeps it fast.
     out = bcrypt.bcrypt_pbkdf(b"password", b"salt", 67, 1)
     assert len(out) == 67
     assert out == bcrypt.bcrypt_pbkdf(b"password", b"salt", 67, 1)
-
-
-def test_bcrypt_pi_words_are_cached() -> None:
-    first = bcrypt.pi_words()
-    assert bcrypt.pi_words() == first
-    assert len(first) == 18 + 4 * 256
-    # The classic first fractional word of pi is 0x243f6a88.
-    assert first[0] == 0x243F6A88
 
 
 @pytest.mark.parametrize("name", ciphers.BACKENDS)

@@ -2,10 +2,19 @@
 
 Output formats and messages are gfal2-util 1.9.1's (Apache-2.0, (c) CERN),
 reimplemented.
+
+Each command is a function of the :class:`~._base.Command` (parsed options in
+``cmd.params``, the context in ``cmd.context``) and a :class:`~._base.Spec`
+in :data:`SPECS` holding its help text and arguments. The help strings,
+gfal2-util's typos included (``mkdir -m``'s "display hidden files"), are
+reproduced verbatim: they are the generated man pages' source too. A command
+raises ``GError`` to fail; :func:`~._base.main` prints it and exits with
+its errno.
 """
 
 from __future__ import annotations
 
+import contextlib
 import stat
 import sys
 from datetime import datetime
@@ -16,17 +25,23 @@ from ._utils import file_mode_str, file_type_str
 
 __all__ = ["SPECS"]
 
-#: Bytes per read for ``gfal-cat`` and ``gfal-save``.
+#: Bytes per read for ``gfal-cat`` and ``gfal-save``: large enough that a
+#: remote protocol's per-request cost is amortised, small enough to stream.
 CHUNK = 1 << 20
 
 
 def mkdir(cmd: Command) -> None:
+    """``gfal-mkdir [-p] [-m MODE] DIR...``: each directory in turn, the first failure ending it.
+
+    ``-m`` is parsed by argparse as a *decimal* int (default 755) and then
+    read back as octal digits, as gfal2-util does; that is why ``-m 0700``
+    works and ``-m 8`` silently gives 0755.
+    """
     mode = 0o755
     if cmd.params.mode:
-        try:
+        # -m 999: gfal2-util falls back to 0755 without a word
+        with contextlib.suppress(ValueError):
             mode = int(str(cmd.params.mode), 8)
-        except ValueError:
-            pass  # -m 999: gfal2-util falls back to 0755 without a word
     for directory in cmd.params.directory:
         output.identify("mkdir", url=directory)
         if cmd.params.parents:
@@ -37,6 +52,11 @@ def mkdir(cmd: Command) -> None:
 
 
 def save(cmd: Command) -> None:
+    """``gfal-save URL``: stdin to a (new or truncated) remote file, in :data:`CHUNK` writes.
+
+    The file is closed even on failure; for protocols that commit at close
+    (HTTP), a failed upload is reported from there.
+    """
     # Bytes from stdin untouched, as cat writes them: gfal2-util's text-mode
     # read dies on input that is not UTF-8 (UnicodeEncodeError, empty file).
     output.identify("save", url=cmd.params.file)
@@ -55,6 +75,11 @@ def save(cmd: Command) -> None:
 
 
 def cat(cmd: Command) -> None:
+    """``gfal-cat URL...``: each file's bytes to stdout, in order.
+
+    Python's text stdout is flushed first so that earlier text output is
+    not overtaken by bytes written to the buffer underneath.
+    """
     # The bytes go to stdout untouched, with or without -b: gfal2-util's text
     # mode decodes each chunk on its own and chokes on binary data, or on a
     # character split across two reads.
@@ -75,6 +100,13 @@ def cat(cmd: Command) -> None:
 
 
 def xattr(cmd: Command) -> None:
+    """``gfal-xattr URL [NAME | NAME=VALUE]``: list all, get one, or set one.
+
+    Listing prints ``name = value`` per attribute and ``name FAILED: ...``
+    for one that cannot be read, carrying on (gfal2-util's behaviour: one
+    unreadable attribute must not hide the rest). A ``NAME=`` or ``=VALUE``
+    with an empty side is silently ignored, as in gfal2-util.
+    """
     path, attribute = cmd.params.file, cmd.params.attribute
     output.identify("xattr", url=path, attribute=attribute)
     if attribute is not None:
@@ -99,6 +131,7 @@ def xattr(cmd: Command) -> None:
 
 
 def checksum(cmd: Command) -> None:
+    """``gfal-sum URL ALGORITHM``: prints ``URL VALUE`` (the URL as given, after ``surl``)."""
     output.identify("checksum", url=cmd.params.file)
     value = cmd.context.checksum(cmd.params.file, cmd.params.checksum_type)
     output.record(status="succeeded", algorithm=cmd.params.checksum_type, value=value)
@@ -106,10 +139,20 @@ def checksum(cmd: Command) -> None:
 
 
 def _time(stamp: int) -> str:
+    """A ``gfal-stat`` time: local time with microseconds, which are always ``.000000``.
+
+    gfal2-util formats ``datetime.fromtimestamp`` of an integer, and scripts
+    parse that exact shape.
+    """
     return datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
 def stat_(cmd: Command) -> None:
+    """``gfal-stat URL``: GNU ``stat``-like lines, in gfal2-util's exact layout.
+
+    The tabs, the trailing tab after ``Gid``, the quoted file name and the
+    mode as ``(0644/-rw-r--r--)`` are all gfal2-util's; scripts cut on them.
+    """
     output.identify("stat", url=cmd.params.file)
     info = cmd.context.stat(cmd.params.file)
     output.record(status="succeeded", value=stat_record(info))
@@ -126,12 +169,14 @@ def stat_(cmd: Command) -> None:
 
 
 def rename(cmd: Command) -> None:
+    """``gfal-rename SOURCE DESTINATION``: one ``rename``, nothing printed on success."""
     output.identify("rename", source=cmd.params.source, target=cmd.params.destination)
     cmd.context.rename(cmd.params.source, cmd.params.destination)
     output.record(status="succeeded")
 
 
 def chmod(cmd: Command) -> None:
+    """``gfal-chmod MODE URL``: ``MODE`` must be octal digits, else a usage error (status 2)."""
     output.identify("chmod", url=cmd.params.file)
     try:
         mode = int(cmd.params.mode, 8)
@@ -142,6 +187,13 @@ def chmod(cmd: Command) -> None:
 
 
 def token(cmd: Command) -> int:
+    """``gfal-token URL [ACTIVITY...]``: print a storage-issued token (macaroon or SciToken).
+
+    With activities, they are requested as given; otherwise ``-w`` picks
+    the default write set and its absence the read set (the plugin decides
+    what those are). A negative ``--validity`` is refused with gfal2-util's
+    message and status 1 before anything is sent.
+    """
     params = cmd.params
     output.identify("token", url=params.path)
     if params.validity < 0:

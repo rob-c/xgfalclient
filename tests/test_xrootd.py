@@ -15,6 +15,7 @@ import os
 import socket
 import stat as _stat
 import struct
+import sys
 import threading
 import time
 import urllib.parse
@@ -23,22 +24,20 @@ from collections.abc import Iterator
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
+import xrdclient
+from xrdclient import errors as xe
+from xrdclient.proto import constants as c
+from xrdclient.testing import FakeServer, error, frame
 
-xrdclient = pytest.importorskip("xrdclient")
-
-from xrdclient import errors as xe  # noqa: E402
-from xrdclient.proto import constants as c  # noqa: E402
-from xrdclient.testing import FakeServer, error, frame  # noqa: E402
-
-import xgfalclient  # noqa: E402
-from xgfalclient import GError, checksum_mode  # noqa: E402
-from xgfalclient import plugins as registry  # noqa: E402
-from xgfalclient.creds import X509Credential  # noqa: E402
-from xgfalclient.plugins import xrootd  # noqa: E402
-from xgfalclient.plugins.xrootd import (  # noqa: E402
+import xgfalclient
+from xgfalclient import GError, checksum_mode
+from xgfalclient import plugins as registry
+from xgfalclient.plugin import PluginFile
+from xgfalclient.plugins import xrootd
+from xgfalclient.plugins.xrootd import (
     XRootDPlugin,
     collapse_slashes,
     describe,
@@ -50,8 +49,14 @@ from xgfalclient.plugins.xrootd import (  # noqa: E402
     space_json,
     status_error,
     status_word,
+    tpc,
+    urls,
 )
-from xgfalclient.testing.pki import PKI  # noqa: E402
+from xgfalclient.plugins.xrootd import copy as xcopy
+from xgfalclient.plugins.xrootd import file as xfile
+from xgfalclient.plugins.xrootd import stat as xstat
+from xgfalclient.testing.pki import PKI
+from xgfalclient.transfer import Transfer
 
 HELLO = b"hello world\n"
 ADLER_HELLO = f"{zlib.adler32(HELLO):08x}"
@@ -101,12 +106,11 @@ def test_the_plugin_is_registered_under_gfal2s_name(ctx: xgfalclient.Gfal2Contex
 
 
 def test_without_xrdclient_root_urls_say_how_to_fix_it(monkeypatch: pytest.MonkeyPatch) -> None:
-    def missing(name: str = "xrdclient") -> Any:
-        raise ImportError("No module named 'xrdclient'")
-
-    monkeypatch.setattr(xrootd, "_import", missing)
+    # The plugin module imports xrdclient at the top, so a broken xrdclient
+    # is a plugin module that cannot be imported; the registry answers for it.
+    monkeypatch.setitem(sys.modules, "xgfalclient.plugins.xrootd", None)
     monkeypatch.setattr(registry, "_MISSING", {})
-    assert XRootDPlugin.available() == xrootd.MISSING_HINT
+    assert xrootd.MISSING_HINT == registry.XROOTD_HINT
     with xgfalclient.creat_context() as context:
         assert not any(name.startswith("xrootd") for name in context.get_plugin_names())
         failure = _gerror(context.stat, "root://host//f")
@@ -117,6 +121,34 @@ def test_without_xrdclient_root_urls_say_how_to_fix_it(monkeypatch: pytest.Monke
 
 def test_available_when_xrdclient_imports() -> None:
     assert XRootDPlugin.available() is None
+
+
+# -- cancel() and blocked calls ---------------------------------------------------------
+
+
+def test_an_abort_of_something_without_a_connection_refuses_what_comes_after() -> None:
+    fs = xrdclient.FileSystem("root://127.0.0.1:1//")  # never connected
+    abort = xfile.Abort(fs)
+    abort()  # no connection to shut down, and nothing dialled for it
+    assert abort.fired
+    with pytest.raises(xe.AbortedError):
+        fs.stat("/")
+
+
+def test_a_file_made_without_a_context_is_never_aborted() -> None:
+    handle = SimpleNamespace(read=lambda size, offset: b"abc"[offset : offset + size])
+    made = xrootd.XRootDFile("root://h//f", cast("xrdclient.File", handle), writable=False)
+    assert made.read(2) == b"ab"
+
+
+def test_a_filesystem_a_cancel_cut_is_not_pooled(
+    ctx: xgfalclient.Gfal2Context, plugin: XRootDPlugin, base: str
+) -> None:
+    with plugin._fs(base + "/data/a.txt") as (fs, path):
+        assert fs.stat(path).size == len(HELLO)
+        ctx.cancel()  # while the call holds it: its connection is spent
+    assert not any(plugin._idle.values())
+    assert ctx.stat(base + "/data/a.txt").st_size == len(HELLO)  # a fresh one
 
 
 # -- errors ----------------------------------------------------------------------------
@@ -168,7 +200,7 @@ def _raised_from(exc: BaseException, cause: BaseException) -> BaseException:
         (xe.ProtocolError("garbage"), errno.EPROTO, "[FATAL] Invalid message"),
         (xe.WaitLimitError("busy"), errno.EAGAIN, "[ERROR] Retry"),
         (xe.TimeoutError("slow"), errno.ETIMEDOUT, "[ERROR] Operation expired"),
-        (socket.timeout("slow"), errno.ETIMEDOUT, "[ERROR] Operation expired"),
+        (TimeoutError("slow"), errno.ETIMEDOUT, "[ERROR] Operation expired"),
         (ValueError("bad port"), errno.EINVAL, "[ERROR] Invalid arguments"),
         (RuntimeError("odd"), errno.EIO, "[ERROR] Unknown error"),
         (xe.ConnectionError("closed"), errno.ECONNRESET, "[FATAL] Connection error"),
@@ -250,7 +282,7 @@ def test_posix_stat_uses_the_extended_times_when_there_are_some() -> None:
 def test_uid_and_gid_are_zero_where_the_platform_has_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delattr(os, "getuid")
     monkeypatch.delattr(os, "getgid")
-    assert xrootd._ids() == (0, 0)
+    assert xstat._ids() == (0, 0)
 
 
 def test_status_words() -> None:
@@ -308,33 +340,36 @@ def test_gsi_delegation_follows_the_environment(
     assert plugin._config("root://h//f").gsi_delegate is True
 
 
-def test_a_separate_certificate_and_key_are_combined_once(
-    ctx: xgfalclient.Gfal2Context, plugin: XRootDPlugin, pki: PKI
+def test_a_separate_certificate_and_key_are_handed_over_as_they_are(
+    ctx: xgfalclient.Gfal2Context,
+    plugin: XRootDPlugin,
+    grid_env: PKI,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cred = X509Credential(str(pki.user_cert_path), str(pki.user_key_path))
-    combined = plugin._proxy_for(cred)
-    assert plugin._proxy_for(cred) == combined
-    body = Path(combined).read_bytes()
-    assert b"BEGIN CERTIFICATE" in body and b"PRIVATE KEY" in body
-    assert _stat.S_IMODE(os.stat(combined).st_mode) == 0o600
-    os.remove(combined)  # closing copes with a file that has already gone
-    plugin.close()
-    assert plugin._combined == {}
+    """No copy of the private key on disk: xrdclient takes the two files themselves."""
+    import tempfile
 
-
-def test_closing_removes_combined_credentials(plugin: XRootDPlugin, pki: PKI) -> None:
-    combined = plugin._proxy_for(X509Credential(str(pki.user_cert_path), str(pki.user_key_path)))
-    plugin.close()
-    assert not os.path.exists(combined)
-
-
-def test_an_unreadable_key_leaves_no_file_behind(
-    plugin: XRootDPlugin, pki: PKI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(xrootd.tempfile, "tempdir", str(tmp_path))
-    with pytest.raises(OSError):
-        plugin._proxy_for(X509Credential(str(pki.user_cert_path), str(tmp_path / "missing")))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    cert, key = str(grid_env.user_cert_path), str(grid_env.user_key_path)
+    ctx.set_opt_string("X509", "CERT", cert)
+    ctx.set_opt_string("X509", "KEY", key)
+    config = plugin._config("root://h//f")
+    # $X509_USER_PROXY (set here) would win over the pair were the proxy left unset.
+    assert (config.proxy, config.usercert, config.userkey) == (None, cert, key)
     assert list(tmp_path.iterdir()) == []
+    ctx.set_opt_string("X509", "KEY", cert)  # one file with both: a proxy
+    combined = plugin._config("root://h//f")
+    assert (combined.proxy, combined.usercert, combined.userkey) == (cert, None, None)
+
+
+def test_without_a_credential_the_environment_has_no_say(
+    plugin: XRootDPlugin, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name in ("X509_USER_PROXY", "X509_USER_CERT", "X509_USER_KEY"):
+        monkeypatch.setenv(name, str(tmp_path / "missing"))
+    config = plugin._config("root://h//f")
+    assert (config.proxy, config.usercert, config.userkey) == (None, None, None)
 
 
 def test_xrd_options_and_url_cgi_reach_every_request(
@@ -502,8 +537,10 @@ def test_unlink(ctx: xgfalclient.Gfal2Context, server: FakeServer, base: str) ->
     assert "/data/a.txt" not in server.files
     failure = _gerror(ctx.unlink, base + "/data/a.txt")
     assert failure.message == "Failed to delete file (No such file or directory)"
-    (bulk,) = ctx.unlink([base + "/nothing"])
-    assert bulk.code == errno.ENOENT
+    results = ctx.unlink([base + "/nothing"])
+    assert isinstance(results, list)
+    (bulk,) = results
+    assert bulk is not None and bulk.code == errno.ENOENT
 
 
 def test_rename(ctx: xgfalclient.Gfal2Context, server: FakeServer, base: str) -> None:
@@ -581,6 +618,7 @@ def test_listdir_and_readpp(ctx: xgfalclient.Gfal2Context, base: str) -> None:
         entry, info = directory.readpp()
         if entry is None:
             break
+        assert info is not None
         seen[entry.d_name] = (entry.d_type, info.st_mode, info.st_size, info.st_nlink)
     assert seen == {
         "a.txt": (8, _stat.S_IFREG | 0o666, 12, 0),
@@ -612,6 +650,7 @@ def test_entries_without_stat_are_stat_ed_one_by_one(
     _ok(server, c.kXR_dirlist, b"a.txt\nsub\x00")  # a server that ignores kXR_dstat
     directory = ctx.opendir(base + "/data")
     first, info = directory.readpp()
+    assert first is not None and info is not None
     assert (first.d_name, info.st_size) == ("a.txt", 12)
     _ok(server, c.kXR_dirlist, b"gone\x00")
     failure = _gerror(ctx.listdir, base + "/data")
@@ -667,23 +706,16 @@ def test_listings_are_read_as_xrdclient_reads_them() -> None:
         b"d\n77 4096 50 1600000000\n.\n0 0 0 0\n\x00junk"
     )
     theirs = [
-        (entry.name, xrootd._brief(entry.stat))
+        (entry.name, (int(entry.stat.flags), entry.stat.st_size, entry.stat.st_mtime))
         for entry in responses.parse_dirlist(body, "/p")
         if entry.stat is not None
     ]
     assert [name for name, _ in theirs] == ["f1", "d"]
     assert xrootd.parse_listing(body, "/p") == theirs
     assert xrootd.parse_listing(body, "/p", brief=False) == [
-        (name, xrootd._UNREAD) for name, _ in theirs
+        (name, xstat._UNREAD) for name, _ in theirs
     ]
     assert xrootd.parse_listing(b"a\nb\n\x00", "/p") == [("a", None), ("b", None)]
-
-
-def test_a_filesystem_without_a_router_is_listed_through_scandir() -> None:
-    info = SimpleNamespace(flags=0x10, st_size=5, st_mtime=7)
-    entries = [SimpleNamespace(name="a", stat=info), SimpleNamespace(name="b", stat=None)]
-    fs: Any = SimpleNamespace(scandir=lambda path: entries)
-    assert xrootd._dirlist(fs, "/d", brief=True) == [("a", (0x10, 5, 7)), ("b", None)]
 
 
 # -- connections -----------------------------------------------------------------------
@@ -1024,26 +1056,31 @@ def _doc(*responses: dict[str, Any], request_id: str = "tok") -> str:
     return json.dumps({"request_id": request_id, "responses": list(responses)})
 
 
+def _refusal(document: str, token: str, paths: list[str], *, archive: bool) -> GError:
+    """The error ``parse_prepare_status`` makes of the first path's answer."""
+    first = parse_prepare_status(document, token, paths, archive=archive)[0]
+    assert isinstance(first, GError)
+    return first
+
+
 def test_poll_documents_are_judged_as_gfal2_judges_them() -> None:
     paths = ["/f"]
-    judged = parse_prepare_status("No information found.", "tok", paths, archive=False)
-    assert judged[0].message == "Response from server is an invalid JSON: No information found."
-    assert parse_prepare_status("[]", "tok", paths, archive=False)[0].code == errno.ENOMSG
-    assert parse_prepare_status(_doc(request_id="x"), "tok", paths, archive=False)[0].message == (
+    judged = _refusal("No information found.", "tok", paths, archive=False)
+    assert judged.message == "Response from server is an invalid JSON: No information found."
+    assert _refusal("[]", "tok", paths, archive=False).code == errno.ENOMSG
+    assert _refusal(_doc(request_id="x"), "tok", paths, archive=False).message == (
         "Request ID mismatch."
     )
     no_id = json.dumps({"responses": []})
-    assert parse_prepare_status(no_id, "tok", paths, archive=False)[0].message == (
-        "Request ID mismatch."
-    )
+    assert _refusal(no_id, "tok", paths, archive=False).message == ("Request ID mismatch.")
     not_a_list = json.dumps({"request_id": "tok", "responses": {"/f": {}}})
-    assert parse_prepare_status(not_a_list, "tok", paths, archive=False)[0].message == (
+    assert _refusal(not_a_list, "tok", paths, archive=False).message == (
         "Number of files in the request does not match!"
     )
-    assert parse_prepare_status(_doc(), "tok", paths, archive=False)[0].message == (
+    assert _refusal(_doc(), "tok", paths, archive=False).message == (
         "Number of files in the request does not match!"
     )
-    assert parse_prepare_status(_doc(), "tok", paths, archive=True)[0].message == (
+    assert _refusal(_doc(), "tok", paths, archive=True).message == (
         "Number of files in the request doest not match!"
     )
 
@@ -1260,52 +1297,30 @@ def test_a_reply_no_write_expects_breaks_the_connection(
     assert ctx.stat(base + "/data/a.txt").st_size == 12  # on a connection of its own
 
 
-def test_an_upload_goes_one_write_at_a_time_where_it_cannot_borrow_the_wire(
+def test_an_upload_goes_one_write_at_a_time_where_it_cannot_use_the_bulk_plane(
     ctx: xgfalclient.Gfal2Context,
     server: FakeServer,
     base: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    payload = os.urandom(5000)
+    payload = _small_chunks(monkeypatch)
     (tmp_path / "src").write_bytes(payload)
-    monkeypatch.setattr(xrootd._Upload, "usable", staticmethod(lambda handle: False))
+    monkeypatch.setenv("XRD_BULK", "0")  # xrdclient writes each piece and waits for it
+    server.waits[c.kXR_write] = 1  # sat out, not handed back, on this path
     ctx.filecopy(ctx.transfer_parameters(), f"file://{tmp_path}/src", base + "/up/plain")
     assert server.contents("/up/plain") == payload
-
-
-def test_a_signing_session_is_not_borrowed() -> None:
-    def handle(signer: object) -> Any:
-        session = SimpleNamespace(
-            machine=SimpleNamespace(signer=signer, lease_sids=1, release_sids=1),
-            bulk=1,
-            transport=1,
-            mark_broken=1,
-        )
-        return SimpleNamespace(session=session, handle=b"\x00" * 4)
-
-    assert xrootd._Upload.usable(handle(None))
-    assert not xrootd._Upload.usable(handle(object()))
-
-
-def test_a_session_without_the_bulk_api_is_not_borrowed() -> None:
-    machine = SimpleNamespace(signer=None, lease_sids=1, release_sids=1)
-    older = SimpleNamespace(machine=SimpleNamespace(signer=None), bulk=1, transport=1)
-    assert not xrootd._Upload.usable(SimpleNamespace(session=older, handle=b"\x00" * 4))
-    no_bulk = SimpleNamespace(machine=machine, transport=1, mark_broken=1)
-    assert not xrootd._Upload.usable(SimpleNamespace(session=no_bulk, handle=b"\x00" * 4))
+    assert server.seen.count(c.kXR_write) == 12
 
 
 def test_an_upload_that_cannot_settle_its_connection_says_so() -> None:
     channel, session = _upload_channel(lambda view: 0)
     channel._begin()
     channel._owed.add(channel._leased[0])
-    with pytest.raises(xe.TimeoutError, match="connection closed"):
+    with pytest.raises(xe.ConnectionError, match="connection closed") as caught:
         channel.settle()
+    assert not isinstance(caught.value, xe.TimeoutError)  # the link went, nothing ran out
     assert session.broken
-    wire = SimpleNamespace(receive_into=lambda view: 0)
-    with pytest.raises(xe.ConnectionError):
-        xrootd._receive(wire, 8)
 
 
 def _upload_channel(receive_into: Any) -> tuple[Any, Any]:
@@ -1318,7 +1333,11 @@ def _upload_channel(receive_into: Any) -> tuple[Any, Any]:
     session = SimpleNamespace(
         config=Config(request_timeout=0.01),
         machine=machine,
-        transport=SimpleNamespace(send=lambda part: None, receive_into=receive_into),
+        transport=SimpleNamespace(
+            send=lambda part: None,
+            send_buffers=lambda parts: None,
+            receive_into=receive_into,
+        ),
         broken=False,
     )
     session.mark_broken = lambda: setattr(session, "broken", True)
@@ -1326,7 +1345,7 @@ def _upload_channel(receive_into: Any) -> tuple[Any, Any]:
 
 
 def test_an_upload_refuses_a_reply_to_a_write_it_did_not_send() -> None:
-    pending = bytearray(xrootd._RESPONSE_HEADER.pack(7, 0, 0))  # stream 7: never used
+    pending = bytearray(struct.pack(">HHI", 7, 0, 0))  # stream 7: never used
 
     def receive_into(view: memoryview) -> int:
         count = min(len(view), len(pending))
@@ -1341,22 +1360,29 @@ def test_an_upload_refuses_a_reply_to_a_write_it_did_not_send() -> None:
 
 
 @pytest.mark.parametrize("closed", [False, True])
-def test_shared_upload_preserves_timeout_and_closed_connection_errors(
+def test_an_upload_keeps_timeouts_and_says_a_closed_connection_is_one(
     monkeypatch: pytest.MonkeyPatch, closed: bool
 ) -> None:
+    """A timeout stays a timeout; a connection closed under the writer is a lost connection."""
+
     def receive_into(view: memoryview) -> int:
         if closed:
             return 0
         raise xe.TimeoutError("server took too long")
 
     channel, session = _upload_channel(receive_into)
-    session.bulk = lambda *args, **kwargs: channel
-    monkeypatch.setattr(
-        xrootd, "ReadAhead", lambda *args, **kwargs: nullcontext([memoryview(b"x")])
-    )
+    monkeypatch.setattr(xcopy, "ReadAhead", lambda *args, **kwargs: nullcontext([memoryview(b"x")]))
     transfer = SimpleNamespace(check=lambda: None, progress=lambda *args, **kwargs: None)
-    handle = SimpleNamespace(session=session, handle=bytes(4))
-    upload = xrootd._Upload(transfer, None, None, handle)
+
+    def write_pieces(pieces: Any, **kwargs: Any) -> int:
+        return int(channel.write_chunks(list(pieces), strict_replies=True))
+
+    upload = xcopy._Upload(
+        cast("Transfer", transfer),
+        cast("PluginFile", None),
+        cast("xrootd.XRootDFile", None),
+        cast("xrdclient.File", SimpleNamespace(write_pieces=write_pieces)),
+    )
     expected = xe.ConnectionError if closed else xe.TimeoutError
     with pytest.raises(expected) as caught:
         upload.run()
@@ -1370,7 +1396,7 @@ def test_an_upload_that_comes_up_short_fails(
     ctx: xgfalclient.Gfal2Context, base: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "src").write_bytes(b"abc")
-    monkeypatch.setattr(XRootDPlugin, "_upload_serially", lambda *args: 1)
+    monkeypatch.setattr(xcopy.CopyJob, "_upload_serially", lambda *args: 1)
     failure = _gerror(
         ctx.filecopy, ctx.transfer_parameters(), f"file://{tmp_path}/src", base + "/s"
     )
@@ -1701,6 +1727,35 @@ def test_a_pull_without_a_timeout_between_progress_reports(
     assert 6 not in done
 
 
+def test_a_copys_cancel_hook_remembers_why_it_stopped() -> None:
+    asked: list[int] = []
+
+    def check() -> None:
+        asked.append(1)
+        if len(asked) > 1:
+            raise GError("Transfer canceled", errno.ECANCELED)
+
+    stop = xcopy.Stop(cast("Transfer", SimpleNamespace(check=check)))
+    assert stop() is False
+    assert stop() is True and isinstance(stop.reason, GError)
+    assert stop() is True and len(asked) == 2  # the answer stands; nobody is asked again
+
+
+def test_a_download_aborted_by_someone_else_fails_as_it_was(
+    ctx: xgfalclient.Gfal2Context, base: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xrdclient.client import bulk
+
+    def aborted(*args: Any, **kwargs: Any) -> None:
+        raise xe.AbortedError("not by this copy")
+
+    monkeypatch.setattr(bulk, "download", aborted)
+    failure = _gerror(
+        ctx.filecopy, ctx.transfer_parameters(), base + "/data/a.txt", f"file://{tmp_path}/x"
+    )
+    assert failure.message.endswith("not by this copy (source)")
+
+
 def test_a_short_copy_still_reports_its_size_once(
     ctx: xgfalclient.Gfal2Context,
     server: FakeServer,
@@ -1728,7 +1783,8 @@ def test_a_short_copy_still_reports_its_size_once(
     Puller(server, target)
     assert copy(_url(server) + "/data/a.txt", _url(target) + "/pulled") == [len(HELLO)]
     # The same one-request-at-a-time, where the fast paths are not to be had.
-    monkeypatch.setattr(xrootd._Upload, "usable", staticmethod(lambda handle: False))
+    monkeypatch.setenv("XRD_BULK", "0")
+    ctx.plugin(base, "stat").close()  # settings made before are forgotten
     assert copy(f"file://{tmp_path}/src", base + "/up/plain") == [5000]
 
     def refuse(*args: Any, **kwargs: Any) -> None:
@@ -1744,7 +1800,7 @@ def test_progress_is_quiet_until_the_destination_exists(
     transfer = xgfalclient.transfer.Transfer(
         ctx, ctx.transfer_parameters(), "root://h//a", _url(target) + "/none"
     )
-    plugin._tpc_progress(transfer)
+    xcopy.CopyJob(plugin, transfer)._tpc_progress()
     assert transfer.transferred == 0
 
 
@@ -1764,30 +1820,33 @@ def test_progress_is_quiet_until_the_destination_exists(
     ],
 )
 def test_check_tpc_lite_reads_the_answer_as_xrdcl_does(answer: str | None, lite: bool) -> None:
-    assert xrootd._tpc_lite(answer) is lite
+    assert tpc._tpc_lite(answer) is lite
 
 
 @pytest.mark.parametrize(
-    ("answer", "tpc"),
+    ("answer", "expected"),
     [(None, False), ("1", False), ("1\n", True), ("12", True), ("tpc\n", False), ("0\n", False)],
 )
-def test_check_tpc_reads_the_answer_as_xrdcl_does(answer: str | None, tpc: bool) -> None:
-    assert xrootd._tpc(answer) is tpc  # a lone "1" too: XrdCl's length check
+def test_check_tpc_reads_the_answer_as_xrdcl_does(answer: str | None, expected: bool) -> None:
+    assert tpc._tpc(answer) is expected  # a lone "1" too: XrdCl's length check
 
 
 def test_host_ids_and_landing_places() -> None:
     parse = xrdclient.parse
-    assert xrootd._host_id(parse("root://u@h:1095//p")) == "u@h:1095"
-    assert xrootd._host_id(parse("root://[::1]:1094//p")) == "[::1]:1094"
-    landed = xrootd._landed(parse("root://u@h//p?a=1"), "[::1]:2000")
+    assert urls.host_id(parse("root://u@h:1095//p")) == "u@h:1095"
+    assert urls.host_id(parse("root://[::1]:1094//p")) == "[::1]:1094"
+    landed = urls.landed(parse("root://u@h//p?a=1"), "[::1]:2000")
     assert (landed.host, landed.port, landed.username, landed.cgi) == ("::1", 2000, "u", "a=1")
 
 
 def test_cgi_is_merged_verbatim() -> None:
     url = xrdclient.parse("root://h//p?authz=a%20b&tpc.stage=x")
-    merged = xrootd._opaque(url, {"tpc.stage": "copy", "tpc.scgi": "a=1\tb=2"})
+    merged = urls.opaque(url, {"tpc.stage": "copy", "tpc.scgi": "a=1\tb=2"})
     assert merged.path_with_cgi == "/p?authz=a%20b&tpc.stage=copy&tpc.scgi=a=1\tb=2"
-    assert xrootd._opaque(url.without_query(), {"k": "v"}).path_with_cgi == "/p?k=v"
+    assert urls.opaque(url.without_query(), {"k": "v"}).path_with_cgi == "/p?k=v"
+    assert urls.opaque(url, {"authz": "c", "tpc.stage": "copy"}).path_with_cgi == (
+        "/p?authz=c&tpc.stage=copy"  # every field replaced: none of the old ones kept
+    )
 
 
 class Logins:
@@ -1795,9 +1854,9 @@ class Logins:
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.made: list[tuple[str, bool]] = []
-        made, real = self.made, xrdclient.File
+        made = self.made
 
-        class Recording(real):  # type: ignore[misc, valid-type]
+        class Recording(xrdclient.File):
             def __init__(self, url: Any, config: Any = None, **kwargs: Any) -> None:
                 made.append((str(url), config.gsi_delegate))
                 super().__init__(url, config, **kwargs)
@@ -2014,7 +2073,7 @@ def test_a_source_that_refuses_the_key(
     def open_(conn: Any, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
         if b"tpc.key=" in body:
             return iter([error(sid, 3010, "bad key")])
-        return placement(conn, sid, params, body)  # type: ignore[no-any-return]
+        return placement(conn, sid, params, body)
 
     server.handlers[c.kXR_open] = open_
     failure = _gerror(
@@ -2124,6 +2183,27 @@ def test_a_pull_that_finishes_as_it_is_cancelled_is_still_cancelled(
     assert (failure.code, failure.message) == (errno.ECANCELED, "Transfer canceled")
 
 
+def test_a_pull_called_off_before_it_starts_is_never_started(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
+) -> None:
+    """A cancel during the set-up: the rendezvous finishes it, sends no pull, and closes."""
+    puller = Puller(server, target)
+    opened = server.handlers.get(c.kXR_open) or xrdclient.testing.server._HANDLERS[c.kXR_open]
+
+    def slow(conn: Any, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
+        time.sleep(0.4)
+        return opened(conn, sid, params, body)
+
+    server.handlers[c.kXR_open] = slow
+    threading.Timer(0.1, ctx.cancel).start()
+    params = ctx.transfer_parameters()
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert (failure.code, failure.message) == (errno.ECANCELED, "Transfer canceled")
+    assert puller.fctls == []  # nothing under way to call off
+    assert list(puller.syncs.values()) == [1]  # armed, never pulled
+    assert "/p" not in target.files
+
+
 def test_a_notice_during_a_pull_is_passed_over(
     ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
 ) -> None:
@@ -2132,43 +2212,41 @@ def test_a_notice_during_a_pull_is_passed_over(
     assert target.contents("/p") == HELLO
 
 
-@pytest.mark.parametrize(
-    ("ending", "code"),
-    [("stray", errno.EPROTO), ("oksofar", errno.EPROTO), ("hangup", errno.ECONNRESET)],
-)
-def test_a_pull_answered_nonsense_breaks_the_connection(
-    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer, ending: str, code: int
+def test_a_pull_whose_connection_drops_fails_as_a_lost_connection(
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, target: FakeServer
 ) -> None:
-    Puller(server, target, delay=0.2, ending=ending)
+    Puller(server, target, delay=0.2, ending="hangup")
     params = ctx.transfer_parameters()
     params.transfer_cleanup = False
     failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/p")
-    assert failure.code == code
+    assert failure.code == errno.ECONNRESET
 
 
-def test_a_pull_on_an_older_xrdclient_cannot_be_stopped(
+@pytest.mark.parametrize("ending", ["stray", "oksofar"])
+def test_a_pull_answered_off_the_point_waits_for_its_answer(
     ctx: xgfalclient.Gfal2Context,
     server: FakeServer,
     target: FakeServer,
     monkeypatch: pytest.MonkeyPatch,
+    ending: str,
 ) -> None:
-    monkeypatch.setattr(xrootd._Pull, "usable", staticmethod(lambda handle: False))
-    puller = Puller(server, target, delay=0.2)
-    ctx.filecopy(ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/p")
-    assert target.contents("/p") == HELLO
-    assert puller.fctls == []
+    """A reply on a stream nobody asked on, or a partial one, is xrdclient's to settle.
 
-
-def test_a_pull_borrows_only_a_connection_with_the_api() -> None:
-    machine = SimpleNamespace(lease_sids=1, release_sids=1, frame_for=1)
-    session = SimpleNamespace(machine=machine, bulk=1, transport=1, mark_broken=1)
-    assert xrootd._Pull.usable(SimpleNamespace(session=session))
-    older = SimpleNamespace(
-        machine=SimpleNamespace(lease_sids=1, release_sids=1), bulk=1, transport=1, mark_broken=1
+    The connection is xrdclient's session, which passes such a reply over and
+    goes on waiting for the sync's real answer - here, until the copy's own
+    time runs out and the pull is called off.
+    """
+    monkeypatch.setattr(xrootd, "TPC_CANCEL_WAIT", 0.2)
+    puller = Puller(server, target, delay=0.2, ending=ending)
+    params = ctx.transfer_parameters()
+    params.timeout = 1
+    params.transfer_cleanup = False
+    failure = _gerror(ctx.filecopy, params, _url(server) + "/data/a.txt", _url(target) + "/p")
+    assert (failure.code, failure.message) == (
+        errno.ETIMEDOUT,
+        "Error on XrdCl::CopyProcess::Run(): [ERROR] Operation expired",
     )
-    assert not xrootd._Pull.usable(SimpleNamespace(session=older))
-    unmarked = SimpleNamespace(machine=machine, bulk=1, transport=1)
-    assert not xrootd._Pull.usable(SimpleNamespace(session=unmarked))
+    assert puller.fctls == [b"ofs.tpc cancel\x00"]
 
 
 @pytest.mark.parametrize(
@@ -2185,7 +2263,7 @@ def test_a_pull_borrows_only_a_connection_with_the_api() -> None:
     ],
 )
 def test_substreams_become_tpc_str_as_xrdcl_counts_them(value: str, cgi: dict[str, str]) -> None:
-    assert xrootd._streams(value) == cgi
+    assert tpc._streams(value) == cgi
 
 
 def test_a_pull_asks_for_substreams_when_xrdcl_would(

@@ -7,10 +7,11 @@ import errno
 import io
 import json
 import sys
-from xml.etree import ElementTree as ET
+from pathlib import Path
+from typing import Any
 
 import pytest
-from xrdclient.cli import _output as output
+from xrdcore import report as output
 
 from gfal2_util.shell import Gfal2Shell
 from xgfalclient import cli, transfer
@@ -18,43 +19,16 @@ from xgfalclient.cli import _base, _tape
 from xgfalclient.cli.__main__ import main as module_main
 from xgfalclient.context import Gfal2Context
 from xgfalclient.plugins.mock import MockPlugin
+from xgfalclient.types import Stat
 
 
-def xml_value(node):
-    kind = node.attrib["type"]
-    if kind == "object":
-        return {field.attrib["name"]: xml_value(field) for field in node}
-    if kind == "array":
-        return [xml_value(item) for item in node]
-    if kind == "null":
-        return None
-    if kind == "string":
-        text = node.text or ""
-        if "encoding" in node.attrib:
-            return base64.b64decode(text).decode("utf-8", "surrogatepass")
-        return text
-    return json.loads(node.text)
-
-
-def decode(text, fmt):
-    if fmt == "json":
-        return json.loads(text)
-    root = ET.fromstring(text)
-    return {
-        "schema": root.attrib["schema"],
-        "version": int(root.attrib["version"]),
-        "tool": xml_value(root.find("tool")),
-        "command": xml_value(root.find("command")),
-        "records": [xml_value(node) for node in root.find("records")],
-        "summary": xml_value(root.find("summary")),
-    }
-
-
-def invoke(command, args, fmt, capsys):
+def invoke(
+    command: str, args: list[str], fmt: str, capsys: pytest.CaptureFixture[str]
+) -> tuple[int, Any]:
     code = getattr(cli, command.replace("-", "_"))(["--output-format", fmt, *args])
     captured = capsys.readouterr()
     assert captured.err == ""
-    report = decode(captured.out, fmt)
+    report = output.parse(captured.out, fmt)
     assert report["schema"] == output.SCHEMA and report["version"] == 1
     assert report["summary"]["exit_code"] == code
     return code, report
@@ -63,7 +37,9 @@ def invoke(command, args, fmt, capsys):
 @pytest.mark.parametrize("fmt", ["json", "xml"])
 @pytest.mark.parametrize("command", sorted(cli.COMMANDS))
 @pytest.mark.parametrize("flag", ["--help", "--version"])
-def test_all_commands_help_and_version(fmt, command, flag, capsys):
+def test_all_commands_help_and_version(
+    fmt: str, command: str, flag: str, capsys: pytest.CaptureFixture[str]
+) -> None:
     code, report = invoke(command, [flag], fmt, capsys)
     assert code == 0 and report["summary"]["ok"]
     assert report["records"]
@@ -73,14 +49,16 @@ def test_all_commands_help_and_version(fmt, command, flag, capsys):
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
 @pytest.mark.parametrize("command", ["gfal2_version", "gfal_srm_ifce_version"])
-def test_version_only_tools(fmt, command, capsys):
+def test_version_only_tools(fmt: str, command: str, capsys: pytest.CaptureFixture[str]) -> None:
     code, report = invoke(command, [], fmt, capsys)
     assert code == 0 and report["records"][0]["kind"] == "version"
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
 @pytest.mark.parametrize("command", ["stat", "copy", "chmod", "legacy-register"])
-def test_usage_errors_are_structured(fmt, command, capsys):
+def test_usage_errors_are_structured(
+    fmt: str, command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
     code, report = invoke(command, [], fmt, capsys)
     assert code == 2
     error = next(row for row in report["records"] if row["kind"] == "error")
@@ -89,7 +67,9 @@ def test_usage_errors_are_structured(fmt, command, capsys):
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_partial_mkdir_batch_retains_success_and_numeric_failure(fmt, tmp_path, capsys):
+def test_partial_mkdir_batch_retains_success_and_numeric_failure(
+    fmt: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     first, second = tmp_path / "first", tmp_path / "second"
     second.mkdir()
     code, report = invoke("mkdir", [first.as_uri(), second.as_uri()], fmt, capsys)
@@ -103,7 +83,9 @@ def test_partial_mkdir_batch_retains_success_and_numeric_failure(fmt, tmp_path, 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
 @pytest.mark.parametrize("command", ["cat", "copy"])
-def test_binary_stdout_is_encoded_not_mixed_with_report(fmt, command, tmp_path, capsys):
+def test_binary_stdout_is_encoded_not_mixed_with_report(
+    fmt: str, command: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     path = tmp_path / "blob"
     body = b"\0\xff\r\n" * (1 << 19)
     path.write_bytes(body)
@@ -116,7 +98,9 @@ def test_binary_stdout_is_encoded_not_mixed_with_report(fmt, command, tmp_path, 
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_listing_is_typed_and_filename_escaping_is_lossless(fmt, tmp_path, capsys):
+def test_listing_is_typed_and_filename_escaping_is_lossless(
+    fmt: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     name = "a\n<&>\té"
     (tmp_path / name).write_bytes(b"ab")
     code, report = invoke("ls", [tmp_path.as_uri()], fmt, capsys)
@@ -127,7 +111,9 @@ def test_listing_is_typed_and_filename_escaping_is_lossless(fmt, tmp_path, capsy
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_mutators_and_results(fmt, tmp_path, capsys, monkeypatch):
+def test_mutators_and_results(
+    fmt: str, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     source, target = tmp_path / "source", tmp_path / "target"
     source.write_bytes(b"abc")
     for command, args in [
@@ -153,7 +139,9 @@ def test_mutators_and_results(fmt, tmp_path, capsys, monkeypatch):
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_copy_acknowledgement_and_progress(fmt, tmp_path, capsys, monkeypatch):
+def test_copy_acknowledgement_and_progress(
+    fmt: str, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(transfer, "MONITOR_INTERVAL", 0)
     monkeypatch.setattr(transfer, "STREAM_MONITOR_INTERVAL", 0)
     source, target = tmp_path / "source", tmp_path / "target"
@@ -170,7 +158,9 @@ def test_copy_acknowledgement_and_progress(fmt, tmp_path, capsys, monkeypatch):
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_dry_run_never_claims_transfer_success(fmt, tmp_path, capsys):
+def test_dry_run_never_claims_transfer_success(
+    fmt: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     source, target = tmp_path / "source", tmp_path / "target"
     source.write_bytes(b"a")
     code, report = invoke("copy", ["--dry-run", source.as_uri(), target.as_uri()], fmt, capsys)
@@ -180,7 +170,9 @@ def test_dry_run_never_claims_transfer_success(fmt, tmp_path, capsys):
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_staging_handles_and_mixed_batch_states(fmt, tmp_path, capsys, monkeypatch):
+def test_staging_handles_and_mixed_batch_states(
+    fmt: str, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     listing = tmp_path / "urls"
     urls = ["mock://h/good", "mock://h/bad?staging_errno=22"]
     listing.write_text("\n".join(urls))
@@ -204,7 +196,9 @@ def test_staging_handles_and_mixed_batch_states(fmt, tmp_path, capsys, monkeypat
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_report_failure_can_coexist_with_compatibility_exit_zero(fmt, capsys, monkeypatch):
+def test_report_failure_can_coexist_with_compatibility_exit_zero(
+    fmt: str, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(MockPlugin, "listxattr", lambda *args: ["user.nope"], raising=False)
     code, report = invoke("xattr", ["mock://h/f"], fmt, capsys)
     assert code == 0 and not report["summary"]["ok"]
@@ -212,24 +206,28 @@ def test_report_failure_can_coexist_with_compatibility_exit_zero(fmt, capsys, mo
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_module_and_compatibility_shell(fmt, tmp_path, capsys):
+def test_module_and_compatibility_shell(
+    fmt: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     path = tmp_path / "a"
     path.write_bytes(b"hi")
     assert module_main(["stat", "--output-format", fmt, path.as_uri()]) == 0
-    assert decode(capsys.readouterr().out, fmt)["summary"]["ok"]
+    assert output.parse(capsys.readouterr().out, fmt)["summary"]["ok"]
     assert module_main(["unknown", "--output-format", fmt]) == 2
-    assert decode(capsys.readouterr().out, fmt)["summary"]["exit_code"] == 2
+    assert output.parse(capsys.readouterr().out, fmt)["summary"]["exit_code"] == 2
     assert Gfal2Shell().main(["gfal-stat", "--output-format", fmt, path.as_uri()]) == 0
-    assert decode(capsys.readouterr().out, fmt)["summary"]["ok"]
+    assert output.parse(capsys.readouterr().out, fmt)["summary"]["ok"]
 
 
-def test_shortcuts_and_timeout_close_late_worker_output(tmp_path, capsys, monkeypatch):
+def test_shortcuts_and_timeout_close_late_worker_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "a"
     path.write_bytes(b"hi")
     assert cli.stat(["--json", path.as_uri()]) == 0
     assert json.loads(capsys.readouterr().out)["summary"]["ok"]
     assert cli.stat(["--xml", path.as_uri()]) == 0
-    assert decode(capsys.readouterr().out, "xml")["summary"]["ok"]
+    assert output.parse(capsys.readouterr().out, "xml")["summary"]["ok"]
     # A worker that exceeds the wait budget retains its closed ContextVar report;
     # shared diagnostic helpers must never leak late text into restored stdout.
     import threading
@@ -237,7 +235,7 @@ def test_shortcuts_and_timeout_close_late_worker_output(tmp_path, capsys, monkey
     done, release = threading.Event(), threading.Event()
     original = Gfal2Context.stat
 
-    def delayed(self, url):
+    def delayed(self: Gfal2Context, url: str) -> Stat:
         release.wait(5)
         _base.out("late worker message")
         done.set()
@@ -254,7 +252,9 @@ def test_shortcuts_and_timeout_close_late_worker_output(tmp_path, capsys, monkey
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_early_configuration_and_input_validation(fmt, capsys):
+def test_early_configuration_and_input_validation(
+    fmt: str, capsys: pytest.CaptureFixture[str]
+) -> None:
     code, report = invoke("stat", ["-D", "bad", "mock://h/f"], fmt, capsys)
     assert code == 1 and report["summary"]["error_count"] == 1
     code, report = invoke("token", ["--validity=-1", "mock://h/f"], fmt, capsys)
@@ -263,7 +263,9 @@ def test_early_configuration_and_input_validation(fmt, capsys):
     assert code == 1 and "URL" in report["records"][0]["message"]
 
 
-def test_shared_error_is_deduplicated_across_copy_and_executor(tmp_path, capsys):
+def test_shared_error_is_deduplicated_across_copy_and_executor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     source, target = tmp_path / "source", tmp_path / "target"
     source.write_bytes(b"a")
     target.write_bytes(b"b")
@@ -272,14 +274,16 @@ def test_shared_error_is_deduplicated_across_copy_and_executor(tmp_path, capsys)
 
 
 @pytest.mark.parametrize("fmt", ["json", "xml"])
-def test_recursive_copy_does_not_acknowledge_failed_children(fmt, tmp_path, capsys, monkeypatch):
+def test_recursive_copy_does_not_acknowledge_failed_children(
+    fmt: str, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
     source, target = tmp_path / "source", tmp_path / "target"
     source.mkdir()
     (source / "a").write_bytes(b"a")
     (source / "b").write_bytes(b"b")
     original = Gfal2Context.filecopy
 
-    def copy(self, params, src, dst):
+    def copy(self: Gfal2Context, params: Any, src: Any, dst: Any) -> Any:
         if src.endswith("/b"):
             from xgfalclient import GError
 
@@ -298,12 +302,10 @@ def test_recursive_copy_does_not_acknowledge_failed_children(fmt, tmp_path, caps
     assert not any(row["source"].endswith("/b") and row["status"] == "succeeded" for row in rows)
 
 
-def test_plain_metadata_conversion_is_skipped(capsys):
-    from xgfalclient.types import Stat
-
+def test_plain_metadata_conversion_is_skipped(capsys: pytest.CaptureFixture[str]) -> None:
     assert _base.stat_record(Stat()) is None
 
-    def action():
+    def action() -> int:
         assert _base.stat_record(None) is None
         return 0
 

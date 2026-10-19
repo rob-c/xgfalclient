@@ -9,9 +9,9 @@ import time
 from pathlib import Path
 
 import pytest
+from xrdclient.testing.brix import BrixProxy
 
 import xgfalclient
-from _brix import BrixProxy
 from xgfalclient.testing.webdav import WebDAVServer
 
 

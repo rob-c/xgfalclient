@@ -1,10 +1,13 @@
 """The ``srm://`` plugin side by side with real gfal2, and against a real dCache.
 
 **gfal2 parity.** A throwaway ``gfal-ref:latest`` container (gfal2 2.23.5,
-srm-ifce 1.24.8, CGSI-gSOAP, Python 3.9) runs :mod:`xgfalclient.testing.srm`
-and a driver that performs the same operations through ``gfal2`` and
-through ``xgfalclient`` (bind-mounted), recording each answer and every
-SOAP request body the server received. Answers and request bodies must be
+srm-ifce 1.24.8, CGSI-gSOAP, with AppStream Python 3.11 added; see
+:mod:`_interop_image`) runs :mod:`xgfalclient.testing.srm` and a driver that
+performs the same operations through ``gfal2`` (on the system Python 3.9)
+and through ``xgfalclient`` (bind-mounted, with the host's ``xrdclient``, on
+3.11), recording each answer and every SOAP request body the server
+received. The server is this package's code, so it runs on 3.11 in a
+process of its own for either client. Answers and request bodies must be
 identical except where :data:`KNOWN` says why not.
 
 **dCache.** With ``XGFAL_SRM_URL`` (e.g. ``srm://xgfal-srm-dcache:8443/data``)
@@ -27,6 +30,7 @@ from pathlib import Path
 import pytest
 
 import xgfalclient
+from _interop_image import GFAL2_PYTHON, XGFAL_PYTHON, library_mounts, xgfal_image, xrdclient_src
 
 pytestmark = [
     pytest.mark.interop,
@@ -46,28 +50,55 @@ KNOWN = {
     "cks-md5": "gfal2's gridftp plugin wording differs from this package's",
 }
 
-DRIVER = r"""
-import json, os, sys, pathlib, shutil, errno
-sys.path.insert(0, "/xgfal/src")
+#: The in-process SRM server, on python3.11 (it is this package's code) for
+#: either client: it prints the URL and the PKI's environment, then answers
+#: one JSON command per line on stdin (``["locality", path, value]``,
+#: ``["wire"]``) until stdin closes.
+SERVER = r"""
+import json, pathlib, shutil, sys
+sys.path[:0] = ["/xgfal/src", "/xgfal/xrd"]
 from xgfalclient.testing.pki import create_pki, subject_hash
 from xgfalclient.testing.srm import SRMServer, Space
-impl = sys.argv[1]
-if impl == "x":
-    import xgfalclient as gfal2
-else:
-    import gfal2
-d = pathlib.Path("/tmp/run-" + impl); shutil.rmtree(d, ignore_errors=True)
+d = pathlib.Path("/tmp/run-" + sys.argv[1]); shutil.rmtree(d, ignore_errors=True)
 pki = create_pki(d / "pki")
 h = subject_hash(pki.ca.subject.encoded())
 (pki.ca_dir / f"{h}.signing_policy").write_text(
     "access_id_CA X509 '/DC=org/DC=xgfal/CN=xgfal Test CA'\npos_rights globus CA:sign\n"
     "cond_subjects globus '\"/DC=org/DC=xgfal/*\"'\n")
-os.environ.update(pki.environment())
 root = d / "root"; (root / "data" / "sub").mkdir(parents=True)
 (root / "data" / "f").write_bytes(b"hello world\n"); (root / "data" / "sub" / "a").write_bytes(b"a")
 srm = SRMServer(pki.server_context(), root, queue_polls=1).start()
 srm.spaces["tok1"] = Space("ATLASDATADISK")
-u = srm.url("")
+print(json.dumps([srm.url(""), pki.environment()]), flush=True)
+for line in sys.stdin:
+    command = json.loads(line)
+    if command[0] == "locality":
+        srm.set_locality(command[1], command[2])
+        print("null", flush=True)
+    elif command[0] == "wire":
+        print(json.dumps(sorted({body.decode() for op, body in srm.log if op != "srmPing"})),
+              flush=True)
+srm.stop()
+"""
+
+#: The operations, through gfal2 on the system python3 (3.9: keep the syntax
+#: to that) or through this package on python3.11; each drives its own
+#: :data:`SERVER`, given as the second argument.
+DRIVER = r"""
+import json, os, subprocess, sys
+impl = sys.argv[1]
+if impl == "x":
+    sys.path[:0] = ["/xgfal/src", "/xgfal/xrd"]
+    import xgfalclient as gfal2
+else:
+    import gfal2
+server = subprocess.Popen(["python3.11", "-c", sys.argv[2], impl], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, universal_newlines=True)
+def control(*command):
+    server.stdin.write(json.dumps(command) + "\n"); server.stdin.flush()
+    return json.loads(server.stdout.readline())
+u, environment = json.loads(server.stdout.readline())
+os.environ.update(environment)
 ctx = gfal2.creat_context()
 ctx.set_opt_boolean("BDII", "ENABLED", False)
 ctx.set_opt_string_list("SRM PLUGIN", "TURL_PROTOCOLS", ["file"])
@@ -100,19 +131,23 @@ run("xattr-unknown", lambda: ctx.getxattr(u + "/data/f", "user.foo"))
 run("read", lambda: ctx.open(u + "/data/f", "r").read(100))
 run("read-missing", lambda: ctx.open(u + "/nope", "r"))
 run("write-exists", lambda: ctx.open(u + "/data/f", "w"))
-srm.set_locality("/data/f", "NEARLINE")
+control("locality", "/data/f", "NEARLINE")
 run("bol-sync", lambda: ctx.bring_online(u + "/data/f", 10, 60, False)[0])
-run("bol-lost-list", lambda: (srm.set_locality("/data/f", "LOST"),
+run("bol-lost-list", lambda: (control("locality", "/data/f", "LOST"),
     ctx.bring_online([u + "/data/f"], 10, 60, True)[0])[1])
-srm.set_locality("/data/sub/a", "ONLINE_AND_NEARLINE")  # a path gfal2 has not cached
+control("locality", "/data/sub/a", "ONLINE_AND_NEARLINE")  # a path gfal2 has not cached
 run("archive", lambda: ctx.archive_poll(u + "/data/sub/a"))
-srm.set_locality("/data/f", "ONLINE")
+control("locality", "/data/f", "ONLINE")
 run("copy", lambda: ctx.filecopy(u + "/data/f", u + "/data/c"))
 run("copy-missing", lambda: ctx.filecopy(u + "/nope", u + "/data/c2"))
-wire = sorted({body.decode() for op, body in srm.log if op not in ("srmPing",)})
-out["wire"] = [w.split("<SOAP-ENV:Body")[1] for w in wire]
+out["wire"] = [w.split("<SOAP-ENV:Body")[1] for w in control("wire")]
 print(json.dumps(out))
-srm.stop()
+sys.stdout.flush()
+server.stdin.close()
+try:
+    server.wait(timeout=30)
+except subprocess.TimeoutExpired:
+    server.kill()
 os._exit(0)
 """
 
@@ -130,14 +165,24 @@ def test_parity_with_gfal2() -> None:
     _docker(
         # The package alone: src/ also holds the gfal2 shim, which would
         # shadow the real gfal2 and compare this package with itself.
-        "run", "-d", "--name", name,
-        "-v", f"{ROOT / 'src' / 'xgfalclient'}:/xgfal/src/xgfalclient:ro",
-        "--entrypoint", "sleep", IMAGE, "infinity",
-    )  # fmt: skip
+        "run",
+        "-d",
+        "--name",
+        name,
+        "-v",
+        f"{ROOT / 'src' / 'xgfalclient'}:/xgfal/src/xgfalclient:ro",
+        "-v",
+        f"{xrdclient_src()}:/xgfal/xrd:ro",
+        *library_mounts(),
+        "--entrypoint",
+        "sleep",
+        xgfal_image(IMAGE),
+        "infinity",
+    )
     try:
         results = {}
-        for impl in ("g", "x"):
-            text = _docker("exec", name, "python3", "-c", DRIVER, impl)
+        for impl, python in (("g", GFAL2_PYTHON), ("x", XGFAL_PYTHON)):
+            text = _docker("exec", name, python, "-c", DRIVER, impl, SERVER)
             line = text.strip().splitlines()[-1]
             line = re.sub(r"localhost:\d+", "localhost:PORT", line)
             results[impl] = json.loads(re.sub(r"xgfal-\d+", "TOKEN", line))

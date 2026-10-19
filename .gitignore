@@ -13,3 +13,4 @@ dist/
 build/
 site/
 *.egg-info/
+.complexipy_cache/

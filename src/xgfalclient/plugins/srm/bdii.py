@@ -23,18 +23,29 @@ resolution" and guesses ``httpg://host[:port]/srm/managerv2``.
 
 The LDAP needed is a sliver of LDAPv3 (RFC 4511): BER-encoded bind,
 search and unbind requests and their responses, and the RFC 4515 filter
-syntax. It is written out here rather than taken from a library, because the
-package depends on nothing. :mod:`xgfalclient.testing.ldap` serves the same
-sliver for the tests.
+syntax. It is written out here rather than taken from a library, because a
+whole LDAP stack for one anonymous search is not worth a dependency.
+:mod:`xgfalclient.testing.ldap` serves the same sliver for the tests, and
+owns the server-side half (decoding a request's filter and evaluating it
+against entries), which a client never needs.
 
 Where this differs from gfal2: an answer (or a failure) is kept for the
 life of the context, one lookup per host, where gfal2 asks the BDII again
 on every SRM operation; and a ``TIMEOUT`` of zero or less is bounded by the
 caller's timeout rather than by nothing.
+
+The schema is GLUE 1.3: a ``GlueService`` entry per web service, whose
+``GlueServiceType`` (``SRM``/``srm``), ``GlueServiceVersion`` (``2.2.0``)
+and ``GlueServiceEndpoint`` (``httpg://host:8443/srm/managerv2``) are all
+that is read. The ``GlueSEUniqueID`` arm of the filter matches the storage
+element's own entry too, which carries none of these attributes and is
+skipped. Reading order: :class:`Resolver` (the policy), then
+:class:`LDAPClient` (the exchange), then the BER and filter helpers.
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
@@ -43,39 +54,44 @@ import threading
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any
 
-from ..._compat import SLOTS
-from ..._xml import UnsafeXML, fromstring
+from xrdcore.safexml import UnsafeXML, fromstring
+
 from ...errors import ECOMM, GError
 
 __all__ = [
-    "Resolver",
-    "Endpoint",
-    "LDAPError",
-    "LDAPClient",
-    "encode",
-    "decode",
-    "parse_filter",
-    "encode_filter",
-    "match_filter",
-    "SRM_FILTER",
     "ATTRIBUTES",
     "BASE",
     "GROUP",
     "RESULT_TEXT",
+    "SRM_FILTER",
+    "Endpoint",
+    "LDAPClient",
+    "LDAPError",
+    "Resolver",
+    "decode",
+    "encode",
+    "encode_filter",
+    "parse_filter",
 ]
 
 _log = logging.getLogger("gfal2")
 
+#: The option group gfal2 reads the BDII settings from.
 GROUP = "BDII"
+#: The search base: the root of the GLUE 1.3 tree in a top-level BDII.
 BASE = "o=grid"
+#: gfal2's filter; ``{host}`` is the SURL's host, inserted unescaped, so a
+#: host that breaks the filter's syntax fails as "Bad search filter".
 SRM_FILTER = (
     "(|(GlueSEUniqueID=*{host}*)(&(GlueServiceType=srm*)(GlueServiceEndpoint=*://{host}*)))"
 )
+#: The attributes requested; any other one in an entry is gfal2's "Bad attribute".
 ATTRIBUTES = ("GlueServiceVersion", "GlueServiceEndpoint", "GlueServiceType")
 #: gfal2 keeps at most this many endpoints per host.
 MAX_ENDPOINTS = 100
+#: The port of a ``host`` without one in ``LCG_GFAL_INFOSYS`` (RFC 4516's default).
 LDAP_PORT = 389
 
 # ---------------------------------------------------------------------------
@@ -84,8 +100,10 @@ LDAP_PORT = 389
 
 #: A decoded element: its tag byte and its content, which is the raw bytes
 #: of a primitive and the list of elements of a constructed one.
-Element = tuple[int, Union[bytes, list[Any]]]
+Element = tuple[int, bytes | list[Any]]
 
+#: Universal tags (X.680): primitive ones, and the constructed SEQUENCE/SET.
+#: Context and application tags are written as literals where they are used.
 INTEGER, OCTETS, ENUMERATED, BOOLEAN, SEQUENCE, SET = 0x02, 0x04, 0x0A, 0x01, 0x30, 0x31
 
 
@@ -94,6 +112,12 @@ class BERError(ValueError):
 
 
 def _length(size: int) -> bytes:
+    """A definite length (X.690 8.1.3): short form below 128, else long form.
+
+    The long form is ``0x80 | n`` then ``n`` big-endian bytes. The
+    indefinite form, which LDAP forbids (RFC 4511 section 5.1), is never
+    written.
+    """
     if size < 0x80:
         return bytes([size])
     body = size.to_bytes((size.bit_length() + 7) // 8, "big")
@@ -107,16 +131,27 @@ def encode(tag: int, content: bytes | Sequence[bytes]) -> bytes:
 
 
 def integer(value: int, tag: int = INTEGER) -> bytes:
+    """A two's-complement INTEGER (or ENUMERATED, by ``tag``).
+
+    One byte more than the magnitude needs whenever the top bit would
+    otherwise be set, so 128 is ``00 80`` and not the negative ``80``.
+    """
     size = max(1, (value.bit_length() + 8) // 8)
     return encode(tag, value.to_bytes(size, "big", signed=True))
 
 
 def octets(value: str, tag: int = OCTETS) -> bytes:
+    """A UTF-8 OCTET STRING (or an implicitly tagged one, by ``tag``)."""
     return encode(tag, value.encode("utf-8"))
 
 
 def _read(data: bytes, offset: int) -> tuple[int, int, int]:
-    """``(tag, content start, content end)`` of the element at ``offset``."""
+    """``(tag, content start, content end)`` of the element at ``offset``.
+
+    ``BERError`` for a truncated element, an indefinite length (``0x80``),
+    or a high tag number (``0x1F`` in the low bits), none of which LDAP
+    uses.
+    """
     if offset + 2 > len(data):
         raise BERError("truncated element")
     tag, first = data[offset], data[offset + 1]
@@ -137,7 +172,12 @@ def _read(data: bytes, offset: int) -> tuple[int, int, int]:
 
 
 def element_size(data: bytes) -> int | None:
-    """How many bytes the first element of ``data`` takes; ``None`` until its header is in."""
+    """How many bytes the first element of ``data`` takes; ``None`` until its header is in.
+
+    This frames LDAP messages on the TCP stream: each is one BER element,
+    so the receive loop reads until it has a whole one. Validation is left
+    to :func:`decode`.
+    """
     if len(data) < 2:
         return None
     first = data[1]
@@ -158,6 +198,7 @@ def decode(data: bytes) -> Element:
 
 
 def _decode(data: bytes, tag: int, start: int, end: int) -> Element:
+    """The element at ``data[start:end]``; children too when the constructed bit (0x20) is set."""
     if not tag & 0x20:
         return tag, data[start:end]
     children: list[Any] = []
@@ -172,6 +213,7 @@ def _decode(data: bytes, tag: int, start: int, end: int) -> Element:
 
 
 def as_int(item: Element) -> int:
+    """A decoded INTEGER/ENUMERATED's value; ``BERError`` for a constructed element."""
     value = item[1]
     if not isinstance(value, bytes):
         raise BERError("expected a primitive")
@@ -179,6 +221,7 @@ def as_int(item: Element) -> int:
 
 
 def as_text(item: Element) -> str:
+    """A decoded string's UTF-8 text, bad bytes replaced rather than fatal."""
     value = item[1]
     if not isinstance(value, bytes):
         raise BERError("expected a primitive")
@@ -186,6 +229,7 @@ def as_text(item: Element) -> str:
 
 
 def children(item: Element) -> list[Element]:
+    """A constructed element's children; ``BERError`` for a primitive one."""
     value = item[1]
     if not isinstance(value, list):
         raise BERError("expected a constructed element")
@@ -203,6 +247,12 @@ Filter = tuple[Any, ...]
 
 
 def _unescape(text: str) -> str:
+    """An assertion value with RFC 4515's ``\\XX`` hex escapes decoded.
+
+    The escapes are bytes, so the value is built as UTF-8 bytes and decoded
+    once at the end. A backslash not followed by two hex digits is kept as
+    it is, leniently.
+    """
     out = bytearray()
     index = 0
     raw = text.encode("utf-8")
@@ -228,6 +278,15 @@ def parse_filter(text: str) -> Filter:
 
 
 def _parse(text: str, index: int) -> tuple[Filter, int]:
+    """The filter starting at ``text[index]`` (an opening parenthesis), and where it ends.
+
+    Recursive descent over RFC 4515's ``filter`` production. Only the
+    item types the BDII query and the test server need are supported:
+    ``&``, ``|``, ``!``, equality, presence and substrings. ``>=``, ``<=``,
+    ``~=`` and extensible matches parse as equality on an attribute whose
+    name keeps the operator's leading character (``a>``), so they match
+    nothing rather than fail.
+    """
     if text[index : index + 1] != "(":
         raise ValueError(f"Bad search filter: {text}")
     index += 1
@@ -243,26 +302,37 @@ def _parse(text: str, index: int) -> tuple[Filter, int]:
         item, index = _parse(text, index + 1)
         found = ("!", item)
     else:
-        close = text.find(")", index)
-        if close < 0:
-            raise ValueError(f"Bad search filter: {text}")
-        attribute, sep, value = text[index:close].partition("=")
-        if not sep or not attribute:
-            raise ValueError(f"Bad search filter: {text}")
-        index = close
-        if value == "*":
-            found = ("present", attribute)
-        elif "*" in value:
-            parts = [_unescape(part) for part in value.split("*")]
-            found = ("substrings", attribute, parts[0], [p for p in parts[1:-1] if p], parts[-1])
-        else:
-            found = ("=", attribute, _unescape(value))
+        found, index = _parse_item(text, index)
     if text[index : index + 1] != ")":
         raise ValueError(f"Bad search filter: {text}")
     return found, index + 1
 
 
+def _parse_item(text: str, index: int) -> tuple[Filter, int]:
+    """The ``attribute=value`` item at ``text[index]``, and the index of its ``)``."""
+    close = text.find(")", index)
+    if close < 0:
+        raise ValueError(f"Bad search filter: {text}")
+    attribute, sep, value = text[index:close].partition("=")
+    if not sep or not attribute:
+        raise ValueError(f"Bad search filter: {text}")
+    if value == "*":
+        return ("present", attribute), close
+    if "*" in value:
+        parts = [_unescape(part) for part in value.split("*")]
+        middle = [part for part in parts[1:-1] if part]
+        return ("substrings", attribute, parts[0], middle, parts[-1]), close
+    return ("=", attribute, _unescape(value)), close
+
+
 def encode_filter(found: Filter) -> bytes:
+    """A parsed :data:`Filter` as the BER ``Filter`` CHOICE of RFC 4511 section 4.5.1.
+
+    The context tags: ``and`` [0] ``0xA0``, ``or`` [1] ``0xA1``, ``not`` [2]
+    ``0xA2``, ``equalityMatch`` [3] ``0xA3``, ``substrings`` [4] ``0xA4``,
+    ``present`` [7] ``0x87`` (primitive: just the attribute name); a
+    substring's parts are ``initial`` [0], ``any`` [1] and ``final`` [2].
+    """
     kind = found[0]
     if kind in ("&", "|"):
         return encode(0xA0 if kind == "&" else 0xA1, [encode_filter(f) for f in found[1]])
@@ -277,65 +347,6 @@ def encode_filter(found: Filter) -> bytes:
     parts += [octets(part, 0x81) for part in middle]
     parts += [octets(final, 0x82)] if final else []
     return encode(0xA4, [octets(attribute), encode(SEQUENCE, parts)])
-
-
-def decode_filter(item: Element) -> Filter:
-    """The filter a search request carries (for the test server)."""
-    tag = item[0]
-    if tag in (0xA0, 0xA1):
-        return ("&" if tag == 0xA0 else "|", [decode_filter(f) for f in children(item)])
-    if tag == 0xA2:
-        return ("!", decode_filter(children(item)[0]))
-    if tag == 0x87:
-        return ("present", as_text(item))
-    if tag == 0xA3:
-        attribute, value = children(item)
-        return ("=", as_text(attribute), as_text(value))
-    if tag == 0xA4:
-        attribute, parts = children(item)
-        initial, middle, final = "", [], ""
-        for part in children(parts):
-            if part[0] == 0x80:
-                initial = as_text(part)
-            elif part[0] == 0x81:
-                middle.append(as_text(part))
-            else:
-                final = as_text(part)
-        return ("substrings", as_text(attribute), initial, middle, final)
-    raise BERError(f"unsupported filter choice {tag:#x}")
-
-
-def match_filter(found: Filter, entry: dict[str, list[str]]) -> bool:
-    """Whether ``entry`` (attribute names matched case-insensitively) passes."""
-    values = {name.lower(): items for name, items in entry.items()}
-    kind = found[0]
-    if kind == "&":
-        return all(match_filter(f, entry) for f in found[1])
-    if kind == "|":
-        return any(match_filter(f, entry) for f in found[1])
-    if kind == "!":
-        return not match_filter(found[1], entry)
-    present = values.get(found[1].lower(), [])
-    if kind == "present":
-        return bool(present)
-    if kind == "=":
-        return any(value.lower() == found[2].lower() for value in present)
-    _, _, initial, middle, final = found
-    return any(
-        _substrings(value.lower(), initial.lower(), middle, final.lower()) for value in present
-    )
-
-
-def _substrings(value: str, initial: str, middle: list[str], final: str) -> bool:
-    if not value.startswith(initial):
-        return False
-    position = len(initial)
-    for part in middle:
-        found = value.find(part.lower(), position)
-        if found < 0:
-            return False
-        position = found + len(part)
-    return len(value) - position >= len(final) and value.endswith(final)
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +373,8 @@ RESULT_TEXT = {
     80: "Internal (implementation specific) error",
 }
 
+#: libldap's client-side codes (negative, never on the wire): what a failed
+#: connection, a timeout and a filter that will not parse report.
 SERVER_DOWN, TIMEOUT, FILTER_ERROR = -1, -5, -7
 
 #: Protocol operation tags (RFC 4511 section 4.2 onwards).
@@ -373,18 +386,27 @@ class LDAPError(Exception):
     """An LDAP failure: ``code`` is libldap's result code."""
 
     def __init__(self, code: int) -> None:
+        """The message is libldap's ``ldap_err2string`` text, which gfal2 prints."""
         super().__init__(RESULT_TEXT.get(code, "Unknown error"))
         self.code = code
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Server:
+    """One BDII from ``LCG_GFAL_INFOSYS``: a host name (or IPv6 literal) and port."""
+
     host: str
     port: int
 
 
 def parse_servers(text: str) -> list[Server]:
-    """``host[:port]`` items, comma-separated, as ``LCG_GFAL_INFOSYS`` lists them."""
+    """``host[:port]`` items, comma-separated, as ``LCG_GFAL_INFOSYS`` lists them.
+
+    A ``scheme://`` prefix is dropped (``ldap://bdii:2170`` is accepted),
+    ``[v6]:port`` is understood, empty items are skipped, and a missing or
+    non-numeric port is :data:`LDAP_PORT`. Top-level BDIIs listen on 2170,
+    so in practice the port is always written.
+    """
     found = []
     for token in text.split(","):
         token = token.strip().rpartition("://")[2]
@@ -400,9 +422,22 @@ def parse_servers(text: str) -> list[Server]:
 
 
 class LDAPClient:
-    """One connection to the first of ``servers`` that accepts one."""
+    """One connection to the first of ``servers`` that accepts one.
+
+    Synchronous and single-request: each method sends one operation and
+    reads until its answer, so message IDs need no bookkeeping and
+    responses are not matched to them. Not thread-safe; the
+    :class:`Resolver` uses one per lookup, under its lock. Failures are
+    :class:`LDAPError` with libldap's codes (``2``, protocol error, for
+    anything unreadable), which :class:`Resolver` words as gfal2 does.
+    """
 
     def __init__(self, servers: Sequence[Server], timeout: float | None) -> None:
+        """Connect to the first server that accepts; ``LDAPError(SERVER_DOWN)`` if none.
+
+        ``timeout`` (seconds, ``None`` for none) bounds each connect and
+        then each send and receive on the socket.
+        """
         self.timeout = timeout
         self.sock: socket.socket | None = None
         self._buffer = b""
@@ -410,33 +445,44 @@ class LDAPClient:
         for server in servers:
             try:
                 self.sock = socket.create_connection((server.host, server.port), timeout)
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError):  # UnicodeError: a name IDNA rejects
                 continue
             break
         if self.sock is None:
             raise LDAPError(SERVER_DOWN)
 
     def close(self) -> None:
+        """Unbind (best effort; an UnbindRequest has no answer) and close the socket."""
         if self.sock is None:
             return
-        try:
+        with contextlib.suppress(LDAPError):
             self._send(encode(UNBIND_REQUEST, b""))
-        except LDAPError:
-            pass
         self.sock.close()
         self.sock = None
 
     def _send(self, operation: bytes) -> int:
+        """Wrap ``operation`` in an ``LDAPMessage`` with the next ID and send it.
+
+        ``LDAPMessage ::= SEQUENCE { messageID INTEGER, protocolOp, ... }``
+        (RFC 4511 section 4.1.1); no controls are sent. Returns the ID.
+        """
         assert self.sock is not None
         self._id += 1
         try:
             self.sock.sendall(encode(SEQUENCE, [integer(self._id), operation]))
         except OSError as exc:
-            raise LDAPError(TIMEOUT if isinstance(exc, socket.timeout) else SERVER_DOWN) from exc
+            raise LDAPError(TIMEOUT if isinstance(exc, TimeoutError) else SERVER_DOWN) from exc
         return self._id
 
     def _message(self) -> Element:
-        """The next protocol operation addressed to us."""
+        """The ``protocolOp`` of the next ``LDAPMessage`` on the connection.
+
+        Bytes past the message stay buffered for the next call. Its message
+        ID is not checked: with one request outstanding, every message is
+        an answer to it. A message that is not an ``LDAPMessage`` is a
+        protocol error (``2``); a closed connection or a socket error is
+        ``SERVER_DOWN``, a socket timeout ``TIMEOUT``.
+        """
         assert self.sock is not None
         while True:
             size = element_size(self._buffer)
@@ -450,21 +496,24 @@ class LDAPClient:
             try:
                 chunk = self.sock.recv(65536)
             except OSError as exc:
-                raise LDAPError(
-                    TIMEOUT if isinstance(exc, socket.timeout) else SERVER_DOWN
-                ) from exc
+                raise LDAPError(TIMEOUT if isinstance(exc, TimeoutError) else SERVER_DOWN) from exc
             if not chunk:
                 raise LDAPError(SERVER_DOWN)
             self._buffer += chunk
 
     @staticmethod
     def _result(operation: Element) -> None:
+        """Raise the ``resultCode`` (an ``LDAPResult``'s first field) unless it is success."""
         code = as_int(children(operation)[0])
         if code:
             raise LDAPError(code)
 
     def bind(self) -> None:
-        """An anonymous simple bind, LDAPv3."""
+        """An anonymous simple bind, LDAPv3.
+
+        ``BindRequest ::= [APPLICATION 0] SEQUENCE { version 3, name "",
+        authentication simple [0] "" }``; BDIIs allow anonymous reads.
+        """
         self._send(encode(BIND_REQUEST, [integer(3), octets(""), octets("", 0x80)]))
         reply = self._message()
         if reply[0] != BIND_RESPONSE:
@@ -474,14 +523,21 @@ class LDAPClient:
     def search(
         self, base: str, found: Filter, attributes: Sequence[str], time_limit: int = 0
     ) -> list[dict[str, list[str]]]:
-        """A subtree search; each entry's attributes, in the order the server sent them."""
+        """A subtree search; each entry's attributes, in the order the server sent them.
+
+        ``time_limit`` is the server-side limit in seconds (0 for none); the
+        socket timeout bounds the wait on this side. References
+        (``SearchResultReference``) are skipped, not followed. The
+        ``SearchResultDone``'s code decides success, so a search that hit a
+        size or time limit raises even after some entries came.
+        """
         request = [
             octets(base),
             integer(2, ENUMERATED),  # wholeSubtree
             integer(0, ENUMERATED),  # neverDerefAliases
             integer(0),  # no size limit
             integer(max(0, time_limit)),
-            encode(BOOLEAN, b"\x00"),
+            encode(BOOLEAN, b"\x00"),  # typesOnly FALSE: we want the values
             encode_filter(found),
             encode(SEQUENCE, [octets(name) for name in attributes]),
         ]
@@ -493,6 +549,8 @@ class LDAPClient:
                 self._result(reply)
                 return entries
             if reply[0] == SEARCH_ENTRY:
+                # SearchResultEntry ::= [APPLICATION 4] SEQUENCE { objectName,
+                # attributes SEQUENCE OF SEQUENCE { type, vals SET OF value } }
                 _, pairs = children(reply)
                 entry: dict[str, list[str]] = {}
                 for pair in children(pairs):
@@ -508,7 +566,7 @@ class LDAPClient:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Endpoint:
     """One service the BDII (or its cache) lists: its URL and SRM version."""
 
@@ -534,6 +592,8 @@ def _entry_endpoint(entry: dict[str, list[str]]) -> Endpoint | None:
     )
     fields = {"GlueServiceVersion": "", "GlueServiceEndpoint": "", "GlueServiceType": ""}
     counted = 0
+    # An attribute the server sent without values does not count, so an
+    # entry with nothing but those (the GlueSE entry's) is skipped.
     for name, values in entry.items():
         if not values:
             continue
@@ -567,6 +627,9 @@ def read_cache(path: str, host: str) -> list[Endpoint]:
     try:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
+        # The dump is a sequence of top-level <entry> elements, not one
+        # document: wrap it in a root (after dropping any XML declaration,
+        # which may only come first) so that it parses.
         if text.lstrip().startswith("<?xml"):
             text = text.split("?>", 1)[1]
         root = fromstring(f"<cache>{text}</cache>")
@@ -575,30 +638,48 @@ def read_cache(path: str, host: str) -> list[Endpoint]:
         return []
     found = []
     for entry in root.findall("entry"):
-        url = (entry.findtext("endpoint") or "").strip()
-        hostname = url.partition("://")[2] if "://" in url else url
-        if not hostname.lower().startswith(host.lower()):
+        endpoint = _cache_entry(entry, host)
+        if endpoint is None:
             continue
-        kind = (entry.findtext("type") or "").strip().lower()
-        version = (entry.findtext("version") or "").strip()
-        if kind == "srm" and version.startswith("2."):
-            found.append(Endpoint(url, "srm_v2"))
-        else:  # SRM v1, WebDAV, or unknown: counted, never chosen
-            found.append(Endpoint(url, "srm_v1" if kind == "srm" else ""))
+        found.append(endpoint)
         if len(found) >= MAX_ENDPOINTS:
             break
     return found
 
 
+def _cache_entry(entry: ElementTree.Element, host: str) -> Endpoint | None:
+    """One cache ``<entry>`` as an endpoint, or None when it is not ``host``'s."""
+    url = (entry.findtext("endpoint") or "").strip()
+    hostname = url.partition("://")[2] if "://" in url else url
+    if not hostname.lower().startswith(host.lower()):
+        return None
+    kind = (entry.findtext("type") or "").strip().lower()
+    version = (entry.findtext("version") or "").strip()
+    if kind == "srm" and version.startswith("2."):
+        return Endpoint(url, "srm_v2")
+    # SRM v1, WebDAV, or unknown: counted, never chosen.
+    return Endpoint(url, "srm_v1" if kind == "srm" else "")
+
+
 class Resolver:
-    """A context's BDII lookups: one per host, remembered."""
+    """A context's BDII lookups: one per host, remembered.
+
+    The lock is held across a lookup, so threads asking about the same
+    host wait for the first answer instead of all asking the BDII; a
+    lookup for another host waits too, behind the one lock. Failures are remembered as
+    well as answers, so a dead BDII costs one timeout per host, not one
+    per operation.
+    """
 
     def __init__(self, options: Any) -> None:
+        """Read settings from ``options`` (the context's) at lookup time."""
         self.options = options
         self._lock = threading.Lock()
+        #: Host to endpoint URL, ``None`` (nothing usable, no error), or the error.
         self._cache: dict[str, str | GError | None] = {}
 
     def enabled(self) -> bool:
+        """``[BDII] ENABLED`` (default true): whether short SURLs are looked up."""
         return bool(self.options.boolean(GROUP, "ENABLED", True))
 
     def endpoint(self, host: str, timeout: float | None = None) -> str | None:
@@ -622,6 +703,7 @@ class Resolver:
 
     @staticmethod
     def _select(found: list[Endpoint]) -> str | None:
+        """The first SRM v2 endpoint; ``None`` for no endpoints, ``EINVAL`` for no v2 one."""
         if not found:
             return None
         for item in found:
@@ -632,6 +714,7 @@ class Resolver:
         )
 
     def _lookup(self, host: str, timeout: float | None) -> list[Endpoint]:
+        """``CACHE_FILE``'s endpoints for ``host`` if it lists any, else the LDAP query's."""
         path = self.options.string(GROUP, "CACHE_FILE", "")
         if path:
             _log.debug("BDII CACHE_FILE set to %s", path)
@@ -644,6 +727,7 @@ class Resolver:
         return self._ldap(host, timeout)
 
     def _servers(self) -> list[Server]:
+        """The BDIIs to try: ``$LCG_GFAL_INFOSYS`` wins over the option, even when empty."""
         text = os.environ.get("LCG_GFAL_INFOSYS")
         if text is None:
             text = self.options.string(GROUP, "LCG_GFAL_INFOSYS", "")
@@ -659,6 +743,15 @@ class Resolver:
         return servers
 
     def _ldap(self, host: str, fallback: float | None) -> list[Endpoint]:
+        """Bind, search and unbind; ``ECOMM``/``ENXIO`` in gfal2's words on failure.
+
+        ``[BDII] TIMEOUT`` (seconds) bounds the connection and is also sent
+        as the search's server-side time limit; when it is not positive the
+        caller's ``fallback`` bounds the socket instead and the server is
+        given no limit. A search with no entries at all is ``ENXIO``; one
+        whose entries hold no endpoint yields ``[]``, which the caller
+        reads as "nothing to say".
+        """
         servers = self._servers()
         uri = ",".join(f"ldap://{server.host}:{server.port}" for server in servers)
         configured = int(self.options.integer(GROUP, "TIMEOUT", -1))
@@ -669,6 +762,7 @@ class Resolver:
             client = LDAPClient(servers, timeout)
         except LDAPError as exc:
             raise _failure(ECOMM, f"Error while bind to bdii with {uri} : {exc}", *_OUTER) from exc
+        # The unbind in ``finally`` runs whatever the bind or search did.
         try:
             try:
                 client.bind()
@@ -679,6 +773,8 @@ class Resolver:
             try:
                 entries = client.search(BASE, parse_filter(query), ATTRIBUTES, max(0, configured))
             except (LDAPError, ValueError) as exc:
+                # ValueError: the filter did not parse (a host that breaks
+                # its syntax), reported as libldap's filter error.
                 reason = exc if isinstance(exc, LDAPError) else LDAPError(FILTER_ERROR)
                 text = f"Error while request {query} to bdii : {reason}"
                 raise _failure(ECOMM, text, *_OUTER, "gfal_mds_ldap_search") from exc
@@ -691,6 +787,12 @@ class Resolver:
 
 
 def _endpoints(entries: list[dict[str, list[str]]]) -> Iterator[Endpoint]:
+    """The endpoints of ``entries``, at most :data:`MAX_ENDPOINTS` of them.
+
+    Every entry is still converted, past the cap too, so a malformed one
+    anywhere fails the lookup; entries without any of the attributes (the
+    storage element's own) are skipped.
+    """
     count = 0
     for entry in entries:
         found = _entry_endpoint(entry)

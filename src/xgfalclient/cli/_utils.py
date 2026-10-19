@@ -12,8 +12,9 @@ import os
 import stat
 import sys
 
-__all__ = ["file_type_str", "file_mode_str", "ls_colors"]
+__all__ = ["file_mode_str", "file_type_str", "ls_colors"]
 
+#: The parsed ``LS_COLORS``, once read (see :func:`ls_colors`).
 _colors: dict[str, str] | None = None
 
 
@@ -38,6 +39,7 @@ def ls_colors() -> dict[str, str]:
     return _colors
 
 
+#: File type words, as ``gfal-stat`` prints them after the size.
 _TYPES = {
     stat.S_IFBLK: "block device",
     stat.S_IFCHR: "character device",
@@ -55,6 +57,7 @@ def file_type_str(kind: int) -> str:
 
 
 def _triplet(mode: int) -> str:
+    """``rwx`` for the low three permission bits of ``mode`` (callers shift each class down)."""
     return (
         ("r" if mode & stat.S_IROTH else "-")
         + ("w" if mode & stat.S_IWOTH else "-")
@@ -63,6 +66,7 @@ def _triplet(mode: int) -> str:
 
 
 def _type_letter(mode: int) -> str:
+    """The leading letter, gfal2-util's quirks included (``f`` for a FIFO, ``-`` for a link)."""
     if stat.S_ISDIR(mode):
         return "d"
     if stat.S_ISBLK(mode):

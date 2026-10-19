@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import socket
 import struct
 import threading
+from typing import cast
 
 import pytest
 
 from xgfalclient.crypto import ciphers
+from xgfalclient.crypto.sshkeys import string
 from xgfalclient.errors import GError
 from xgfalclient.plugins.sftp import ssh
 from xgfalclient.plugins.sftp.endpoint import Endpoint
@@ -19,18 +22,18 @@ from xgfalclient.plugins.sftp.endpoint import Endpoint
 class Recv:
     """A callable feeding fixed bytes, as the cipher ``read`` helpers expect."""
 
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes | bytearray) -> None:
         self.data = data
         self.pos = 0
 
-    def __call__(self, n: int) -> bytes:
+    def __call__(self, n: int) -> bytes | bytearray:
         chunk = self.data[self.pos : self.pos + n]
         self.pos += n
         return chunk
 
 
 def _mac(name: str = "sha256") -> ssh._MAC:
-    return ssh._MAC(name, os.urandom(ssh.hashlib.new(name).digest_size))
+    return ssh._MAC(name, os.urandom(hashlib.new(name).digest_size))
 
 
 @pytest.mark.parametrize("etm", [True, False])
@@ -69,7 +72,7 @@ def test_chacha_cipher_round_trip_and_bad_tag() -> None:
 def test_null_cipher_round_trip() -> None:
     null = ssh._NullCipher()
     wire = null.seal(0, b"payload")
-    assert ssh._NullCipher().read(Recv(wire), 0) == b"payload"
+    assert bytes(ssh._NullCipher().read(Recv(wire), 0)) == b"payload"
 
 
 def test_check_length_rejects_absurd() -> None:
@@ -127,7 +130,7 @@ class FakeSock:
 
 def _transport(sock: FakeSock) -> ssh.SSHTransport:
     endpoint = Endpoint(host="h", port=22, user="a")
-    return ssh.SSHTransport(endpoint, ssh.Auth(username="a"), sock)  # type: ignore[arg-type]
+    return ssh.SSHTransport(endpoint, ssh.Auth(username="a"), cast(socket.socket, sock))
 
 
 def test_exchange_versions_skips_banner() -> None:
@@ -162,7 +165,7 @@ def test_exchange_versions_eof() -> None:
 
 
 def test_recv_exact_timeout() -> None:
-    transport = _transport(FakeSock(recv_exc=socket.timeout("slow")))
+    transport = _transport(FakeSock(recv_exc=TimeoutError("slow")))
     with pytest.raises(GError, match="Timed out") as caught:
         transport._recv_exact(5)
     assert caught.value.code == errno.ETIMEDOUT
@@ -320,17 +323,17 @@ def test_gcm_cipher_round_trip_and_rejections(keylen: int) -> None:
         assert len(wire) % 16 == 4 and len(wire) >= 4 + 16 + 16
         assert reader.read(Recv(bytes(wire)), seq) == payload  # bytes in: copied once
     # A flipped bit anywhere - length (the AAD), body or tag - is refused.
-    wire = bytes(ssh._GcmCipher(_GCM, key, iv).seal(0, b"secret payload"))
-    for position in (3, 10, len(wire) - 1):
-        bad = bytearray(wire)
+    sealed = bytes(ssh._GcmCipher(_GCM, key, iv).seal(0, b"secret payload"))
+    for position in (3, 10, len(sealed) - 1):
+        bad = bytearray(sealed)
         bad[position] ^= 1
         with pytest.raises(GError, match=r"AES-GCM tag|block size|implausible"):
             ssh._GcmCipher(_GCM, key, iv).read(Recv(bytes(bad)), 0)
     # A replayed packet (the nonce has moved on) is refused.
     fresh = ssh._GcmCipher(_GCM, key, iv)
-    assert fresh.read(Recv(wire), 0) == b"secret payload"
+    assert bytes(fresh.read(Recv(sealed), 0)) == b"secret payload"
     with pytest.raises(GError, match="AES-GCM tag"):
-        fresh.read(Recv(wire), 1)
+        fresh.read(Recv(sealed), 1)
     # A length that is not whole blocks is refused before any decryption.
     with pytest.raises(GError, match="not a multiple of the block size"):
         ssh._GcmCipher(_GCM, key, iv).read(Recv(struct.pack(">I", 20) + bytes(40)), 0)
@@ -341,10 +344,8 @@ def test_gcm_negotiated_first_with_libcrypto() -> None:
     preferred = ssh._ciphers_preferred(_GCM)
     assert preferred[:2] == ("aes128-gcm@openssh.com", "aes256-gcm@openssh.com")
     assert ssh._ciphers_preferred(ciphers.PURE) == preferred
-    cipher = ssh.make_cipher(
-        _GCM, "aes256-gcm@openssh.com", "hmac-sha2-256", 12345, b"h" * 32, b"s" * 32, "sha256",
-        ("A", "C", "E"),
-    )  # fmt: skip
+    keys = ssh.SessionKeys(12345, b"h" * 32, b"s" * 32, "sha256")
+    cipher = ssh.make_cipher(_GCM, "aes256-gcm@openssh.com", "hmac-sha2-256", keys, ("A", "C", "E"))
     assert isinstance(cipher, ssh._GcmCipher) and len(cipher._key) == 32
 
 
@@ -460,7 +461,7 @@ def test_extended_data_is_charged_to_the_window() -> None:
     transport = _transport(FakeSock())
     stderr = b"warning"
     transport._handle_channel(
-        bytes([ssh.MSG_CHANNEL_EXTENDED_DATA]) + struct.pack(">II", 0, 1) + ssh.string(stderr)
+        bytes([ssh.MSG_CHANNEL_EXTENDED_DATA]) + struct.pack(">II", 0, 1) + string(stderr)
     )
     assert transport._local_window == ssh._LOCAL_WINDOW - len(stderr)
     assert transport._inlen == 0  # never delivered as channel data
@@ -493,7 +494,7 @@ class GatherSock(FakeSock):
 
 def test_gathered_write_resumes_after_partial_sends() -> None:
     sock = GatherSock(limit=7)
-    transport = _transport(sock)  # type: ignore[arg-type]
+    transport = _transport(sock)
     packets: list[ssh.Buffer] = [b"abc", bytearray(b"defghij"), b"", b"klmnopqrstuvwxyz"]
     transport._write_gathered(packets)
     assert sock.sent == b"abcdefghijklmnopqrstuvwxyz" and sock.calls == 4
@@ -512,11 +513,16 @@ def test_gathered_write_without_sendmsg_joins_packets() -> None:
 
 def test_send_slices_parts_into_packets_and_gathers_them() -> None:
     sock = GatherSock(limit=1 << 30)
-    transport = _transport(sock)  # type: ignore[arg-type]
+    transport = _transport(sock)
     transport._remote_channel = 3
     transport._remote_maxpacket = 10
     transport._remote_window = 1000
-    parts = [b"0123", memoryview(b"456789abcdef"), bytearray(b""), b"ghijklmnopq"]
+    parts: list[bytes | bytearray | memoryview] = [
+        b"0123",
+        memoryview(b"456789abcdef"),
+        bytearray(b""),
+        b"ghijklmnopq",
+    ]
     transport.send(*parts)
     assert sock.calls == 1 and transport._remote_window == 1000 - 27
     wire, received = Recv(sock.sent), b""
@@ -533,4 +539,4 @@ def test_cipher_interface_is_unimplemented() -> None:
     with pytest.raises(NotImplementedError):
         cipher.seal(0, b"payload")
     with pytest.raises(NotImplementedError):
-        cipher.read(None, 0)  # type: ignore[arg-type]
+        cipher.read(Recv(b""), 0)

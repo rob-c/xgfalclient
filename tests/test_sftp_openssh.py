@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
+import shutil
 import subprocess
+import time
 from pathlib import Path
+from typing import IO, Any, cast
 
 import pytest
 
@@ -25,10 +29,10 @@ def fake_ssh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     return write_fake_ssh(tmp_path / "ssh")
 
 
-def _endpoint(**kw: object) -> Endpoint:
-    defaults: dict[str, object] = dict(host="example.org", port=22, user="alice")
+def _endpoint(**kw: Any) -> Endpoint:
+    defaults: dict[str, Any] = {"host": "example.org", "port": 22, "user": "alice"}
     defaults.update(kw)
-    return Endpoint(**defaults)  # type: ignore[arg-type]
+    return Endpoint(**defaults)
 
 
 # -- command line and environment --------------------------------------------
@@ -60,6 +64,55 @@ def test_command_line_shape() -> None:
     assert not any("askpass" in a.lower() or "BatchMode=no" in a for a in argv)
 
 
+def test_ssh_options_take_precedence_over_our_defaults() -> None:
+    # ssh keeps the *first* value it sees for an option, so SSH_OPTIONS must
+    # come before the defaults it is meant to override - but after the
+    # settings this tier depends on (no prompts, no forwarding) and the
+    # URL's port and user, which identify the pooled session.
+    endpoint = _endpoint(
+        port=2222,
+        explicit_port=True,
+        user="bob",
+        timeout=30,
+        ssh_options=(
+            "ConnectTimeout=5",
+            "StrictHostKeyChecking=yes",
+            "BatchMode=no",
+            "Port=2300",
+        ),
+    )
+    argv = openssh.command(["ssh"], endpoint)
+    first: dict[str, str] = {}
+    for arg in argv:
+        if arg.startswith("-o"):
+            name, _, value = arg[2:].partition("=")
+            first.setdefault(name, value)
+    assert first["ConnectTimeout"] == "5"
+    assert first["StrictHostKeyChecking"] == "yes"
+    assert first["BatchMode"] == "yes"
+    assert argv.index("-p") < argv.index("-oPort=2300")
+    assert argv.index("-l") < argv.index("-oConnectTimeout=5")
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="no ssh binary")
+def test_ssh_options_precedence_as_ssh_itself_resolves_it() -> None:
+    # ``ssh -G`` prints the configuration it would use, without connecting.
+    endpoint = _endpoint(
+        port=2222,
+        explicit_port=True,
+        user="bob",
+        timeout=30,
+        ssh_options=("ConnectTimeout=5", "ServerAliveInterval=3", "BatchMode=no", "User=eve"),
+    )
+    argv = openssh.command([str(shutil.which("ssh")), "-F", "/dev/null", "-G"], endpoint)
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=True)
+    config = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
+    assert config["connecttimeout"] == "5"
+    assert config["serveraliveinterval"] == "3"
+    assert config["batchmode"] == "yes"
+    assert (config["user"], config["port"]) == ("bob", "2222")
+
+
 def test_command_line_minimal() -> None:
     endpoint = _endpoint(user="", timeout=0)
     argv = openssh.command(["ssh"], endpoint)
@@ -87,11 +140,11 @@ def test_find_ssh() -> None:
 
 
 def test_find_ssh_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(openssh.shutil, "which", lambda name: f"/opt/bin/{name}")
+    monkeypatch.setattr(shutil, "which", lambda name: f"/opt/bin/{name}")
     # A bare name found on PATH is kept as given; ssh itself resolves to its path.
     assert openssh.find_ssh("gsissh -v") == ["gsissh", "-v"]
     assert openssh.find_ssh("") == ["/opt/bin/ssh"]
-    monkeypatch.setattr(openssh.shutil, "which", lambda name: None)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
     assert openssh.find_ssh("") is None
 
 
@@ -191,13 +244,18 @@ def test_connect_start_failure_without_errno(monkeypatch: pytest.MonkeyPatch) ->
     def refuse(*args: object, **kwargs: object) -> None:
         raise OSError("cannot start")
 
-    monkeypatch.setattr(openssh.subprocess, "Popen", refuse)
+    monkeypatch.setattr(subprocess, "Popen", refuse)
     with pytest.raises(GError, match="Could not start ssh: cannot start") as caught:
         openssh.connect(["ssh"], _endpoint())
     assert caught.value.code == errno.ENOENT
 
 
 # -- PipeStream internals via a controllable process --------------------------
+
+
+def _popen(fake: FakePopen) -> subprocess.Popen[bytes]:
+    """``fake`` where :class:`~.openssh.PipeStream` takes a real process."""
+    return cast("subprocess.Popen[bytes]", fake)
 
 
 class FakePopen:
@@ -245,16 +303,14 @@ class FakePopen:
         self.killed = True
         self._alive = False
         if self._w_out >= 0:
-            try:
+            with contextlib.suppress(OSError):
                 os.close(self._w_out)
-            except OSError:
-                pass
             self._w_out = -1
 
 
 def test_pipestream_recv_timeout() -> None:
     process = FakePopen(alive=True)  # stays open, never sends
-    stream = openssh.PipeStream(process, _endpoint(), timeout=0.2)
+    stream = openssh.PipeStream(_popen(process), _endpoint(), timeout=0.2)
     with pytest.raises(GError) as caught:
         stream.recv_into(memoryview(bytearray(16)))
     assert caught.value.code == errno.ETIMEDOUT
@@ -264,7 +320,7 @@ def test_pipestream_recv_timeout() -> None:
 
 def test_pipestream_failure_kills_hung_process() -> None:
     process = FakePopen(stderr_data=b"Connection refused\n", alive=True)
-    stream = openssh.PipeStream(process, _endpoint(), timeout=0)
+    stream = openssh.PipeStream(_popen(process), _endpoint(), timeout=0)
     # No timeout: recv sees EOF only after the process is torn down, so drive
     # failure() directly (the process is hung, so it is killed).
     err = stream.failure()
@@ -275,7 +331,7 @@ def test_pipestream_failure_kills_hung_process() -> None:
 
 def test_pipestream_send_after_exit_raises() -> None:
     process = FakePopen(stderr_data=b"Permission denied\n", alive=False)
-    stream = openssh.PipeStream(process, _endpoint(), timeout=0)
+    stream = openssh.PipeStream(_popen(process), _endpoint(), timeout=0)
     os.close(process._stdin_r)  # closing the read end makes writes fail
     with pytest.raises(GError) as caught:
         stream.send(b"x" * 100000)
@@ -285,7 +341,7 @@ def test_pipestream_send_after_exit_raises() -> None:
 
 def test_pipestream_stderr_is_capped() -> None:
     process = FakePopen(stderr_data=b"line\n" * 20000, alive=False)
-    stream = openssh.PipeStream(process, _endpoint(), timeout=0)
+    stream = openssh.PipeStream(_popen(process), _endpoint(), timeout=0)
     text = stream.stderr()
     assert 65536 <= len(text) <= 70000  # only the head is kept
     stream.close()
@@ -293,7 +349,7 @@ def test_pipestream_stderr_is_capped() -> None:
 
 def test_pipestream_recv_without_timeout_reads_data() -> None:
     process = FakePopen(stdout_data=b"payload-bytes", alive=False)
-    stream = openssh.PipeStream(process, _endpoint(), timeout=0)  # no select
+    stream = openssh.PipeStream(_popen(process), _endpoint(), timeout=0)  # no select
     view = memoryview(bytearray(32))
     got = stream.recv_into(view)
     assert bytes(view[:got]) == b"payload-bytes"
@@ -302,8 +358,8 @@ def test_pipestream_recv_without_timeout_reads_data() -> None:
 
 def test_pipestream_recv_readv_oserror() -> None:
     process = FakePopen(stderr_data=b"Connection reset\n", alive=False)
-    stream = openssh.PipeStream(process, _endpoint(), timeout=0)
-    stream.process.stdout.close()  # a closed fd makes readv raise OSError
+    stream = openssh.PipeStream(_popen(process), _endpoint(), timeout=0)
+    process.stdout.close()  # a closed fd makes readv raise OSError
     with pytest.raises(GError):
         stream.recv_into(memoryview(bytearray(16)))
     stream.close()
@@ -311,7 +367,7 @@ def test_pipestream_recv_readv_oserror() -> None:
 
 def test_pipestream_send_partial_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     process = FakePopen(alive=False)
-    stream = openssh.PipeStream(process, _endpoint(), timeout=0)
+    stream = openssh.PipeStream(_popen(process), _endpoint(), timeout=0)
     written_out = bytearray()
     # Return a short count first (a partial write of the first view), then one
     # that ends exactly on the view boundary, then the rest. The empty part is
@@ -324,7 +380,7 @@ def test_pipestream_send_partial_writes(monkeypatch: pytest.MonkeyPatch) -> None
         written_out.extend(data[:n])
         return n
 
-    monkeypatch.setattr(openssh.os, "writev", fake_writev)
+    monkeypatch.setattr(os, "writev", fake_writev)
     stream.send(b"hello", b"", b"world")
     assert bytes(written_out) == b"helloworld"
     stream.close()
@@ -343,14 +399,18 @@ class _RaisingClose:
 
 def test_pipestream_close_idempotent_and_tolerant(monkeypatch: pytest.MonkeyPatch) -> None:
     process = FakePopen(alive=True)
-    stream = openssh.PipeStream(process, _endpoint(), timeout=0)
+    stream = openssh.PipeStream(_popen(process), _endpoint(), timeout=0)
     # Replace the pipes with ones whose close() raises, to cover the guard.
-    stream.process.stdin = _RaisingClose(process.stdin.fileno())  # type: ignore[assignment]
-    stream.process.stdout = _RaisingClose(process.stdout.fileno())  # type: ignore[assignment]
+    stream._pipes = (
+        cast("IO[bytes]", _RaisingClose(process.stdin.fileno())),
+        cast("IO[bytes]", _RaisingClose(process.stdout.fileno())),
+    )
 
     # Make the kill-wait loop finish instantly, then require a kill.
     values = iter([0.0, 100.0, 100.0])
-    monkeypatch.setattr(openssh.time, "monotonic", lambda: next(values, 100.0))
+    monkeypatch.setattr(time, "monotonic", lambda: next(values, 100.0))
     stream.close()
     assert process.killed
     stream.close()  # idempotent second call returns immediately
+    process.stdin.close()  # the real pipes the raising stand-ins replaced
+    process.stdout.close()

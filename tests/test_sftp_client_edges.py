@@ -11,13 +11,14 @@ from __future__ import annotations
 import errno
 import struct
 import threading
+from collections.abc import Callable
 
 import pytest
 
 from xgfalclient.crypto.sshkeys import string, uint32
 from xgfalclient.errors import GError
 from xgfalclient.plugins.sftp import protocol as fx
-from xgfalclient.plugins.sftp.client import SFTPClient
+from xgfalclient.plugins.sftp.client import Buffer, SFTPClient
 
 
 def _version(version: int = 3, ext: bytes = b"") -> bytes:
@@ -42,15 +43,15 @@ class FakeStream:
         self.sent: list[bytes] = []
         self.closed = False
         self.fail_send: BaseException | None = None
-        self.recv_hook = None  # type: ignore[assignment]
+        self.recv_hook: Callable[[], None] | None = None
 
     def feed(self, *packets: bytes) -> None:
         self.buffer += b"".join(packets)
 
-    def send(self, *parts: object) -> None:
+    def send(self, *parts: Buffer) -> None:
         if self.fail_send is not None:
             raise self.fail_send
-        self.sent.append(b"".join(bytes(p) for p in parts))  # type: ignore[arg-type]
+        self.sent.append(b"".join(bytes(p) for p in parts))
 
     def recv_into(self, view: memoryview) -> int:
         if self.recv_hook is not None:
@@ -171,13 +172,13 @@ def test_double_failure_keeps_first_error() -> None:
     assert client._error is not None and client._error.message == "first"
 
 
-def test_fail_ignores_close_error() -> None:
+def test_fail_ignores_close_error(monkeypatch: pytest.MonkeyPatch) -> None:
     client, stream = _handshaked()
 
     def boom() -> None:
         raise OSError("close failed")
 
-    stream.close = boom  # type: ignore[assignment]
+    monkeypatch.setattr(stream, "close", boom)
     client._fail(GError("x", errno.EIO))  # must not propagate the close error
     assert not client.alive
 
@@ -193,7 +194,7 @@ def test_leader_follower_handoff() -> None:
 
     rid_a = client.send(fx.STAT, string(b"/a"))
     rid_b = client.send(fx.STAT, string(b"/b"))
-    stream.recv_hook = slow_recv  # type: ignore[assignment]
+    stream.recv_hook = slow_recv
     stream.feed(_resp(fx.ATTRS, rid_b, _attrs_body()), _resp(fx.ATTRS, rid_a, _attrs_body()))
     results: dict[int, int] = {}
 
@@ -343,3 +344,17 @@ def test_read_into_short_read_after_the_file_shrank() -> None:
     assert client.read_into(b"h", 0, memoryview(buf), chunk=10, depth=2) == 2
     assert bytes(buf[:2]) == b"ab"
     client.close()
+
+
+def test_abort_marks_the_session_dead_and_breaks_its_stream() -> None:
+    """``cancel()``'s hook: a stream without ``abort`` is closed; a dead session stays dead."""
+    stream = FakeStream()
+    client = SFTPClient(stream)
+    client.abort()
+    assert not client.alive and stream.closed
+    with pytest.raises(GError, match="the operation was cancelled"):
+        client.send(fx.STAT, string(b"/f"))
+    client.close()
+    client.abort()  # again, after close: the first failure is the one kept
+    with pytest.raises(GError, match="the operation was cancelled"):
+        client.send(fx.STAT, string(b"/f"))

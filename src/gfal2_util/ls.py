@@ -24,16 +24,20 @@ __all__ = [
     "time_locale",
 ]
 
+# gfal2-util's module-level names for the time formatters and colours.
 time_formats = TIME_FORMATS
 full_iso = TIME_FORMATS["full-iso"]
 long_iso = TIME_FORMATS["long-iso"]
 time_iso = TIME_FORMATS["iso"]
 time_locale = TIME_FORMATS["locale"]
 
+#: The raw ``LS_COLORS`` at import time; gfal2-util exposes it, nothing here reads it.
 color_env = os.environ.get("LS_COLORS", None)
 color_dict = ls_colors()
 
 
 class CommandLs(base.CommandBase):
+    """gfal2-util's ``CommandLs``; ``_size_to_human`` is kept for code that called it."""
+
     execute_ls = base._method(SPECS["ls"])
     _size_to_human = staticmethod(size_to_human)

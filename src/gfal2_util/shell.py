@@ -10,8 +10,8 @@ including any the caller defined. ``main`` returns what the command did
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any, Callable
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from xgfalclient.cli._base import exit_status, output
 
@@ -27,6 +27,8 @@ __all__ = ["CommandFactory", "Gfal2Shell"]
 
 
 class CommandFactory:
+    """gfal2-util's ``CommandFactory``: find the class that implements a command."""
+
     @staticmethod
     def get_command(cmd: str) -> tuple[type[base.CommandBase], Callable[..., Any]]:
         """The class and ``execute_<cmd>`` method for ``cmd``; ``ValueError`` if none has it."""
@@ -38,13 +40,19 @@ class CommandFactory:
 
 
 class Gfal2Shell:
+    """gfal2-util's ``Gfal2Shell``; the command classes are imported above so they register."""
+
     def main(self, args: Sequence[str]) -> int | None:
         """Entry point"""
+        # The one-word docstring above is gfal2-util's. With --json/--xml the
+        # run is wrapped in a report and the status normalised to an int;
+        # otherwise the command's raw return value goes back, as gfal2-util's.
         if output.requested(args[1:]):
             return output.run_cli(args[0], args[1:], lambda: exit_status(self._main(args)))
         return self._main(args)
 
     def _main(self, args: Sequence[str]) -> int | None:
+        """Pick the command from ``args[0]`` (``gfal-ls`` -> ``ls``), parse, execute."""
         cmd = args[0].rsplit("-", 1)[1].lower()
         command_class, command_func = CommandFactory.get_command(cmd)
         inst = command_class()

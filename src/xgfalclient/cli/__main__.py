@@ -14,10 +14,12 @@ from ._base import output
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Dispatch to the named command inside a report context; the exit status."""
     return output.run_cli("xgfalclient", argv, lambda: _main(argv))
 
 
 def _main(argv: Sequence[str] | None = None) -> int:
+    """Strip any ``gfal-`` prefix, find the command, run it; usage (status 2) if unknown."""
     args = list(sys.argv[1:] if argv is None else argv)
     command = args[0].rpartition("gfal-")[2] if args else ""
     if command in TOOLS:

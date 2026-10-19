@@ -1,30 +1,33 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """Open HTTP files, and checksums."""
 
 from __future__ import annotations
 
-import base64
 import errno
 import hashlib
 import os
-import zlib
+import time
 
 import pytest
 
 import xgfalclient
-from test_http_helpers import dav, dav2, hctx, write  # noqa: F401 - fixtures
+from test_http_helpers import dav as dav
+from test_http_helpers import dav2 as dav2
+from test_http_helpers import hctx as hctx
+from test_http_helpers import write
 from xgfalclient import GError
-from xgfalclient.checksum import crc32c
 from xgfalclient.plugin import O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY
 from xgfalclient.plugins.http import _dav, _io
 from xgfalclient.plugins.http._client import TransportError
+from xgfalclient.plugins.http.plugin import HTTPPlugin
 from xgfalclient.testing.webdav import WebDAVServer
 
 WRITE = O_WRONLY | O_CREAT | O_TRUNC
 
 
-def plugin(context: xgfalclient.Gfal2Context):  # type: ignore[no-untyped-def]
-    return context.plugin("davs://h/", "open")
+def plugin(context: xgfalclient.Gfal2Context) -> HTTPPlugin:
+    found = context.plugin("davs://h/", "open")
+    assert isinstance(found, HTTPPlugin)
+    return found
 
 
 # -- reading ------------------------------------------------------------------------------
@@ -52,25 +55,26 @@ def test_seek_reopens_with_a_range(hctx: xgfalclient.Gfal2Context, dav: WebDAVSe
     assert handle.read(10) == "789"
     assert dav.requests[-1].header("Range") == "bytes=7-"
     handle.lseek(5, os.SEEK_SET)
-    dav.ignore_range = True  # the server now answers 200 with the whole file
+    dav.ignore_ranges = True  # the server now answers 200 with the whole file
     assert handle.read(2) == "56"
     handle.close()
 
 
 def test_pread(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
+    """The ranges themselves are the shared suite's; here, davix's spelling and the edges."""
     write(dav, "/data/f", b"hello\n")
     handle = hctx.open(dav.url("/data/f"), "r")
     assert handle.pread(2, 3) == "llo"
     assert dav.requests[-1].header("Range") == "bytes=2-4"
-    assert handle.pread_bytes(100, 3) == b""  # 416
     assert handle.pread_bytes(0, 0) == b""
-    dav.ignore_range = True
-    assert handle.pread_bytes(4, 10) == b"o\n"
+    dav.ignore_ranges = True
     assert handle.pread_bytes(50, 2) == b""  # the skip runs off the end
     handle.close()
 
 
-def test_server_rejects_a_range_beyond_eof(hctx, dav):
+def test_server_rejects_a_range_beyond_eof(
+    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
+) -> None:
     write(dav, "/data/f", b"hello")
     with plugin(hctx)._get(dav.url("/data/f"), {"Range": "bytes=99-"}) as response:
         assert response.status == 416
@@ -87,11 +91,6 @@ def test_short_and_refused_reads(hctx: xgfalclient.Gfal2Context, dav: WebDAVServ
     dav.fault("GET", status=416)
     assert handle.read(3) == ""
     handle.close()
-    handle = hctx.open(dav.url("/data/f"), "r")
-    dav.fault("GET", status=403)
-    with pytest.raises(GError) as caught:
-        handle.read(3)
-    assert caught.value.code == errno.EPERM
 
 
 def test_open_errors(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -203,10 +202,10 @@ def test_refused_upload(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> No
     # Refused before the body with a known size: the writes are dropped, the
     # verdict arrives on close.
     dav.fault("PUT", status=507)
-    handle = plugin(hctx).open(dav.url("/data/r"), WRITE, 0o644, 3)
-    handle.write(b"abc")
+    sized = plugin(hctx).open(dav.url("/data/r"), WRITE, 0o644, 3)
+    sized.write(b"abc")
     with pytest.raises(GError) as caught:
-        handle.close()
+        sized.close()
     assert (caught.value.code, caught.value.message) == (
         errno.EIO,  # davix has no errno for 507
         "HTTP 507 : Insufficient Storage ",
@@ -226,42 +225,14 @@ def test_upload_to_a_missing_parent(hctx: xgfalclient.Gfal2Context, dav: WebDAVS
     )
 
 
-def test_upload_follows_a_redirect_before_the_body(
-    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer, dav2: WebDAVServer
-) -> None:
-    dav.redirects["/data/moved"] = dav2.base
-    handle = plugin(hctx).open(dav.url("/data/moved"), WRITE, 0o644, 3)
-    handle.write(b"abc")
-    handle.close()
-    assert dav2.local("/data/moved").read_bytes() == b"abc"
-    handle = hctx.open(dav.url("/data/moved2"), "w")
-    handle.write("xyz")
-    handle.close()
-    assert dav2.local("/data/moved2").read_bytes() == b"xyz"
-
-
-def test_upload_redirect_loop(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
-    dav.redirects["/data/loop"] = dav.base
-    with pytest.raises(GError) as caught:
-        plugin(hctx).open(dav.url("/data/loop"), WRITE, 0o644, 3).write(b"abc")
-    assert caught.value.code == errno.ELOOP
-
-
 # -- checksums ----------------------------------------------------------------------------
 
 
 def test_checksums(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
-    data = b"hello\n"
-    write(dav, "/data/f", data)
-    url = dav.url("/data/f")
-    assert hctx.checksum(url, "adler32") == f"{zlib.adler32(data):08x}"
-    assert dav.requests[-1].method == "HEAD"
-    assert dav.requests[-1].header("Want-Digest") == "adler32"
-    assert hctx.checksum(url, "ADLER32") == "084b021f"
-    assert dav.requests[-1].header("Want-Digest") == "ADLER32"  # as given, as davix sends it
-    assert hctx.checksum(url, "md5") == hashlib.md5(data).hexdigest()
-    assert hctx.checksum(url, "sha256") == hashlib.sha256(data).hexdigest()
-    assert hctx.checksum(url, "crc32c") == f"{crc32c(data, 0):08x}"
+    """The values are the shared suite's; davix names the algorithm as it was given."""
+    write(dav, "/data/f", b"hello\n")
+    assert hctx.checksum(dav.url("/data/f"), "ADLER32") == "084b021f"
+    assert dav.requests[-1].header("Want-Digest") == "ADLER32"
 
 
 def test_checksum_errors(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
@@ -298,9 +269,8 @@ def test_checksum_from_a_get_only_server(hctx: xgfalclient.Gfal2Context, dav: We
 
 
 def test_checksum_from_content_md5(hctx: xgfalclient.Gfal2Context, dav: WebDAVServer) -> None:
+    """A ``Content-MD5`` that is not base64 is passed over for the ``GET``'s digest."""
     digest = hashlib.md5(b"abc").digest()
-    dav.fault("HEAD", status=200, headers={"Content-MD5": base64.b64encode(digest).decode()})
-    assert hctx.checksum(dav.url("/data/f"), "MD5") == digest.hex()
     write(dav, "/data/f", b"abc")
     dav.fault("HEAD", status=200, headers={"Content-MD5": "!!not base64!!"})
     assert hctx.checksum(dav.url("/data/f"), "md5") == digest.hex()  # from the GET
@@ -333,34 +303,6 @@ def test_date_parsing() -> None:
 # it got to, so a flaky link costs a reconnect rather than the read - CONN_RETRY
 # bounds how many times. A response that ends cleanly at its own length is not a
 # drop (test_short_and_refused_reads, above) and is passed on unchanged.
-
-
-def test_a_dropped_read_resumes_from_where_it_got_to(
-    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
-) -> None:
-    body = bytes(range(256)) * 40  # 10240 bytes
-    write(dav, "/data/f", body)
-    # The first GET declares the full length but sends only 3000 bytes, then
-    # drops; the resumed ranged GET serves the rest.
-    dav.fault("GET", body=body, truncate=3000, times=1)
-    handle = hctx.open(dav.url("/data/f"), "r")
-    assert handle.read_bytes(len(body) + 10) == body
-    handle.close()
-    assert any(r.header("Range") for r in dav.requests if r.method == "GET")
-
-
-def test_a_dropped_pread_resumes_only_the_missing_range(
-    hctx: xgfalclient.Gfal2Context, dav: WebDAVServer
-) -> None:
-    body = bytes(range(256)) * 40
-    write(dav, "/data/f", body)
-    dav.fault("GET", body=body, truncate=3000, times=1)
-    handle = hctx.open(dav.url("/data/f"), "r")
-    assert handle.pread_bytes(0, len(body)) == body
-    handle.close()
-    ranges = [request.header("Range") for request in dav.requests if request.method == "GET"]
-    assert ranges[0] == f"bytes=0-{len(body) - 1}"
-    assert ranges[1].startswith("bytes=3000-")
 
 
 @pytest.mark.parametrize("status,first", [(206, b"0123"), (416, b"")])
@@ -413,7 +355,7 @@ def test_a_read_gives_up_after_conn_retry_drops(
     body = b"0123456789" * 100
     write(dav, "/data/f", body)
     hctx.set_opt_integer("CORE", "CONN_RETRY", 2)
-    dav.fault("GET", body=body, truncate=10, times=50)  # every GET drops early
+    dav.fault("GET", status=200, body=body, truncate=10, times=50)  # every GET drops early
     handle = hctx.open(dav.url("/data/f"), "r")
     with pytest.raises(GError) as caught:
         handle.read_bytes(len(body))
@@ -424,10 +366,8 @@ def test_a_read_gives_up_after_conn_retry_drops(
 def test_retry_pause_backs_off_unless_zero_is_explicit(
     hctx: xgfalclient.Gfal2Context, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from xgfalclient.plugins.http import plugin as plugin_module
-
     slept: list[float] = []
-    monkeypatch.setattr(plugin_module.time, "sleep", slept.append)
+    monkeypatch.setattr(time, "sleep", slept.append)
     http = plugin(hctx)
     http.retry_pause(2)
     assert slept == [0.1]

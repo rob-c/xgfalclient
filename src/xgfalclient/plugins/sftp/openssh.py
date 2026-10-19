@@ -27,10 +27,17 @@ only has to start it well:
   gfal2's errors: ``Permission denied`` is ``EACCES``, ``Connection
   refused`` ``ECONNREFUSED``, an unknown host ``EREMOTE`` as in gfal2, and
   so on.
+
+The SFTP bytes on the pipes are the same as on an SSH channel, so
+:class:`~.client.SFTPClient` runs unchanged on a :class:`PipeStream`. Each
+connection is one ``ssh`` process in its own session (process group), so a
+terminal's Ctrl-C reaches our process, not ssh, and the plugin decides how
+to stop it.
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import select
@@ -40,16 +47,22 @@ import subprocess
 import threading
 import time
 from collections.abc import Sequence
-from typing import Any
+from typing import IO, Any
 
 from ...errors import GError
 from .endpoint import Endpoint
 
-__all__ = ["PipeStream", "command", "environment", "ssh_error", "find_ssh", "connect"]
+__all__ = ["PipeStream", "command", "connect", "environment", "find_ssh", "ssh_error"]
 
 
 def find_ssh(configured: str = "") -> list[str] | None:
-    """The ``ssh`` command: ``SSH_COMMAND`` (shell-split) or ``ssh`` on ``PATH``."""
+    """The ``ssh`` command: ``SSH_COMMAND`` (shell-split) or ``ssh`` on ``PATH``.
+
+    ``None`` when there is none, which is what sends ``auto`` to an
+    in-process tier. A configured command whose program cannot be found is
+    also ``None`` rather than a fallback to ``ssh``: the operator asked for
+    that one. Extra words (``ssh -F conf``) are kept as leading arguments.
+    """
     if configured:
         argv = shlex.split(configured)
         if argv and (os.path.isabs(argv[0]) or shutil.which(argv[0])):
@@ -60,13 +73,48 @@ def find_ssh(configured: str = "") -> list[str] | None:
 
 
 def command(ssh: Sequence[str], endpoint: Endpoint) -> list[str]:
-    """The ``ssh`` argument vector for ``endpoint`` - never carrying a secret."""
+    """The ``ssh`` argument vector for ``endpoint`` - never carrying a secret.
+
+    ``-s ... sftp`` requests the subsystem; ``-T`` no pty (which would
+    mangle binary data), ``-x``/``-a`` no X11 or agent forwarding, and
+    ``ClearAllForwardings`` drops any port forwarding from the user's config,
+    which SFTP never needs and several pooled connections would each try
+    to bind. The server-alive probes detect a dead peer within about a
+    minute. ``-p`` is passed only for a port the URL named, so ``Port`` in
+    ``~/.ssh/config`` still applies otherwise. ``--`` keeps a hostile host
+    name from being read as an option.
+
+    **Order is precedence.** For almost every option ssh keeps the *first*
+    value it obtains - command line before ``~/.ssh/config`` before the
+    system file, and on the command line ``-o``, ``-p`` and ``-l`` in argv
+    order (``ssh_config(5)``: "for each parameter, the first obtained value
+    will be used"; ``ssh -G`` shows the result). So the argv is built in
+    three bands:
+
+    #. what this tier relies on and ``SSH_OPTIONS`` must not undo:
+       ``BatchMode=yes`` and no password prompts (ssh runs without a
+       terminal and never gets a password, so a prompt could only hang),
+       ``ClearAllForwardings``, and the URL's port and user, which name the
+       pooled session;
+    #. ``SSH_OPTIONS``, the operator's explicit choices;
+    #. our defaults, which a ``SSH_OPTIONS`` entry overrides:
+       ``LogLevel``, ``StrictHostKeyChecking``, ``UserKnownHostsFile``,
+       ``ConnectTimeout``, the ``ServerAlive`` probes. ``IdentityFile``
+       (``-i``) accumulates instead, so ours is added to any others.
+    """
+    argv = list(ssh)
+    argv += ["-s", "-T", "-x", "-a"]
     # BatchMode=yes always: this tier never has a password to type, so ssh
     # must fail rather than block on a prompt. NumberOfPasswordPrompts=0
     # skips even the keyboard-interactive round trips.
-    argv = list(ssh)
-    argv += ["-s", "-T", "-x", "-a", "-oLogLevel=ERROR", "-oClearAllForwardings=yes"]
-    argv += ["-oBatchMode=yes", "-oNumberOfPasswordPrompts=0"]
+    argv += ["-oBatchMode=yes", "-oNumberOfPasswordPrompts=0", "-oClearAllForwardings=yes"]
+    if endpoint.explicit_port:
+        argv += ["-p", str(endpoint.port)]
+    if endpoint.user:
+        argv += ["-l", endpoint.user]
+    for option in endpoint.ssh_options:
+        argv.append(f"-o{option}")
+    argv.append("-oLogLevel=ERROR")
     argv.append(f"-oStrictHostKeyChecking={endpoint.strict_host_keys}")
     if endpoint.known_hosts:
         argv.append(f"-oUserKnownHostsFile={endpoint.known_hosts}")
@@ -75,12 +123,6 @@ def command(ssh: Sequence[str], endpoint: Endpoint) -> list[str]:
     argv += ["-oServerAliveInterval=15", "-oServerAliveCountMax=4"]
     if endpoint.key_file:
         argv += ["-i", endpoint.key_file]
-    for option in endpoint.ssh_options:
-        argv.append(f"-o{option}")
-    if endpoint.explicit_port:
-        argv += ["-p", str(endpoint.port)]
-    if endpoint.user:
-        argv += ["-l", endpoint.user]
     argv += ["--", endpoint.host, "sftp"]
     return argv
 
@@ -140,12 +182,20 @@ class PipeStream:
     def __init__(
         self, process: subprocess.Popen[bytes], endpoint: Endpoint, timeout: float
     ) -> None:
+        """Adopt a started ``ssh`` with all three pipes, and start draining its stderr.
+
+        ``timeout`` (seconds, 0 for none) bounds each wait for a reply. The
+        stream owns ``process`` from here: :meth:`close` reaps it. stderr is
+        drained on a daemon thread, because an ssh that fills a stderr pipe
+        nobody reads would block, and with it the SFTP traffic.
+        """
         self.process = process
         self.endpoint = endpoint
         self.timeout = timeout
         assert process.stdin is not None
         assert process.stdout is not None
         assert process.stderr is not None
+        self._pipes: tuple[IO[bytes], IO[bytes]] = (process.stdin, process.stdout)
         self._write_fd = process.stdin.fileno()
         self._read_fd = process.stdout.fileno()
         self._stderr: list[bytes] = []
@@ -157,6 +207,7 @@ class PipeStream:
         self._drain.start()
 
     def _collect(self, pipe: Any) -> None:
+        """Drain ssh's stderr to EOF on the drain thread, keeping the first 64 KiB."""
         # Keep the head of stderr; ssh says why it failed first.
         for line in iter(pipe.readline, b""):
             if self._stderr_size < 65536:
@@ -165,6 +216,7 @@ class PipeStream:
         pipe.close()
 
     def stderr(self) -> str:
+        """What ssh wrote to stderr; waits up to 2 s for it to finish writing."""
         self._drain.join(timeout=2)
         return b"".join(self._stderr).decode("utf-8", "replace")
 
@@ -178,6 +230,12 @@ class PipeStream:
         return ssh_error(self.stderr(), status, self.endpoint)
 
     def send(self, *parts: Any) -> None:
+        """Write ``parts`` in order to ssh's stdin with ``writev``, retrying short writes.
+
+        A write failure means ssh has gone (or is going), so the error raised
+        is :meth:`failure`'s, built from ssh's exit status and stderr, not the
+        bare ``EPIPE``. Empty parts are dropped before the first call.
+        """
         views = [memoryview(part).cast("B") for part in parts if len(part)]
         try:
             while views:
@@ -191,6 +249,12 @@ class PipeStream:
             raise self.failure() from None
 
     def recv_into(self, view: memoryview) -> int:
+        """Read what ssh's stdout has, up to ``len(view)``; never returns 0.
+
+        With a timeout, ``select`` waits for data first so a silent server
+        is ``ETIMEDOUT`` rather than a hang. End of file means ssh exited
+        (the SFTP layer never expects it), so it raises :meth:`failure`.
+        """
         if self.timeout > 0:
             ready, _, _ = select.select([self._read_fd], [], [], self.timeout)
             if not ready:
@@ -207,15 +271,28 @@ class PipeStream:
             raise self.failure()
         return got
 
+    def abort(self) -> None:
+        """End ``ssh`` under a thread blocked on its pipes; for ``cancel()``.
+
+        A blocked ``readv`` then reads the end of the pipe and a blocked
+        ``writev`` fails, either way through :meth:`failure`. ``close``
+        (which reaps the process) stays the owner's.
+        """
+        with contextlib.suppress(OSError):  # already gone
+            self.process.kill()
+
     def close(self) -> None:
+        """Close both pipes, give ssh 2 s to exit, then kill and reap it; idempotent.
+
+        Closing stdin is ssh's signal to end the session cleanly; the short
+        grace period covers its ``CHANNEL_CLOSE`` exchange with the server.
+        """
         if self._closed:
             return
         self._closed = True
-        for pipe in (self.process.stdin, self.process.stdout):
-            try:
-                pipe.close()  # type: ignore[union-attr]
-            except OSError:
-                pass
+        for pipe in self._pipes:
+            with contextlib.suppress(OSError):
+                pipe.close()
         deadline = time.monotonic() + 2
         while self.process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -225,7 +302,14 @@ class PipeStream:
 
 
 def connect(ssh: Sequence[str], endpoint: Endpoint) -> PipeStream:
-    """Start ssh for ``endpoint``; the SFTP handshake is the caller's first read."""
+    """Start ssh for ``endpoint``; the SFTP handshake is the caller's first read.
+
+    Returns as soon as the process exists: authentication failures show up
+    on the first read or write, as :meth:`PipeStream.failure`. Failing to
+    start the program at all is reported with its errno (``ENOENT`` if
+    none). ``bufsize=0`` keeps Python from buffering the pipes, since the
+    stream does its own ``readv``/``writev`` on the descriptors.
+    """
     argv = command(ssh, endpoint)
     try:
         process = subprocess.Popen(

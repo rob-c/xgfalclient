@@ -15,7 +15,9 @@ import socket
 import subprocess
 import sys
 import traceback
-from typing import Any, Callable
+from collections.abc import Callable
+from functools import partial
+from typing import Any
 
 from xgfalclient.crypto import krb5
 
@@ -87,10 +89,10 @@ def full_round(client_backend: str, server_backend: str, **client_options: Any) 
 
 for c in BACKENDS:
     for s in BACKENDS:
-        check(f"round {c}->{s}")(lambda c=c, s=s: full_round(c, s))
+        check(f"round {c}->{s}")(partial(full_round, c, s))
 
 for b in BACKENDS:
-    check(f"delegate {b}")(lambda b=b: full_round(b, b, delegate=True))
+    check(f"delegate {b}")(partial(full_round, b, b, delegate=True))
 
 
 def _one_step(b: str) -> None:
@@ -164,11 +166,11 @@ def _wrong_key(b: str) -> str:
 
 
 for b in BACKENDS:
-    check(f"one step {b}")(lambda b=b: _one_step(b))
-    check(f"principal+keytab {b}")(lambda b=b: _principal_and_keytab(b))
-    check(f"explicit ccache {b}")(lambda b=b: _explicit_ccache(b))
-    check(f"no ticket {b}")(lambda b=b: _no_ticket(b))
-    check(f"unknown service {b}")(lambda b=b: _unknown_service(b))
+    check(f"one step {b}")(partial(_one_step, b))
+    check(f"principal+keytab {b}")(partial(_principal_and_keytab, b))
+    check(f"explicit ccache {b}")(partial(_explicit_ccache, b))
+    check(f"no ticket {b}")(partial(_no_ticket, b))
+    check(f"unknown service {b}")(partial(_unknown_service, b))
 
 
 def _make_other_keytab() -> None:
@@ -191,7 +193,7 @@ def _make_other_keytab() -> None:
 
 _make_other_keytab()
 for b in BACKENDS:
-    check(f"wrong key {b}")(lambda b=b: _wrong_key(b))
+    check(f"wrong key {b}")(partial(_wrong_key, b))
 
 
 def _kdc_down(b: str) -> str:
@@ -212,7 +214,7 @@ subprocess.run(
 subprocess.run(["pkill", "krb5kdc"], check=False)
 subprocess.run(["sh", "-c", "while pgrep krb5kdc >/dev/null; do sleep 0.1; done"], check=True)
 for b in BACKENDS:
-    check(f"kdc down {b}")(lambda b=b: _kdc_down(b))
+    check(f"kdc down {b}")(partial(_kdc_down, b))
 
 results["_backend"] = krb5.backend()
 results["_ccache"] = subprocess.run(["klist"], capture_output=True, text=True).stdout.splitlines()[

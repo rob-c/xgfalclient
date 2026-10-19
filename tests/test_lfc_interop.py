@@ -12,7 +12,9 @@ last EL7 stack, from the CentOS vault and the EPEL 7 archive: ``lfcdaemon``
 ``xgfal-lfc-client``
     EL7 gfal2, the behaviour reference;
 ``xgfal-lfc-py``
-    ``gfal-ref:latest`` for its Python 3.9, running this checkout.
+    ``gfal-ref:latest`` with AppStream Python 3.11 added (see
+    :mod:`_interop_image`), running this checkout and the host's
+    ``xrdclient``.
 
 The same driver runs every gfal2 operation the old plugin had through both
 clients, each in its own directory, and the answers must match except for
@@ -44,6 +46,8 @@ from typing import Any
 
 import pytest
 
+from _interop_image import LIBRARY_PATH, XGFAL_PYTHON, library_mounts, xgfal_image, xrdclient_src
+
 pytestmark = [
     pytest.mark.interop,
     pytest.mark.skipif(os.environ.get("XGFAL_INTEROP") != "1", reason="XGFAL_INTEROP=1 not set"),
@@ -58,6 +62,8 @@ SERVER = "xgfal-lfc-server"
 CLIENT = "xgfal-lfc-client"
 PYCLIENT = "xgfal-lfc-py"
 FQDN = f"{SERVER}.{NETWORK}"
+#: This checkout and the host's xrdclient, as mounted in the Python container.
+PYTHONPATH = f"PYTHONPATH=/x/src:/x/xrd:{LIBRARY_PATH}"
 
 #: Where gfal2 and this client differ on purpose.
 KNOWN = {
@@ -121,7 +127,7 @@ lfc-mkdir -p /grid
 lfc-chmod 777 /grid
 """
 
-#: The operations, runnable by python2 with gfal2 and python3 with xgfalclient.
+#: The operations, runnable by python2 with gfal2 and python3.11 with xgfalclient.
 DRIVER = r"""
 from __future__ import print_function
 import json, os, sys
@@ -295,7 +301,7 @@ tls.load_cert_chain(os.environ["X509_USER_PROXY"])
 out = {}
 for sessions in (False, True):
     server = client.Server(sys.argv[1], int(sys.argv[2]), lambda: [GSIMechanism(tls)],
-                           sessions=sessions)
+                           client.ServerOptions(sessions=sessions))
     conn = server.connect()
     body = client._ids().hyper(0).string("/grid").string("").bytes()
     opened = conn.call(wire.MAGIC, wire.OPENDIR, body)
@@ -348,10 +354,25 @@ def make_pki(lab: Path) -> None:
 def start(name: str, image: str, lab: Path, *extra: str) -> None:
     docker("rm", "-f", name, check=False)
     docker(
-        "run", "-d", "--name", name, "--hostname", f"{name}.{NETWORK}",
-        "--dns-search", NETWORK, "--network", NETWORK, "--network-alias", f"{name}.{NETWORK}",
-        "-v", f"{lab}:/lab", *extra, image, "sleep", "infinity",
-    )  # fmt: skip
+        "run",
+        "-d",
+        "--name",
+        name,
+        "--hostname",
+        f"{name}.{NETWORK}",
+        "--dns-search",
+        NETWORK,
+        "--network",
+        NETWORK,
+        "--network-alias",
+        f"{name}.{NETWORK}",
+        "-v",
+        f"{lab}:/lab",
+        *extra,
+        image,
+        "sleep",
+        "infinity",
+    )
 
 
 @contextmanager
@@ -367,7 +388,16 @@ def serving() -> Iterator[Path]:
     docker("network", "create", NETWORK, check=False)
     start(SERVER, IMAGE, lab, "--platform", "linux/amd64")
     start(CLIENT, IMAGE, lab, "--platform", "linux/amd64")
-    start(PYCLIENT, PYIMAGE, lab, "-v", f"{ROOT / 'src'}:/x/src:ro")
+    start(
+        PYCLIENT,
+        xgfal_image(PYIMAGE),
+        lab,
+        "-v",
+        f"{ROOT / 'src'}:/x/src:ro",
+        "-v",
+        f"{xrdclient_src()}:/x/xrd:ro",
+        *library_mounts(),
+    )
     try:
         docker("exec", SERVER, "bash", "/lab/setup.sh", timeout=300)
         yield lab
@@ -381,10 +411,13 @@ def serving() -> Iterator[Path]:
 
 def credentials() -> list[str]:
     return [
-        "-e", "X509_USER_PROXY=/lab/pki/x509up_rfc",
-        "-e", "X509_CERT_DIR=/lab/pki/certificates",
-        "-e", "LFC_CONRETRY=0",
-    ]  # fmt: skip
+        "-e",
+        "X509_USER_PROXY=/lab/pki/x509up_rfc",
+        "-e",
+        "X509_CERT_DIR=/lab/pki/certificates",
+        "-e",
+        "LFC_CONRETRY=0",
+    ]
 
 
 def run_gfal2(prefix: str, *env: str) -> list[Any]:
@@ -396,17 +429,33 @@ def run_gfal2(prefix: str, *env: str) -> list[Any]:
 
 def run_xgfal(prefix: str, *env: str) -> list[Any]:
     out = docker(
-        "exec", *credentials(), "-e", "PYTHONPATH=/x/src", *env, PYCLIENT,
-        "python3", "/lab/driver.py", "xgfal", FQDN, prefix,
-    )  # fmt: skip
+        "exec",
+        *credentials(),
+        "-e",
+        PYTHONPATH,
+        *env,
+        PYCLIENT,
+        XGFAL_PYTHON,
+        "/lab/driver.py",
+        "xgfal",
+        FQDN,
+        prefix,
+    )
     return list(json.loads(out))
 
 
 def in_process(*args: str) -> Any:
     out = docker(
-        "exec", "-e", "PYTHONPATH=/x/src", "-e", "LFC_CONRETRY=0", PYCLIENT,
-        "python3", "/lab/inprocess.py", *args,
-    )  # fmt: skip
+        "exec",
+        "-e",
+        PYTHONPATH,
+        "-e",
+        "LFC_CONRETRY=0",
+        PYCLIENT,
+        XGFAL_PYTHON,
+        "/lab/inprocess.py",
+        *args,
+    )
     return json.loads(out)
 
 
@@ -461,9 +510,9 @@ def test_wire_details_match(lab: Path) -> None:
             "exec",
             *credentials(),
             "-e",
-            "PYTHONPATH=/x/src",
+            PYTHONPATH,
             PYCLIENT,
-            "python3",
+            XGFAL_PYTHON,
             "/lab/probe.py",
             FQDN,
             "5010",

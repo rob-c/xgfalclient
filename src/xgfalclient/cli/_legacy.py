@@ -14,13 +14,18 @@ from __future__ import annotations
 
 from ._base import Command, Spec, arg, out, output, surl
 
-__all__ = ["SPECS", "REPLICAS"]
+__all__ = ["REPLICAS", "SPECS"]
 
 #: The extended attribute that holds an LFC entry's replicas.
 REPLICAS = "user.replicas"
 
 
 def _set(cmd: Command, sign: str) -> None:
+    """``setxattr(lfc, "user.replicas", "<sign><surl>")``: the LFC plugin's replica edit.
+
+    The flags argument is the value's length, as gfal2-util passes it; the
+    LFC plugin ignores it.
+    """
     output.identify(
         "register" if sign == "+" else "unregister", url=cmd.params.lfc, replica=cmd.params.surl
     )
@@ -30,14 +35,17 @@ def _set(cmd: Command, sign: str) -> None:
 
 
 def register(cmd: Command) -> None:
+    """``gfal-legacy-register LFC SURL``: add ``SURL`` as a replica of ``LFC``."""
     _set(cmd, "+")
 
 
 def unregister(cmd: Command) -> None:
+    """``gfal-legacy-unregister LFC SURL``: remove that replica."""
     _set(cmd, "-")
 
 
 def replicas(cmd: Command) -> None:
+    """``gfal-legacy-replicas LFC``: one replica URL per line."""
     output.identify("replicas", url=cmd.params.lfc)
     for replica in cmd.context.getxattr(cmd.params.lfc, REPLICAS).split("\n"):
         output.record(status="succeeded", replica=replica)

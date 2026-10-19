@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import errno
+import importlib
 import ssl
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
+from xrdsec.gsi.gss import SecurityContext
 
 import xgfalclient
 from test_dcap import GROUP, code_of, with_dcap
-from xgfalclient.crypto.gsi import SecurityContext
 from xgfalclient.errors import GError
 from xgfalclient.plugins.dcap import KdcapPlugin, register_tunnel, tunnel
 from xgfalclient.plugins.dcap.tunnel import TokenLink, Tunnel
@@ -99,8 +101,6 @@ def test_gsidcap_undecryptable_token(gctx: xgfalclient.Gfal2Context, gsi_door: D
 def test_gsidcap_without_credentials(
     ctx: xgfalclient.Gfal2Context, gsi_door: DcapServer, pki: PKI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if not hasattr(ssl, "VERIFY_ALLOW_PROXY_CERTS"):
-        pytest.skip("the 3.9 test door cannot ask for a client certificate")
     monkeypatch.setenv("X509_CERT_DIR", str(pki.ca_dir))
     with_dcap(ctx)
     # Under TLS 1.3 the door refuses the missing certificate after the client
@@ -128,9 +128,7 @@ class SplittingLink(TokenLink):
 
 
 def test_gsi_tunnel_with_fragmented_tokens(pki: PKI, grid_env: PKI) -> None:
-    client = ssl.create_default_context(cafile=str(pki.ca_file))
-    client.check_hostname = False
-    client.load_cert_chain(str(pki.proxy_path))
+    client = pki.client_context(check_hostname=False)
     server = SecurityContext(pki.server_context(), server_side=True)
     gsi = tunnel.GSITunnel(client)
     gsi.handshake(SplittingLink(server), "localhost")
@@ -206,13 +204,13 @@ def test_incomplete_kerberos_module(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_kerberos_module_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     sentinel = object()
-    monkeypatch.setattr(tunnel.importlib, "import_module", lambda name: sentinel)
+    monkeypatch.setattr(importlib, "import_module", lambda name: sentinel)
     assert tunnel.kerberos_module() is sentinel
 
     def missing(name: str) -> object:
         raise ImportError(name)
 
-    monkeypatch.setattr(tunnel.importlib, "import_module", missing)
+    monkeypatch.setattr(importlib, "import_module", missing)
     assert tunnel.kerberos_module() is None
 
 
@@ -285,7 +283,7 @@ def test_kdcap_through_krb5(
     assert KdcapPlugin.available() is None
     kdcap = ctx.add_plugin(KdcapPlugin)
     assert kdcap.stat(kdoor.url("/data/hello.txt")).st_size == 12
-    assert "hello.txt" in [name for name, _ in kdcap.opendir(kdoor.url("/data"))]
+    assert "hello.txt" in [entry[0] for entry in kdcap.opendir(kdoor.url("/data"))]
 
 
 def test_kdcap_mechanism_unavailable(ctx: xgfalclient.Gfal2Context, krb5: type[FakeKrb5]) -> None:
@@ -329,7 +327,8 @@ def test_kdcap_with_the_real_krb5_module(
     """kdcap through :mod:`xgfalclient.crypto.krb5` over the fake GSS-API library."""
     import sys
 
-    from krb5_fakes import fake_gssapi_module
+    from xrdsec.testing.krb5 import fake_gssapi_module
+
     from xgfalclient.crypto import krb5
     from xgfalclient.testing.dcap import ServerKerberosTunnel
 
@@ -359,7 +358,7 @@ def test_kerberos_tunnel_edges() -> None:
 
     krb = tunnel.KerberosTunnel(Broken)
     with pytest.raises(GError) as info:
-        krb.handshake(SplittingLink(None), "door")  # type: ignore[arg-type]
+        krb.handshake(SplittingLink(cast(SecurityContext, None)), "door")
     assert info.value.code == errno.EACCES
     krb.close()  # nothing to release
 

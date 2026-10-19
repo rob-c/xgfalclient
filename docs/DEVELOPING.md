@@ -5,46 +5,87 @@
 A Python 3, drop-in replacement for the `gfal2` Python bindings
 (`python3-gfal2`) and, in `xgfalclient.cli`, for the `gfal-*` commands of
 gfal2-util. `import xgfalclient as gfal2` must run existing gfal2 code
-unchanged. Required general-purpose dependencies are `botocore`,
-`PyJWT[crypto]`, `urllib3`, `asn1crypto` and `cryptography`. XML declaration
-checks and binary record readers are local standard-library helpers.
-Native `gssapi` and `krb5` bindings are in the optional `krb5`
-extra; `xrdclient==0.3.0` is required for shared security/parsing and `root://`.
+unchanged. Required general-purpose dependencies are `bcrypt` and
+`cryptography`; list a package only if this project imports it itself
+(`asn1crypto` arrives through `xrdsec`, `botocore` through `xrdhttp`). The
+shared libraries `xrdcore`, `xrdsec` and `xrdhttp` (`>=0.4.0,<0.5`) carry the
+XML declaration checks, the JWT claim decoding, the grid security code and the
+HTTP protocol pieces; binary record readers are local standard-library
+helpers. The native `gssapi` binding is in the optional `krb5` extra (as
+`xrdsec[krb5]`); `xrdclient==0.4.0` is required for `root://`.
 Do not add a compiler-dependent package to the default install. CI's
 wheel-only resolution and clean-install jobs cover supported platform families.
-Python 3.9 remains the declared compatibility floor, but its clean-install
-dependency conflict is a release blocker; see [Platforms](platforms.md).
-Current pyhanko-certvalidator requires Python 3.10 and is deferred rather than
-selecting an older validator.
+Python 3.11 is the floor (AppStream `python3.11`/`python3.12` on EL8/EL9);
+see [Platforms](platforms.md). pyhanko-certvalidator remains deferred: RFC 3820
+proxy and VOMS policy are not WebPKI path validation.
+
+[Architecture](architecture.md) is the module map: how a call flows from
+`Gfal2Context` through the plugin registry to a plugin, where each protocol
+and test server lives, and which library or xrdclient modules each part relies on.
 
 ## Shared core ownership
 
-The dependency is one-way: `xgfalclient → xrdclient → general-purpose libraries`.
-Keep xrdclient independently installable: it must never import or depend on
-xgfalclient. The exact release pin prevents mixing incompatible shared APIs.
-Install both sibling checkouts when changing the common core:
+The dependency is one-way:
+`xgfalclient → xrdclient → xrdsec, xrdhttp → xrdcore → general-purpose libraries`,
+and xgfalclient imports the three libraries directly. None of them may import
+or depend on xgfalclient (xrdsec and xrdhttp do not import each other either).
+The exact `xrdclient` pin and the `<0.5` library ranges prevent mixing
+incompatible shared APIs. Install the sibling checkouts, in dependency order,
+when changing shared code:
 
 ```console
-$ python -m pip install -e ../xrdclient -e '.[dev]'
+$ python -m pip install -e ../xrdcore -e ../xrdsec -e ../xrdhttp -e ../xrdclient -e '.[dev]'
 ```
 
-| Shared implementation in xrdclient | xgfalclient compatibility surface |
+| Shared implementation | xgfalclient surface over it |
 | --- | --- |
-| `crypto.voms`: claims, trust policy, diagnostics | `crypto.voms` |
-| `crypto.der`: bounded ASN.1 helpers and writers | `crypto.der` |
-| `crypto.rsa`: keys, signatures, key import/export | `crypto.rsa` |
-| `crypto.aes`: block/CBC/CTR adapters | `crypto.aes` |
-| `crypto.ed25519`, `crypto.p256` | same names under `crypto` |
-| `crypto.x509`: library-backed certificate inspection, names and legacy inspection fallback | `crypto.x509` certificate/credential models and proxy builders |
-| `_xml`: declaration-rejecting XML loading | `_xml` |
-| `http._engine`: bounded redirects, replay policy and failure cleanup | HTTP request/start adapters |
-| `http._connection`, `http.expect`: connections and interim responses | HTTP compatibility path and exchanges |
-| `copy._pipeline`: bounded read-ahead and complete chunk writes | streamed copies and XRootD upload read-ahead |
-| `session.bulk`: framing, acknowledgements, deferred replies and stream cleanup | upload progress, numeric errors and WAIT-range replay after settling |
-| `s3._codec`, `s3.sigv4`: botocore models, multipart XML and signing | addressing, credentials, metadata and transport policies |
+| `xrdsec.voms`: claims, trust policy, diagnostics | `crypto.voms` (alias) |
+| `xrdsec.der`: bounded ASN.1 helpers and writers | `crypto.der` (alias) |
+| `xrdsec.rsa`: keys, signatures, key import/export | `crypto.rsa` (alias) |
+| `xrdsec.aes`: block/CBC/CTR adapters | `crypto.aes` (alias) |
+| `xrdsec.ed25519`, `xrdsec.p256` | same names under `crypto` (aliases only: SSH keys use `cryptography` directly) |
+| `xrdsec.x509`: certificate inspection, names, the legacy inspection fallback, `certificates_in`, `read_credential_files`, `credential_key`, `proxy_policy`, `legacy_proxy_kind`, `signed_by`, `pem_encode`; the building blocks `extension`, `key_usage`, `public_key_info`, `signature_algorithm` (moved there from here) | `crypto.x509` `Certificate`/`Credential`: gfal2's view (extension values by OID, Globus' strict proxy rules, first non-proxy identity); EC keys load; `proxy_cert_info` |
+| `xrdsec.delegation.issue_certificate`: `CertificateBuilder`-based signing (RSA and EC) | `crypto.x509.build_certificate` (the same function) |
+| `xrdsec.delegation.parse_proxy_request`, `make_proxy_request`, `sign_globus_request` (`xrdsec.proxies.issue_proxy(profile="globus")`: `globus_gsi_proxy_sign_req`, moved there from `crypto.proxy`) | `crypto.proxy.parse_request`, `sign_request` (`DERError` for every refusal), `make_request` (the same function), `delegation_payload` |
+| `xrdsec.gsi.gss`: Globus GSI GSS (TLS in tokens, the turn, delegation, `host/fqdn`); `xrdsec.gsi.httpg`: SRM's httpg connection; `xrdsec.testing.gsi`: the acceptor side | `crypto.gsi` (alias); the GridFTP, LFC, dcap and SRM plugins and their fakes |
+| `xrdsec.discovery.GFAL2`/`GFAL2_SEED`, `xrdsec.credentials` (`find_bearer_token(skip_unreadable=True)`, private-file checks), `xrdsec.tokens` (`token_claims`, `check_token`), `xrdsec.tls.client_context(x509_strict=False)` | `creds`: the credential store, option names and precedence, gfal2's debug lines, `GError` codes and messages |
+| `xrdsec.testing.pki.BasePKI` | `testing.pki.PKI` (xgfal's types, `/DC=org/DC=xgfal` names) |
+| `xrdhttp.testing.StorageServer` (the fake storage element, davix style) | `testing.webdav.WebDAVServer`: the directory root, `url()`/`local()`, gridsite delegation |
+| `xrdcore.checksum`, `xrdcore.crc32c`: digests and CRC-32C with its `google-crc32c` probe | `checksum`: gfal2's algorithm set, name aliases, ADLER32 padding and comparison |
+| `xrdcore.safexml`: declaration-rejecting XML loading | `_xml` (alias) |
+| `xrdcore.report`: the `--json`/`--xml` report | `cli._base`'s `output` |
+| `xrdcore.pipeline`: bounded read-ahead and complete chunk writes | streamed copies and XRootD upload read-ahead |
+| `xrdcore.fanout.run_all`: thread fan-out, first failure raised as itself, the rest stopped | `plugins.http._ranged`: the segments, buffers and resume of a parallel ranged download |
+| `xrdcore.cli`: `silence_stdout`, the shared `ExitCode` 0/1 | `cli._base`: gfal2-util's errno exit statuses (`EINTR`, `ETIMEDOUT`, `GError` codes) |
+| `xrdhttp.engine`: bounded redirects, replay policy and failure cleanup | HTTP request/start adapters |
+| `xrdhttp.connection`, `xrdhttp.expect`: connections and interim responses | `plugins.http._connection` (alias) and exchanges |
+| `xrdhttp.wire`: direct body reads off the socket, `sendfile`/large-TLS-write file bodies, `IdlePool` | `plugins.http._client` responses, exchanges and connection pools |
+| `xrdhttp.redirects`: `davix_carries_credentials` (moved there from `_target._may_forward`), `resolve_location` (gfal scheme kept, as `_target._resolve` did) | `plugins.http._client`'s redirect handling |
+| `xrdhttp.webdav`: multistatus resources, hrefs, dates, `Digest`/`Repr-Digest` values | `plugins.http._dav`: davix's `stat`, `EIO` parse errors, nested responses |
+| `xrdhttp.metalink.parse_metalink` with a `MetalinkPolicy` | `plugins.http._metalink`: davix's policy (every `<url>`, HTTP replicas only) and `Link` discovery |
+| `xrdhttp.tape`: discovery document, API version choice, json-c text, path matching | `plugins.http._tape`: gfal2's requests, messages and errno |
+| `xrdhttp.tpc`: `follow_markers`, `token_minutes`, `add_token`, `add_streams`, the activity sets | `plugins.http._tpc`, `_token`: davix's headers, credential choice, outcome errors, progress and cancel checks |
+| `xrdhttp.s3.codec`, `xrdhttp.s3.sigv4` (`sign`, `presign`): botocore models, multipart XML and signing | `plugins.http._s3`: addressing, credentials, metadata and transport policies |
+| `xrdclient.session.bulk` (via `xrdclient.client.bulk`): framing, acknowledgements, deferred replies and stream cleanup | upload progress, numeric errors and WAIT-range replay after settling |
 
-Compatibility modules alias the canonical modules, preserving old imports,
-exception identities and test hooks without duplicated implementations.
+Compatibility modules alias the canonical modules (`sys.modules`), preserving
+old imports, exception identities and test hooks without duplicated
+implementations; xgfal's own code imports the libraries directly. Where
+gfal2/davix and XrdCl genuinely read the same bytes differently, the shared
+code takes a small policy rather than being forked: `MetalinkPolicy` (one
+`<file>` and any absolute URL, or every `<url>` and HTTP only),
+`listed_endpoints(complete=...)` (drop partial tape endpoints, or read them as
+empty), the marker reader's per-block callback (what to report, when to
+check for a cancel), the `discovery.Search` values (gfal2's and XrdCl's search
+orders as data), `skip_unreadable=` (a token file that cannot be read is "no
+token" for gfal2), `x509_strict=` (davix never applies Python's RFC 5280
+strict checks), `check_hostname=False` (GSI's own DN check), the `globus`
+proxy profile and `davix_carries_credentials` beside the strict same-origin
+rule. The HTTP clients themselves stay two: davix's path quoting, numeric
+errors and the plugin's thread-safe pool are not XrdCl's, so only the pieces
+below `http.client` and the protocol rules are shared. Library exceptions
+(`xrdcore.errors`) are turned into `GError` where xgfalclient calls the
+library.
 VOMS accepts a read-only certificate view from either client; their distinct
 credential models and proxy rules remain intact. GFAL-only SSH, GridFTP, SRM,
 LFC and plugin/error translation stay in xgfalclient. XRootD framing, sessions
@@ -63,18 +104,23 @@ serializer over the existing HTTP transports, not an SDK client's credential
 discovery, retry or TLS policy. Declaration checks precede model decoding.
 Copy/complete responses are checked for embedded errors even when HTTP says 200.
 
-Measure combined `src/` and test LoC separately when changing these boundaries,
-including new engines and adapters. Preserve fault scenarios and independent
-protocol vectors rather than deleting tests to improve the count. Shared HTTP
-and pipeline modules retain explicit coverage gates; run both suites and GFAL's
-condition-coverage pass. Verify read/write overlap, bounded buffers, worker
-shutdown, partial writes and representative throughput before acceptance.
+Tests live with the code: the libraries' suites (100 % line and branch each)
+are the canonical tests of shared code, and a case that only re-tested moved
+code belongs there, not here. xgfalclient's suite covers the old import paths
+(`tests/test_shared_core.py`), credential interoperability, the protocol
+adapters and end-user diagnostics, and its condition-coverage pass also holds
+the library modules in `tests/condcov.py`'s `SHARED_MODULES` to the
+both-ways rule (that list's comment says why those;
+`tests/test_library_decisions.py` takes their few non-gfal2 decisions).
+Measure combined `src/` and test LoC separately when changing these
+boundaries. Verify read/write overlap, bounded buffers, worker shutdown,
+partial writes and representative throughput before acceptance.
 
-Run both clients' tests when changing shared code. xrdclient tests cover the
-common core without installing xgfalclient; xgfalclient tests cover the old import
-paths, credential interoperability, protocol adapters and end-user diagnostics.
-CI tests the sibling checkout as well as installing both built wheels. Release
-xrdclient first, then update the required pin before releasing xgfalclient.
+Run every affected suite when changing shared code: the library's, then
+xrdclient's, xgfalclient's and xrdarc's. CI checks out the coordinated
+candidates (xrd-devtools' candidates action, with `packages: xrdcore xrdsec
+xrdhttp xrdclient`) as well as installing the built wheels. Release the libraries, then xrdclient,
+then update the pins before releasing xgfalclient.
 
 ## Hard rules
 
@@ -90,22 +136,35 @@ an untrusted proxy, or making private keys readable by everyone.
 Add Linux/macOS regression cases for the reason, path, code and suggested fix.
 
 1. **Reuse maintained libraries.** Use the declared, maintained
-   general-purpose libraries for AWS signing, JWTs, GSS-API, HTTP pooling/TLS,
+   general-purpose libraries for AWS signing, GSS-API, HTTP pooling/TLS,
    ASN.1 and cryptographic primitives. Keep protocol and policy adapters small;
    do not reintroduce cipher/curve arithmetic or ctypes ABI bindings.
-   `xrdclient` owns the common security/parsing core; `paramiko` remains
-   an optional SSH transport. JWT inspection is unverified diagnostics,
-   never a trust decision. Do not substitute a WebPKI verifier for RFC 3820
+   xrdcore, xrdsec and xrdhttp own the common core; `paramiko` (the
+   `sftp` extra, 3.4+ for strict KEX) is the preferred in-process SSH
+   transport and `bcrypt` derives OpenSSH key-file passphrases; the built-in
+   SSH-2 client in `plugins/sftp/ssh.py` is the last-resort tier (a base
+   install's password logins) and the test server's transport - keep it
+   small, do not grow it. JWT inspection (`creds.token_claims`, over
+   `xrdsec.tokens`) is unverified diagnostics, never a trust decision. Do not substitute a WebPKI verifier for RFC 3820
    proxy or VOMS policy without explicitly testing that policy.
-2. **Python 3.9 compatible.** `from __future__ import annotations` in every
-   module; no `match`; no `X | Y` outside annotations; `dataclass(**SLOTS)`
-   from `_compat`, never `slots=True`; no `zip(strict=)`. Version-dependent
-   code goes in `_compat.py` only.
+   Ruff's banned-API list (`TID251`) enforces the split: `http.client`,
+   hand-built TLS contexts, `gssapi`/`krb5`, `ThreadPoolExecutor`, the XML
+   parsers and `botocore` are refused in `src` and `tests` alike, each
+   message naming the library API to use (the table and the reasons are
+   under "Banned APIs" in the repository's `CONTRIBUTING.md`).
+2. **Python 3.11 compatible.** `from __future__ import annotations` in every
+   module; Python 3.11 syntax and standard library are available (`X | Y`
+   unions, `match`, `slots=True`, `Self`, `tomllib`, `datetime.UTC`), but
+   nothing newer. `zip()` names `strict=` explicitly. Interpreter-dependent
+   code belongs in the library that owns the feature (the TLS peer chain,
+   public from 3.13, is `xrdsec.gsi.gss.peer_chain_der`).
 3. **100% line *and* branch coverage** of everything under
-   `src/xgfalclient`, enforced by `fail_under = 100`. Avoid
-   `# pragma: no cover`; if a branch cannot be reached by a test, the branch
-   is probably wrong. The only accepted pragma is for code that genuinely
-   cannot run on the test platform, with a comment saying why.
+   `src/xgfalclient`, enforced by `fail_under = 100`, with no `omit` and no
+   `# pragma: no cover`/`no branch`: if a branch cannot be reached by a
+   test, the branch is wrong. The only exclusions are the shared
+   `exclude_also` list in `pyproject.toml` (`if TYPE_CHECKING:`,
+   `@overload`, `raise NotImplementedError`, `...` bodies and
+   `if __name__ == "__main__":`).
 
    Branch coverage sees a line as one decision, so on top of it every
    in-line decision must go both ways too: each `and`/`or` operand that
@@ -117,13 +176,15 @@ Add Linux/macOS regression cases for the reason, path, code and suggested fix.
    version, the platform) belongs in a function that takes it as a
    parameter.
 4. **Tests are hermetic.** No network beyond loopback, no real grid
-   services, no ambient credentials (`tests/conftest.py` enforces this).
+   services, no ambient credentials (`tests/conftest.py` enforces this
+   through xrdsec's `xrdsec.testing.fixtures` plugin, plus its own
+   `pytest_xrdsec_hermetic` hook for gfal2's configuration).
    Protocol plugins are tested against in-process servers that live in
    `xgfalclient.testing` (and are therefore covered too). Tests that need a
    real server (docker) are marked `@pytest.mark.interop` and skipped unless
    `XGFAL_INTEROP=1`; they do not count toward coverage.
 5. **Errors are `GError(message, errno_code)`**, never a bare `OSError`,
-   `ssl.SSLError`, `socket.timeout` or `http.client` exception escaping a
+   `ssl.SSLError`, `TimeoutError` or `http.client` exception escaping a
    plugin. Map faithfully: 404 -> `ENOENT`, 403/401 -> `EACCES`, timeouts ->
    `ETIMEDOUT`, refused connection -> `ECONNREFUSED`, and so on
    (`errors.HTTP_ERRNO` for HTTP).
@@ -134,15 +195,30 @@ Add Linux/macOS regression cases for the reason, path, code and suggested fix.
    and never `bytes` concatenation in a loop. Parallelism where the protocol
    has it (HTTP ranges, GridFTP MODE E). Target: at least gfal2's
    throughput through its Python bindings.
-8. **No quality regressions.** `ruff check` (including the enabled
-   high-confidence security rules), `ruff format`, and `mypy --strict` must
-   all be clean. New and refactored functions have cognitive complexity at
-   most 15. The checked-in Complexipy snapshot freezes older hotspots until
-   they are simplified; never raise a value in it. Docstrings explain *why*;
-   match the density of the existing modules.
+8. **No grandfathered code.** Every check holds for all code, old and new,
+   with nothing that lets existing code skip it:
+   - `ruff check` over `src`, `tests` and `benchmarks` with the shared rule
+     set (`E F W I UP B C4 SIM RUF` and the high-confidence `S` rules),
+     `ignore = []` and no `per-file-ignores`; `ruff format --check` clean.
+   - `mypy` (`strict = true`) over `src`, `tests` and `benchmarks`, tests
+     included with no relaxation.
+   - Complexipy: every function at most 15, no snapshot file, no ignore
+     markers. Split a hotspot into well-named helpers.
+   - pytest runs with `filterwarnings = ["error"]`: a warning (an unclosed
+     socket's `ResourceWarning` included) fails the test that caused it.
+     Fix the cause; do not filter it.
+   - No suppression comments (`# noqa`, `# type: ignore`, `# pragma`,
+     `# nosec`, `# fmt: off`). The few irreducible ones carry a specific code
+     and a reason on the same or the preceding line.
+   - Skips are environmental only (platform, optional dependency or tool
+     absent, the interop marker) and say so in their reason.
+   - Deprecated names exist only where they mirror gfal2, python3-gfal2 or
+     gfal2-util, and their docstrings say which.
+
+   Docstrings explain *why*; match the density of the existing modules.
 9. **Distributions are tested artifacts.** Both wheels and source archives
    must pass `twine check --strict`; typed packages carry their `py.typed`
-   marker. Python 3.9 through 3.14 are exercised in CI.
+   marker. Python 3.11 through 3.14 are exercised in CI.
 
 ## Layout
 
@@ -156,7 +232,7 @@ Add Linux/macOS regression cases for the reason, path, code and suggested fix.
 | `creds.py` | credential store, X.509/token discovery, cached TLS contexts |
 | `errors.py` | `GError` and errno helpers |
 | `events.py`, `enums.py`, `types.py`, `url.py`, `checksum.py` | small shared pieces |
-| `crypto/` | DER, RSA, X.509, proxy signing (`proxy.py`), GSI GSSAPI (`gsi.py`) |
+| `crypto/` | DER, RSA, X.509, gridsite proxy signing (`proxy.py`); `gsi.py` is an alias of `xrdsec.gsi.gss` |
 | `testing/` | in-process servers and `pki.py` (throwaway CA/host/user/proxies) |
 | `cli/` | the `gfal-*` commands |
 
@@ -197,8 +273,9 @@ Add Linux/macOS regression cases for the reason, path, code and suggested fix.
   on `close()`.
 * Credentials: `self.context.x509(url)`, `self.context.bearer_token(url)`,
   `self.context.ssl_context(url, group=self.option_group)`. For GSI, build a
-  context with `check_hostname=False` and use `crypto.gsi.SecurityContext`
-  (it does GSI's own `host/fqdn` check and delegation).
+  context with `check_hostname=False` and use `xrdsec.gsi.gss.SecurityContext`
+  (it does GSI's own `host/fqdn` check and delegation); a test server's side
+  is `xrdsec.testing.gsi`.
 * Options: `self.options.string/integer/boolean/string_list(group, key,
   default)` never raise; `self.option_timeout()` is the plugin's operation
   timeout with the core fallback.
@@ -214,6 +291,21 @@ behaviour, error wording or wire format; set
 `ctx.set_opt_integer("HTTP PLUGIN", "LOG_LEVEL", 4)` and attach a
 `logging` handler to see davix's requests.
 
+That image's `python3` is 3.9, the only Python its gfal2 bindings are built
+for, and this package needs 3.11. The interop harnesses (`XGFAL_INTEROP=1`)
+therefore run gfal2's side on the system `python3` and this checkout's side
+on AppStream `python3.11`, with `src`, the host's `xrdclient` and its
+`xrdcore`, `xrdsec` and `xrdhttp` bind-mounted (the libraries under `/libs`,
+on the container's `PYTHONPATH`).
+`tests/_interop_image.py` derives the image they need from `gfal-ref:latest`
+(and from `gfal-sftp-ref:latest` for sftp) on first use, tagged
+`gfal-ref-py311:<recipe hash>`; that first build needs network access for
+`dnf` and `pip`, and later runs reuse docker's cache. Where it cannot be
+built, provide an image with the same contents: `python3.11` and
+`python3.11-pip` from AppStream, then
+`python3.11 -m pip install "cryptography>=45" "botocore>=1.35" "bcrypt>=4" "asn1crypto>=1.5.1"`
+(plus `"paramiko>=3.4"` for the sftp harness).
+
 When gfal2 does something harmful - it deletes the source of a copy onto
 itself when `overwrite` is set - we deliberately differ and say so in a
 comment.
@@ -227,9 +319,24 @@ $ .venv/bin/ruff check src tests benchmarks
 $ .venv/bin/ruff format --check src tests benchmarks
 $ .venv/bin/mypy
 $ .venv/bin/complexipy --quiet
-$ git diff --exit-code -- complexipy-snapshot.json
+$ .venv/bin/xrddevtools conformance --repo .
 $ .venv/bin/python -m build && .venv/bin/twine check --strict dist/*
 ```
+
+`tests/test_scorecard.py` (the take-over scorecard: every one of twelve
+measurements better than the median of 39 widely used libraries) and
+`xrddevtools` come from [xrd-devtools](https://github.com/rob-c/xrd-devtools),
+the repository for what serves the whole chain: the scorecard, the
+configuration-conformance and duplicate gates, the release pre-flight and
+the platform matrix. It is not on PyPI and cannot be a dependency (PyPI
+refuses direct-URL requirements), so it is used from a checkout: pytest's
+`pythonpath` finds a sibling `../xrd-devtools` or CI's
+`.dependencies/xrd-devtools`; elsewhere `pip install -e` it or put its `src`
+on `PYTHONPATH`. Without one the scorecard test skips, saying so (as it does
+without radon and complexipy). CI is xrd-devtools' reusable workflows
+(`static.yml`, `tests.yml`, `chain.yml`, `platforms.yml`), which load the
+plugin with `-p` and set `XRD_DEVTOOLS_REQUIRED=1` so the gate cannot skip
+there - and which need `rob-c/xrd-devtools` to exist.
 
 The external BRIX network-fault integration is opt-in. Point the test at a
 built proxy; it then exercises streamed reads, positioned reads, WebDAV
@@ -255,21 +362,22 @@ $ BRIX_FAULT_FS=/path/to/brix-fault-fs \
     .venv/bin/pytest tests/test_brix_fault_fs.py
 ```
 
+The scenarios are xrdclient's shared local-copy conformance suite
+(`xrdclient.testing.brix.LocalCopySuite`), run here through a
+`Gfal2Context.filecopy` adapter; `tests/test_brix_fault_fs.py` adds only
+gfal2's own errno and wording.
+
 Both tools are built by the adjacent `brix-cache/client` project. The suites
 are skipped when their environment variable is unset, so normal development
 does not require FUSE.
 
-Complexipy allows a function already recorded in `complexipy-snapshot.json`
-to stay at its current complexity, but rejects a new hotspot or any increase.
-When a function is simplified, the tool lowers the snapshot automatically;
-commit that improvement. A snapshot change that raises a value is a failed
-review, not a way to make CI green.
-
 Before publishing a performance-sensitive change, run the paired benchmark
-beside the target service with native `python3-gfal2` installed:
+beside the target service with native `python3-gfal2` installed. gfal2's
+runs use `--gfal2-python` (by default the benchmark's own interpreter), so a
+3.9-only `python3-gfal2` can be measured against xgfalclient on 3.11:
 
 ```console
-$ .venv/bin/python benchmarks/bench_vs_gfal2.py \
+$ .venv/bin/python benchmarks/bench_vs_gfal2.py --gfal2-python /usr/bin/python3 \
     --base davs://server:8443/data/bench --repeat 9 --gate --min-ratio 1.10
 ```
 

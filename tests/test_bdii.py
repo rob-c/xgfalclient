@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """BDII endpoint discovery: the LDAP sliver, the FTS cache file, and the SRM plugin's use.
 
 Everything runs against :class:`xgfalclient.testing.ldap.BDIIServer` or a
@@ -13,14 +12,15 @@ import socket
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 import xgfalclient
-from test_srm import root, srm  # noqa: F401 - fixtures
+from test_srm import root as root
+from test_srm import srm as srm
 from xgfalclient.errors import ECOMM, GError
 from xgfalclient.plugins.srm import bdii
-from xgfalclient.plugins.srm import transport as srm_transport
 from xgfalclient.plugins.srm.bdii import (
     Endpoint,
     LDAPClient,
@@ -30,6 +30,7 @@ from xgfalclient.plugins.srm.bdii import (
     parse_filter,
     parse_servers,
 )
+from xgfalclient.testing import ldap
 from xgfalclient.testing.ldap import BDIIServer
 from xgfalclient.testing.srm import SRMServer
 
@@ -126,7 +127,7 @@ def test_filters() -> None:
     )
     for text in ("(!(a=b))", "(a=*)", "(a=x\\2ay)", "(a=b*c*d)", "(&(a=1)(|(b=2)(c=3)))"):
         found = parse_filter(text)
-        assert bdii.decode_filter(bdii.decode(bdii.encode_filter(found))) == found
+        assert ldap.decode_filter(bdii.decode(bdii.encode_filter(found))) == found
     assert parse_filter("(a=x\\2ay)") == ("=", "a", "x*y")
     assert parse_filter("(a=x\\zz)") == ("=", "a", "x\\zz")  # not an escape: as it is
     assert parse_filter("(a=x\\a)") == ("=", "a", "x\\a")  # too short to be one
@@ -141,12 +142,12 @@ def test_bad_filters(text: str) -> None:
 
 def test_unknown_filter_choice() -> None:
     with pytest.raises(bdii.BERError):
-        bdii.decode_filter(bdii.decode(bdii.octets("x", 0x85)))
+        ldap.decode_filter(bdii.decode(bdii.octets("x", 0x85)))
 
 
 def test_filter_matching() -> None:
     entry = {"GlueServiceType": ["SRM"], "GlueSEUniqueID": ["se.example.org"], "x": []}
-    match = bdii.match_filter
+    match = ldap.match_filter
     assert match(parse_filter("(glueservicetype=srm)"), entry)
     assert match(parse_filter("(GlueSEUniqueID=se*org)"), entry)
     assert match(parse_filter("(GlueSEUniqueID=*xam*le*)"), entry)
@@ -284,8 +285,8 @@ def test_send_failures(server: BDIIServer, monkeypatch: pytest.MonkeyPatch) -> N
             pass
 
     real = client.sock
-    for error, code in ((socket.timeout(), bdii.TIMEOUT), (OSError("reset"), bdii.SERVER_DOWN)):
-        client.sock = Broken(error)  # type: ignore[assignment]
+    for error, code in ((TimeoutError(), bdii.TIMEOUT), (OSError("reset"), bdii.SERVER_DOWN)):
+        client.sock = cast(socket.socket, Broken(error))
         with pytest.raises(LDAPError) as caught:
             client.bind()
         assert caught.value.code == code
@@ -297,12 +298,12 @@ def test_send_failures(server: BDIIServer, monkeypatch: pytest.MonkeyPatch) -> N
         def recv(self, size: int) -> bytes:
             raise self.error
 
-    for error, code in ((socket.timeout(), bdii.TIMEOUT), (OSError("reset"), bdii.SERVER_DOWN)):
-        client.sock = Deaf(error)  # type: ignore[assignment]
+    for error, code in ((TimeoutError(), bdii.TIMEOUT), (OSError("reset"), bdii.SERVER_DOWN)):
+        client.sock = cast(socket.socket, Deaf(error))
         with pytest.raises(LDAPError) as caught:
             client.bind()
         assert caught.value.code == code
-    client.sock = Broken(OSError("reset"))  # type: ignore[assignment]
+    client.sock = cast(socket.socket, Broken(OSError("reset")))
     client.close()  # the unbind fails too, quietly
     real.close()
 
@@ -535,7 +536,7 @@ def test_fallback_to_the_default_path(
         attempts.append(address)
         raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
 
-    monkeypatch.setattr(srm_transport.socket, "create_connection", connect)
+    monkeypatch.setattr(socket, "create_connection", connect)
     with pytest.raises(GError) as caught:
         bctx.stat("srm://127.0.0.1/x")
     assert attempts[-1] == ("127.0.0.1", 80)  # after the BDII's own attempt

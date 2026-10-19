@@ -1,4 +1,3 @@
-# ruff: noqa: F811 - pytest fixtures are imported by name, then requested by name
 """OpenStack Swift (``swift://``) and CS3/Reva (``cs3://``) through the http plugin."""
 
 from __future__ import annotations
@@ -11,11 +10,16 @@ from pathlib import Path
 import pytest
 
 import xgfalclient
-from test_http_helpers import Events, dav, dav2, hctx, make_server, write  # noqa: F401
+from test_http_helpers import dav as dav
+from test_http_helpers import dav2 as dav2
+from test_http_helpers import hctx as hctx
+from test_http_helpers import make_server, write
 from xgfalclient import GError
 from xgfalclient.plugins.http import _swift
 from xgfalclient.plugins.http._client import Target
+from xgfalclient.plugins.http.plugin import HTTPPlugin
 from xgfalclient.testing.webdav import Swift, WebDAVServer
+from xgfalclient.types import Stat
 from xgfalclient.url import parse
 
 FILE = _stat.S_IFREG | 0o755
@@ -37,8 +41,13 @@ def url(server: WebDAVServer, path: str) -> str:
     return server.url(path, scheme="swift")
 
 
-def _entries(context: xgfalclient.Gfal2Context, where: str) -> list[tuple[str, object]]:
-    return list(context.plugin(where, "opendir").opendir(where))
+def _entries(context: xgfalclient.Gfal2Context, where: str) -> list[tuple[str, Stat]]:
+    """The plugin's listing of ``where``: each name and its (always present) stat."""
+    found = []
+    for name, info, *_ in context.plugin(where, "opendir").opendir(where):
+        assert info is not None
+        found.append((name, info))
+    return found
 
 
 def test_stat(hctx: xgfalclient.Gfal2Context, swift: WebDAVServer) -> None:
@@ -46,13 +55,13 @@ def test_stat(hctx: xgfalclient.Gfal2Context, swift: WebDAVServer) -> None:
     info = hctx.stat(url(swift, "/cont/dir/f"))
     assert (info.st_mode, info.st_size) == (FILE, 5) and info.st_mtime > 0
     head = swift.requests[-1]
-    assert (head.method, head.path) == ("HEAD", "/v1/AUTH_proj/cont/dir/f")
+    assert (head.method, head.target) == ("HEAD", "/v1/AUTH_proj/cont/dir/f")
     assert head.header("X-Auth-Token") == "TOK"
     assert hctx.stat(url(swift, "/cont")).st_mode == DIR  # a container answers 204
     # Not an object: a directory if anything is listed under it.
     assert hctx.stat(url(swift, "/cont/dir")).st_mode == DIR
     listing = swift.requests[-1]
-    assert listing.path == "/v1/AUTH_proj/cont/?prefix=dir%2F&delimiter=%2F"
+    assert listing.target == "/v1/AUTH_proj/cont/?prefix=dir%2F&delimiter=%2F"
     assert listing.header("Accept") == "application/xml"
     with pytest.raises(GError) as caught:
         hctx.stat(url(swift, "/cont/nope"))
@@ -108,13 +117,13 @@ def test_listing(hctx: xgfalclient.Gfal2Context, swift: WebDAVServer) -> None:
 def test_namespace(hctx: xgfalclient.Gfal2Context, swift: WebDAVServer) -> None:
     hctx.mkdir(url(swift, "/cont/newdir"), 0o755)
     put = swift.requests[-1]
-    assert (put.method, put.path) == ("PUT", "/v1/AUTH_proj/cont/newdir/")
+    assert (put.method, put.target) == ("PUT", "/v1/AUTH_proj/cont/newdir/")
     assert hctx.stat(url(swift, "/cont/newdir")).st_mode == DIR
     assert hctx.stat(url(swift, "/cont/newdir/")).st_mode == DIR  # the marker, 0 bytes
     hctx.mkdir(url(swift, "/cont/slash/"), 0o755)
-    assert swift.requests[-1].path == "/v1/AUTH_proj/cont/slash/"
+    assert swift.requests[-1].target == "/v1/AUTH_proj/cont/slash/"
     hctx.mkdir(f"swift://127.0.0.1:{swift.port}", 0o755)
-    assert swift.requests[-1].path == "/v1/AUTH_proj/"
+    assert swift.requests[-1].target == "/v1/AUTH_proj/"
     hctx.mkdir_rec(url(swift, "/cont/x/y"), 0o755)
     assert swift.local("/cont/x/y").is_dir()
     hctx.rmdir(url(swift, "/cont/x/y"))
@@ -123,7 +132,7 @@ def test_namespace(hctx: xgfalclient.Gfal2Context, swift: WebDAVServer) -> None:
     hctx.rename(url(swift, "/cont/f"), url(swift, "/cont/g"))
     copy, delete = swift.requests[-2:]
     assert (copy.method, copy.header("X-Copy-From")) == ("PUT", "/cont/f")
-    assert (delete.method, delete.path) == ("DELETE", "/v1/AUTH_proj/cont/f")
+    assert (delete.method, delete.target) == ("DELETE", "/v1/AUTH_proj/cont/f")
     assert swift.local("/cont/g").read_bytes() == b"data"
     with pytest.raises(GError) as caught:
         hctx.rename(url(swift, "/cont/f"), url(swift, "/cont/h"))
@@ -142,6 +151,7 @@ def test_namespace(hctx: xgfalclient.Gfal2Context, swift: WebDAVServer) -> None:
         hctx.stat(url(swift, "/cont/nodir/"))
     assert caught.value.code == errno.ENOENT
     http = hctx.plugin(url(swift, "/"), "stat")
+    assert isinstance(http, HTTPPlugin)
     write(swift, "/cont/full/f", b"x")
     for method, path, status in (
         ("DELETE", "/cont/g", 404),
@@ -193,7 +203,7 @@ def test_credentials(hctx: xgfalclient.Gfal2Context, swift: WebDAVServer) -> Non
     hctx.remove_opt("SWIFT:127.0.0.1", "OS_TOKEN")
     assert hctx.stat(url(swift, "/cont/f")).st_size == 1
     request = swift.requests[-1]
-    assert (request.path, request.header("X-Auth-Token")) == ("/cont/f", None)
+    assert (request.target, request.header("X-Auth-Token")) == ("/cont/f", None)
     with pytest.raises(GError):
         hctx.stat(url(swift, "/v1/elsewhere/f"))
 

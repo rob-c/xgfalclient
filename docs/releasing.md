@@ -3,10 +3,11 @@
 A release is made from one reviewed commit. The version tag, source version,
 built metadata and installed runtime must all agree.
 
-The current candidate is **0.3.0**, requiring `xrdclient==0.3.0`. Keep its
-changelog entry `Unreleased` until the release is approved. Python 3.9.2 remains
-the declared floor, but the botocore/urllib3 clean-install conflict is a release
-blocker, not a permitted skip. See [Platforms](platforms.md) for outstanding
+The current candidate is **0.4.0**, requiring `xrdclient==0.4.0` and `xrdcore`, `xrdsec`,
+`xrdhttp` `>=0.4.0,<0.5`; the latest
+published release is 0.3.2 (`xrdclient==0.3.2`, Python 3.10 floor). Keep a
+version's changelog entry `Unreleased` until its release is approved. Python
+3.11 is the declared floor; every version from 3.11 to 3.14 must pass. See [Platforms](platforms.md) for outstanding
 native-platform checks and the scope of pre-version-bump validation.
 
 ## Prepare
@@ -20,12 +21,13 @@ native-platform checks and the scope of pre-version-bump validation.
    version, the strict documentation build and the performance gate.
 5. Run the real-service interop suite. For transfer, retry or filesystem
    changes, run both BRIX suites described in [Developing](DEVELOPING.md).
-6. Release the exact-pinned `xrdclient` version first. It supplies the shared
-   security/parsing APIs and must be available on PyPI before xgfalclient is
-   tagged. Update the mandatory dependency pin when those APIs change.
+6. Release the libraries (`xrdcore`, then `xrdsec` and `xrdhttp`) and the
+   exact-pinned `xrdclient` version first. They supply the shared security,
+   parsing and HTTP APIs and must be available on PyPI before xgfalclient is
+   tagged. Update the dependency pins when those APIs change.
 7. Run the [shared platform/package matrix](platforms.md) with matching
-   candidate refs. Build and validate fresh 0.3.0 artifacts, including the exact
-   native-package dependency and installed command versions; old 0.2.0
+   candidate refs. Build and validate fresh release artifacts, including the exact
+   native-package dependency and installed command versions; older
    working-tree packages are not final release artifacts.
 
 ## Validate the artifacts
@@ -58,7 +60,17 @@ caches, coverage data or local configuration.
 ## Publish and verify
 
 Push an annotated `v<version>` tag only after every required job is green.
-The tag workflow rebuilds and smoke-tests the artifacts, then uses PyPI trusted
-publishing. After publication, install from PyPI in a clean environment and
+The tag workflow (`.github/workflows/publish.yml`) builds with xrd-devtools'
+shared `publish` action (the same steps for every package of the chain; only
+the PyPI upload stays in this workflow, as trusted publishing requires). It
+rebuilds the artifacts and runs `twine check --strict`, then runs
+xrd-devtools' `chain_preflight.py pypi dist/*.whl` (a plain script needing
+only `packaging`), which refuses to
+continue unless the wheel's exact `xrdclient==` pin and the libraries' lower
+bounds are downloadable from PyPI as wheels. Next it installs the wheel with `--only-binary=:all:` from PyPI
+alone, never a checkout, and runs `pip check` and the tag, changelog and
+gfal2-version checks. Only then does it upload, through PyPI trusted
+publishing. The chain's runbook is xrdclient's `docs/releasing.md`
+(*Releasing the 0.4.0 chain*, step 4). After publication, install from PyPI in a clean environment and
 run one local copy plus one disposable remote transfer before announcing the
 release.

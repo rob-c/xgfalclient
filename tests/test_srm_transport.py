@@ -1,12 +1,11 @@
 """httpg transport: sessions, timeouts, TLS and GSI failures, unreadable replies."""
 
 # The shared fixtures come from test_srm; ruff sees each use as a redefinition.
-# ruff: noqa: F811
 
 from __future__ import annotations
 
+import contextlib
 import errno
-import http.client
 import socket
 import ssl
 import threading
@@ -15,13 +14,19 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from xrdhttp.connection import BadStatusLine
+from xrdsec.gsi.gss import GSIError
 
 import xgfalclient
-from test_srm import GROUP, _fast_polls, _no_bdii, fails, root, sctx, srm  # noqa: F401
-from xgfalclient.crypto.gsi import GSIError
+from test_srm import GROUP, fails
+from test_srm import _fast_polls as _fast_polls
+from test_srm import _no_bdii as _no_bdii
+from test_srm import root as root
+from test_srm import sctx as sctx
+from test_srm import srm as srm
 from xgfalclient.errors import ECOMM
 from xgfalclient.plugins.srm import soap
-from xgfalclient.plugins.srm.transport import HTTPGConnection, _network_error, parse_surl
+from xgfalclient.plugins.srm.transport import _network_error, parse_surl
 from xgfalclient.testing.pki import PKI, create_pki
 from xgfalclient.testing.srm import DROP, Reply, SRMServer
 
@@ -110,10 +115,8 @@ def silent() -> Iterator[int]:
     def accept() -> None:
         listener.settimeout(0.1)
         while not stop.is_set():
-            try:
+            with contextlib.suppress(OSError):
                 held.append(listener.accept()[0])
-            except OSError:
-                pass
 
     thread = threading.Thread(target=accept, daemon=True)
     thread.start()
@@ -156,31 +159,8 @@ def test_network_error_wording() -> None:
     assert "OSError" in _network_error(surl, "Ls", OSError()).message
     unknown = _network_error(surl, "Ls", socket.gaierror(socket.EAI_NONAME, "Name unknown"))
     assert unknown.code == ECOMM and unknown.message.endswith(": Host not found: Name unknown\n")
-    garbled = _network_error(surl, "Ls", http.client.BadStatusLine("junk"))
+    garbled = _network_error(surl, "Ls", BadStatusLine("junk"))
     assert garbled.code == ECOMM and garbled.message.endswith(": junk\n")
-
-
-class _Anonymous:
-    """A TLS context whose peer (on an anonymous cipher suite) shows no certificate."""
-
-    def wrap_socket(self, raw: socket.socket, server_hostname: str) -> _Anonymous:
-        return self
-
-    def getpeercert(self, binary_form: bool) -> None:
-        return None
-
-
-def test_peer_without_a_certificate(silent: int) -> None:
-    connection = HTTPGConnection(
-        "localhost",
-        silent,
-        _Anonymous(),  # type: ignore[arg-type]
-        connect_timeout=1,
-        timeout=1,
-        check_name=True,
-    )
-    with pytest.raises(GSIError, match="no certificate"):
-        connection.connect()
 
 
 def test_operation_timeout(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> None:

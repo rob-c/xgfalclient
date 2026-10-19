@@ -25,6 +25,23 @@ Metalink only after the original endpoint fails. Replica checksums are used to
 reject corrupt complete bodies; failover remains bounded by the configured
 retry policy.
 
+## Cancellation
+
+`Gfal2Context.cancel()` stops what is in flight without waiting for the next
+chunk. HTTP, XRootD, GridFTP, dCap and SFTP register the sockets an operation
+is blocked on (for SFTP over the system `ssh`, the `ssh` process is ended); `cancel()` shuts them down, so a `recv` on a server that has gone
+silent wakes at once and the operation fails with `ECANCELED` (a copy with
+gfal2's "Transfer canceled") instead of holding the caller for the whole
+operation timeout. Retries and reconnects of a cancelled operation are refused
+while the cancel drains; removing a cancelled copy's partial destination is not.
+`cancel()` itself waits at most `[CORE] CANCEL_TIMEOUT` seconds (default 10;
+`0` waits without limit, as gfal2 does) for operations blocked where nothing
+can wake them, such as a TCP connect or an SSH handshake. Third-party plugins
+can use the same hook: `Gfal2Context.abort_on_cancel(sock)` (or
+`register_abort`/`unregister_abort`, or `Transfer.abort_on_cancel` in a copy).
+XRootD's multi-connection bulk download is still only cancelled between chunks:
+xrdclient does not expose its connections.
+
 ## Local filesystem failures
 
 Read-only local operations retry transient `EAGAIN`, `EBUSY`, `EINTR`,
@@ -33,7 +50,13 @@ inode, size and nanosecond timestamps. If it was replaced, the copy fails with
 `ESTALE` instead of combining generations.
 
 Only a reader which encounters a fault reduces its request size, so the normal
-4 MiB streaming path stays fast. Short and zero-progress I/O are handled
+4 MiB streaming path stays fast. On Linux, a copy between two regular local
+files moves its bytes with `copy_file_range(2)`, `COPY_BUFFERSIZE` at a time
+(with the same progress, cancellation and final-sync checks), and hands over
+to the read/write pipeline at the offset reached when the kernel refuses
+(`EXDEV`, `ENOSYS`, `EOPNOTSUPP`, `EINVAL`, `ETXTBSY`), stops short of the
+source's size, or reports one of the transient read errors above (after the
+same reopen-and-verify recovery). Short and zero-progress I/O are handled
 explicitly and bounded.
 
 A completed copy to a regular local file performs a final flush, closes the

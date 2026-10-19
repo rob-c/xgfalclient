@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import os
+import time
+from pathlib import Path
 
 import pytest
 
@@ -152,6 +154,40 @@ def test_ecdsa_public_and_sign() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("kind", "label"), [("ecdsa-sha2-nistp384", "P-384"), ("ecdsa-sha2-nistp521", "P-521")]
+)
+def test_larger_ecdsa_curves(kind: str, label: str) -> None:
+    """RFC 5656's other two curves: SHA-384 and SHA-512, keys and files round-trip."""
+    key = PrivateKey.from_ecdsa(0xC0FFEE, "ec@host", kind=kind)
+    assert key.kind == kind and key.algorithms() == (kind,)
+    parsed = parse_public_blob(key.public.blob)
+    assert parsed == key.public
+    assert parsed.verify(kind, b"data", key.sign(b"data"))
+    assert not parsed.verify(kind, b"other", key.sign(b"data"))
+    assert load_private(encode_openssh_private(key)).public == key.public
+    curve = Reader(key.public.blob)
+    curve.text()
+    name = curve.text()
+    with pytest.raises(KeyError_, match=f"not on {label}"):
+        size = (len(curve.string()) - 1) // 2
+        parse_public_blob(string(kind) + string(name) + string(b"\x04" + b"\x00" * 2 * size))
+    with pytest.raises(KeyError_, match=f"uncompressed {label} point"):
+        parse_public_blob(string(kind) + string(name) + string(b"\x04"))
+    with pytest.raises(KeyError_, match=f"uncompressed {label} point"):  # a compressed form
+        parse_public_blob(string(kind) + string(name) + string(b"\x02" + b"\x00" * 2 * size))
+    # A signature whose r is out of range is a bad signature, not an error.
+    forged = string(kind) + string(mpint(0) + mpint(1))
+    assert not parsed.verify(kind, b"data", forged)
+
+
+def test_a_corrupt_ecdsa_scalar_is_a_key_error() -> None:
+    key = PrivateKey.from_ecdsa(0xC0FFEE)
+    zero = PrivateKey(key.kind, key.public, ecdsa=0)
+    with pytest.raises(KeyError_, match="corrupt ecdsa-sha2-nistp256 private key"):
+        load_private(encode_openssh_private(zero))
+
+
 def test_public_verify_rejects_mismatches() -> None:
     key = PrivateKey.from_ed25519_seed(os.urandom(32))
     sig = key.sign(b"x")
@@ -234,6 +270,41 @@ def test_openssh_private_round_trip_encrypted() -> None:
     assert load_private(blob, b"hunter2").public.blob == key.public.blob
 
 
+#: A real ``ssh-keygen -t ed25519 -N hunter2 -C xgfal-test`` key (OpenSSH 9.9,
+#: the default 16 bcrypt rounds) and its ``.pub`` line. A throwaway, test-only key.
+_SSH_KEYGEN_ED25519 = b"""-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABAAvZUguW
+cLGxDBXHAchFfYAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIA3eb1fXb5+idany
+h9F1V4ikgs87VPphazhZqTH+UGqKAAAAkB5lRdAY9HpsmtkmbddmA/J0ACeOpgf1uSot3S
+UECW9qpt8d5UC0x3xbcZGGmyPklczUTHl8oWPB34g2hgIMyKSoTqOc+R+n7KoUm6poUBtk
+HktW9W3+t1H4J1ql5RlMxG3V5RAWEY1WnzaWS3OLvtOc/lf5TMS9iAQ18YpFDGwdEkzM7Z
+kPNR9iDkqXogcHHA==
+-----END OPENSSH PRIVATE KEY-----
+"""
+_SSH_KEYGEN_ED25519_PUB = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA3eb1fXb5+idanyh9F1V4ikgs87VPphazhZqTH+UGqK xgfal-test"
+)
+
+
+def test_ssh_keygen_passphrase_key_loads_quickly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A default-rounds passphrase key decrypts at native bcrypt speed.
+
+    The pure-Python ``bcrypt_pbkdf`` took the best part of a minute for this
+    file; pyca ``bcrypt`` takes a fraction of a second. The memo is emptied
+    first so the KDF really runs. The bound is on this thread's CPU time (the
+    KDF runs in it, natively), which a heavily loaded CI host does not inflate
+    the way it does wall-clock time.
+    """
+    monkeypatch.setattr(sshkeys, "_derived", {})
+    started = time.thread_time()
+    loaded = load_private(_SSH_KEYGEN_ED25519, "hunter2")
+    elapsed = time.thread_time() - started
+    assert loaded.public_line() == _SSH_KEYGEN_ED25519_PUB
+    assert elapsed < 1.0, f"loading a 16-round passphrase key took {elapsed:.2f}s"
+    with pytest.raises(PassphraseRequired, match="wrong passphrase"):
+        load_private(_SSH_KEYGEN_ED25519, "not-it")
+
+
 def test_load_pem_rsa() -> None:
     loaded = load_private(KEY_0)
     assert loaded.kind == "ssh-rsa"
@@ -304,7 +375,7 @@ def test_host_pattern() -> None:
     assert host_pattern("h", 2222) == "[h]:2222"
 
 
-def test_known_hosts_match_unknown_changed(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_known_hosts_match_unknown_changed(tmp_path: Path) -> None:
     key = PrivateKey.from_ed25519_seed(os.urandom(32)).public
     other = PrivateKey.from_ed25519_seed(os.urandom(32)).public
     line = KnownHosts.line_for("host", 22, key)
@@ -312,6 +383,24 @@ def test_known_hosts_match_unknown_changed(tmp_path) -> None:  # type: ignore[no
     assert known.check("host", 22, key).status == "match"
     assert known.check("elsewhere", 22, key).status == "unknown"
     assert known.check("host", 22, other).status == "changed"
+
+
+def test_known_hosts_non_default_port() -> None:
+    # "[host]:port" is literal text, not a character class: the entry matches
+    # its own host and port, so a changed key there is caught.
+    key = PrivateKey.from_ed25519_seed(os.urandom(32)).public
+    other = PrivateKey.from_ed25519_seed(os.urandom(32)).public
+    known = KnownHosts([KnownHosts.line_for("127.0.0.1", 2222, key)])
+    assert known.check("127.0.0.1", 2222, key).status == "match"
+    assert known.check("127.0.0.1", 2222, other).status == "changed"
+    assert known.check("127.0.0.1", 22, key).status == "unknown"
+    assert known.check("1", 2222, key).status == "unknown"
+    # Wildcards still work inside the brackets, and ? is exactly one character.
+    pattern = f"[*.example.org]:2222,[db?.example.org]:5 {key.kind} "
+    glob = KnownHosts([pattern + base64.b64encode(key.blob).decode()])
+    assert glob.check("web.example.org", 2222, key).status == "match"
+    assert glob.check("db1.example.org", 5, key).status == "match"
+    assert glob.check("db12.example.org", 5, key).status == "unknown"
 
 
 def test_known_hosts_other_key_type() -> None:
@@ -359,7 +448,7 @@ def test_known_hosts_glob_and_negation() -> None:
     assert known.check("secret.example.org", 22, key).status == "unknown"
 
 
-def test_known_hosts_load_and_skips(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_known_hosts_load_and_skips(tmp_path: Path) -> None:
     key = PrivateKey.from_ed25519_seed(os.urandom(32)).public
     path = tmp_path / "known_hosts"
     path.write_text(

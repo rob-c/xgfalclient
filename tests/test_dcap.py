@@ -8,8 +8,9 @@ import socket
 import stat
 import threading
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -21,7 +22,10 @@ from xgfalclient.plugins.dcap.control import ControlConnection, Door
 from xgfalclient.plugins.dcap.protocol import (
     HEADER,
     INT,
+    IOCMD_ACK,
     IOCMD_CLOSE,
+    IOCMD_DATA,
+    IOCMD_FIN,
     IOCMD_READ,
     IOCMD_SEEK,
     parse_url,
@@ -62,9 +66,16 @@ def dctx(ctx: xgfalclient.Gfal2Context) -> xgfalclient.Gfal2Context:
     return ctx
 
 
-def code_of(call: object, *args: object) -> int:
+def opened_file(handle: xgfalclient.FileType) -> file.DcapFile:
+    """The dcap file under a ``ctx.open`` handle."""
+    remote = handle._file
+    assert isinstance(remote, file.DcapFile)
+    return remote
+
+
+def code_of(call: Callable[..., object], *args: object) -> int:
     with pytest.raises(GError) as info:
-        call(*args)  # type: ignore[operator]
+        call(*args)
     return info.value.code
 
 
@@ -224,6 +235,7 @@ def test_opendir_readpp(dctx: xgfalclient.Gfal2Context, door: DcapServer) -> Non
         dirent, info = directory.readpp()
         if dirent is None:
             break
+        assert info is not None
         entries[dirent.d_name] = info
     assert entries["sub"].is_dir()
     assert entries["hello.txt"].st_size == 12
@@ -406,7 +418,8 @@ def test_checksum_mismatch(dctx: xgfalclient.Gfal2Context, door: DcapServer) -> 
     loaded = with_dcap(dctx)
     handle = loaded.open(door.url("/data/new"), O_WRONLY | O_CREAT | O_TRUNC)
     handle.write(b"data")
-    handle._adler = 12345  # type: ignore[attr-defined]
+    assert isinstance(handle, file.DcapFile)
+    handle._adler = 12345
     with pytest.raises(GError) as info:
         handle.close()
     assert "Checksum mismatch" in info.value.message
@@ -494,7 +507,7 @@ def test_sequential_reads_are_pipelined(
         got += handle.read(size)
         if 300 < len(got) < len(data):
             # Past the first read, the next request is on the wire already.
-            assert handle._requests  # type: ignore[attr-defined]
+            assert isinstance(handle, file.DcapFile) and handle._requests
     assert bytes(got) == data
     assert handle.read(10) == b""
     assert handle.read(10) == b""
@@ -553,7 +566,7 @@ def test_failed_read_ahead_is_reported(
 
 def test_data_channel_send_failure(dctx: xgfalclient.Gfal2Context, door: DcapServer) -> None:
     handle = dctx.open(door.url("/data/hello.txt"), "r")
-    handle._file._channel.sock.close()  # type: ignore[attr-defined]
+    opened_file(handle)._channel.sock.close()
     assert code_of(handle.read_bytes, 5) == errno.EBADF
     handle.close()
 
@@ -581,8 +594,8 @@ def test_listing_overflow() -> None:
     ("reply", "text"),
     [
         (INT.pack((1 << 20) + 1), "Bad reply length"),  # longer than any reply
-        (HEADER.pack(4, file.IOCMD_DATA), "got DATA"),  # DATA where an ACK belongs
-        (HEADER.pack(8, file.IOCMD_ACK) + INT.pack(IOCMD_READ), "got ACK"),  # too short
+        (HEADER.pack(4, IOCMD_DATA), "got DATA"),  # DATA where an ACK belongs
+        (HEADER.pack(8, IOCMD_ACK) + INT.pack(IOCMD_READ), "got ACK"),  # too short
     ],
 )
 def test_malformed_replies(reply: bytes, text: str) -> None:
@@ -593,7 +606,7 @@ def test_malformed_replies(reply: bytes, text: str) -> None:
         far.sendall(reply)
         channel = file.DataChannel(near, "pool")
         with pytest.raises(GError) as info:
-            channel.expect(file.IOCMD_ACK, IOCMD_READ)
+            channel.expect(IOCMD_ACK, IOCMD_READ)
     assert info.value.code == errno.EPROTO
     assert text in info.value.message
 
@@ -742,7 +755,7 @@ def test_callback_listener_failure(
         def bind(self, address: object) -> None:
             raise OSError(errno.EADDRNOTAVAIL, "no address")
 
-    monkeypatch.setattr(file.socket, "socket", Unbindable)
+    monkeypatch.setattr(socket, "socket", Unbindable)
     assert code_of(dctx.listdir, door.url("/data")) == errno.EADDRNOTAVAIL
 
 
@@ -830,6 +843,26 @@ def test_door_call_non_gerror(door: DcapServer) -> None:
     pool.close()
 
 
+def test_file_closed_after_plugin_close_does_not_repool(
+    dctx: xgfalclient.Gfal2Context, door: DcapServer
+) -> None:
+    # The plugin (and so the door) is closed while a file is still open; the
+    # file's connection must then be closed on release, not parked on the
+    # idle list of a door nothing will ever close again.
+    handle = dctx.open(door.url("/data/hello.txt"), "r")
+    opened = opened_file(handle)
+    pool, conn = opened._door, opened._conn
+    with_dcap(dctx).close()
+    assert handle.read(5) == "hello"  # the open file still works
+    handle.close()
+    assert conn.closed
+    assert not pool._idle
+    # A connection released by anyone else after the close goes the same way.
+    late = ControlConnection.open(parse_url(door.url("/")), None, 5)
+    pool.release(late)
+    assert late.closed and not pool._idle
+
+
 def test_socket_error_without_errno() -> None:
     error = control.socket_error(OSError("gone"), "The door")
     assert error.code == errno.EIO
@@ -852,15 +885,15 @@ def test_raw_injection_breaks_plain_line(dctx: xgfalclient.Gfal2Context, door: D
 def test_seek_and_plain_read_on_the_mover(dctx: xgfalclient.Gfal2Context, door: DcapServer) -> None:
     """Commands libdcap sends that this client does not: SEEK and plain READ."""
     handle = dctx.open(door.url("/data/hello.txt"), "r")
-    channel = handle._file._channel  # type: ignore[attr-defined]
+    channel = opened_file(handle)._channel
     channel.send(file._SEEK_WRITE.pack(16, IOCMD_SEEK, 6, 0))
-    assert channel.expect(file.IOCMD_ACK, IOCMD_SEEK) == (6).to_bytes(8, "big")
+    assert channel.expect(IOCMD_ACK, IOCMD_SEEK) == (6).to_bytes(8, "big")
     channel.send(file._READ.pack(12, IOCMD_READ, 100))
-    channel.expect(file.IOCMD_ACK, IOCMD_READ)
-    channel.expect(file.IOCMD_DATA)
+    channel.expect(IOCMD_ACK, IOCMD_READ)
+    channel.expect(IOCMD_DATA)
     buffer = bytearray(100)
     assert channel.receive(memoryview(buffer)) == 6
-    channel.expect(file.IOCMD_FIN, IOCMD_READ)
+    channel.expect(IOCMD_FIN, IOCMD_READ)
     assert bytes(buffer[:6]) == b"world\n"
     handle.close()
 
@@ -896,7 +929,7 @@ def test_listdir_callback_port_range(
     class Picky(socket.socket):
         """Ports 1 and 3 are taken; any other stands in for an ephemeral one."""
 
-        def bind(self, address: tuple[str, int]) -> None:  # type: ignore[override]
+        def bind(self, address: Any) -> None:
             tried.append(address[1])
             if address[1] == 1:
                 raise OSError(errno.EADDRINUSE, "in use")
@@ -904,7 +937,7 @@ def test_listdir_callback_port_range(
                 raise OSError("in use, says nobody")
             super().bind((address[0], 0))
 
-    monkeypatch.setattr(file.socket, "socket", Picky)
+    monkeypatch.setattr(socket, "socket", Picky)
     monkeypatch.setenv("DCACHE_CBPORT", "1:3")
     assert "sub" in dctx.listdir(door.url("/data"))
     assert tried == [1, 2]
@@ -927,8 +960,29 @@ def test_an_unresolvable_door_is_unreachable(
     def unknown(*args: object, **kwargs: object) -> None:
         raise socket.gaierror(-2, "Name or service not known")
 
-    monkeypatch.setattr(control.socket, "create_connection", unknown)
+    monkeypatch.setattr(socket, "create_connection", unknown)
     with pytest.raises(GError) as caught:
         dctx.stat("dcap://nosuch.invalid:22125/x")
     # Not getaddrinfo's EAI code (-2, or 8 on macOS), which is no errno at all.
     assert caught.value.code == errno.EHOSTUNREACH
+
+
+def test_a_file_opened_as_a_cancel_drains_closes_its_data_channel() -> None:
+    """The file's registration with the context is refused: nothing of it is left open."""
+    closed: list[bool] = []
+
+    class Refusing:
+        def register(self, *sockets: object) -> int:
+            raise GError("[gfal2_cancel] operation canceled by user", errno.ECANCELED)
+
+    class Channel:
+        sock = None
+
+        def close(self) -> None:
+            closed.append(True)
+
+    conn = type("Conn", (), {"sock": None})()
+    with pytest.raises(GError) as caught:
+        control = file.DoorSession(cast(Door, Refusing()), conn, 1, cast(file.DoorError, None))
+        file.DcapFile("dcap://h/f", O_RDONLY, control, cast(file.DataChannel, Channel()))
+    assert caught.value.code == errno.ECANCELED and closed == [True]

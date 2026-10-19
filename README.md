@@ -33,30 +33,37 @@ gfal2-util's `/usr/bin/gfal-*` scripts along with its own.
 
 The goal is to make scientific data access straightforward for physicists,
 administrators and new projects: familiar APIs, one installation workflow,
-clear diagnostics and portable Python 3.9+ support. Existing FTS, Rucio and
+clear diagnostics and portable Python 3.11+ support. Existing FTS, Rucio and
 DIRAC integrations can keep using the interfaces they already know.
 
 ## Install
 
-Requires Python 3.9.2+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
-`urllib3`, `asn1crypto`, `cryptography` and the exact-pinned `xrdclient==0.3.0`.
-The current 0.3.0 candidate is unreleased. Python 3.9 clean installation is
-currently blocked by the botocore/urllib3 dependency conflict; see
+Requires Python 3.11+ (tested on 3.11 to 3.14). On AlmaLinux/RHEL 8 and 9,
+whose system Python is older, install AppStream's `python3.11` or `python3.12`
+and use that interpreter. Runtime dependencies are `bcrypt`, `cryptography`,
+the shared libraries [xrdcore](https://github.com/rob-c/xrdcore),
+[xrdsec](https://github.com/rob-c/xrdsec) and
+[xrdhttp](https://github.com/rob-c/xrdhttp) (`>=0.4.0,<0.5`) and the
+exact-pinned `xrdclient==0.4.0`; `asn1crypto` arrives through xrdsec and
+`botocore` through xrdhttp. The current 0.4.0 candidates are unreleased; see
 [platform status](docs/platforms.md).
-XRootD support is included in the base install. The two clients share one
-implementation of VOMS validation, DER/RSA/AES/signature helpers and safe XML
-loading; existing `xgfalclient.crypto` import paths remain compatible.
-XML parsing uses a local declaration-rejecting wrapper around Python's built-in
+XRootD support is included in the base install. xgfalclient, xrdclient and
+xrdarc share one implementation of VOMS validation, X.509 and proxy
+delegation, DER/RSA/AES/signature helpers, credential discovery, client TLS,
+safe XML loading, checksums and the HTTP protocol pieces - the libraries'
+(map in [Architecture](docs/architecture.md#built-on-the-libraries)); existing
+`xgfalclient.crypto` import paths remain compatible.
+XML parsing uses xrdcore's declaration-rejecting wrapper around Python's built-in
 parsers; no libxml2, lxml or XML build tools are required. Binary protocol
 records use local, bounds-checked readers and standard-library `struct`.
 Cryptography supplies native wheels for supported mainstream platforms.
 
 Native Kerberos is optional: `pip install 'xgfalclient[krb5]'` adds python-gssapi
-and pykrb5 (distribution name `krb5`). Both have macOS wheels; Linux source
-installs need a C compiler and Kerberos development headers. Ordinary installs
-and non-Kerberos protocols do not request either binding.
+(through `xrdsec[krb5]`). It has macOS wheels; Linux source installs need a C
+compiler and Kerberos development headers. Ordinary installs and
+non-Kerberos protocols do not request it.
 
-CI checks wheel-only dependency resolution for Python 3.9 and 3.14 on
+CI checks wheel-only dependency resolution for Python 3.11 and 3.14 on
 macOS Intel/Apple Silicon, glibc Linux (2.28+) and musl Linux (1.2+), on x86-64
 and ARM64. Clean installs are exercised on Linux and macOS. These gates check
 current releases; they cannot guarantee future upstream wheel availability.
@@ -65,14 +72,15 @@ Python's built-in XML parser must be kept up to date through Python or
 operating-system updates. Parser regression tests cover declaration rejection,
 encoded input, malformed records and existing protocol error codes.
 
-The maintained libraries own AWS signing, JWT claim decoding, DER primitives,
-cipher/curve operations and connection setup/TLS. Protocol-specific GSI,
+The maintained libraries own AWS signing, DER primitives, cipher/curve
+operations and connection setup/TLS. Bearer-token claims are decoded
+(unverified, for expiry diagnostics only) by a small standard-library reader. Protocol-specific GSI,
 RFC 3820/VOMS policy, redirects and upload handshakes remain thin client adapters.
 
 
 ```console
 $ pip install xgfalclient              # all protocols, including root://
-$ pip install 'xgfalclient[xrootd]'    # compatibility alias; same base install
+$ pip install 'xgfalclient[sftp]'      # paramiko: sftp:// with a password
 ```
 
 ## Protocols
@@ -90,7 +98,7 @@ As in gfal2, each protocol is a plugin, loaded the first time a URL needs it.
 | `gsiftp`, `ftp` | gridftp | GSI control channel, MODE E parallel streams, DCAU, third-party copy |
 | `srm` | srm | SRM v2.2 over httpg, TURL resolution to the other plugins, BDII endpoint discovery |
 | `dcap`, `gsidcap`, `kdcap` | dcap | dCache's native protocol |
-| `sftp` | sftp | over the system `ssh`, or a pure-Python SSH-2 transport |
+| `sftp` | sftp | over the system `ssh`, or paramiko (`[sftp]` extra) |
 | `lfc` | lfc | the LCG File Catalog (retired from gfal2, kept here) |
 | `file` | file | the local filesystem, with gfal2's quirks |
 | `mock` | mock | gfal2's test plugin: a storage element described by its URL |
@@ -116,23 +124,26 @@ and `vomsdir` LSC binding; see the
 [VOMS guide](docs/voms.md).
 
 GSI framing and RFC 3820 proxy policy remain in Python, with ASN.1 primitives
-handled by `asn1crypto` and ciphers/curves by `cryptography`. Legacy raw-RSA
+handled by the shared `xrdsec` library (on `asn1crypto`) and ciphers/curves
+by `cryptography`. Legacy raw-RSA
 GSI operations and 512-bit compatibility key generation remain local code;
 they have not yet been rebased. TLS itself is the standard `ssl` module.
 
-Kerberos (for `kdcap://` and friends) uses the system GSS-API through
-the optional `krb5` extra's `gssapi` package (python-gssapi). The old `ctypes` backend
-selection is a compatibility alias; no local GSS-API ABI binding remains.
-`xgfalclient.crypto.krb5.inspect_cache()` uses pykrb5 for read-only cache
-diagnostics, returning the cache name, principal and latest ticket expiry,
-never session keys.
+Kerberos (for `kdcap://` and LFC's Csec) uses the system GSS-API through
+`xrdsec.krb5.gss` and the optional `krb5` extra's python-gssapi; the old
+`ctypes` backend selection is a compatibility alias. `xgfalclient.crypto.krb5`
+keeps gfal2's side: `GError`s with an `errno`, `XGFAL_KRB5_BACKEND`, the
+install hint. `xgfalclient.crypto.krb5.inspect_cache()` reads the cache with
+xrdsec's pure-Python reader (`FILE:`, `DIR:`, `KCM:`, `KEYRING:`), returning
+the cache name, principal and latest ticket expiry, never session keys.
 
 `s3://` is signed with the `[S3]` (or per-host `[S3:<HOST>]`) keys, as davix
 does, and `gcloud://` with the service-account JSON from `[GCLOUD]
 JSON_AUTH_FILE` or `JSON_AUTH_STRING`.
 `sftp://` uses the user's own SSH setup - keys, agent and `~/.ssh/config`
 through the system `ssh`, or public keys and a password from the credential
-store through the built-in SSH-2 client.
+store through paramiko (`pip install 'xgfalclient[sftp]'`). Without paramiko
+the built-in Python SSH-2 client is used.
 
 ## Configuration
 
@@ -232,15 +243,17 @@ truncates the file; ours writes every byte.
 ## Development
 
 ```console
-$ python -m venv .venv && .venv/bin/pip install -e ../xrdclient -e '.[dev]'
+$ python -m venv .venv && .venv/bin/pip install -e ../xrdcore -e ../xrdsec -e ../xrdhttp \
+      -e ../xrdclient -e '.[dev]'
 $ .venv/bin/pytest -n auto --cov          # 100% line and branch coverage, enforced
 $ XGFAL_CONDCOV=1 .venv/bin/pytest -n auto # every and/or, ternary and filter both ways
 $ .venv/bin/ruff check src tests && .venv/bin/mypy
 ```
 
 Tests are hermetic: every protocol has an in-process server in
-`xgfalclient.testing`, and a throwaway grid PKI (`xgfalclient.testing.pki`)
-mints CAs, host certificates and proxies at run time. Tests against real
+`xgfalclient.testing`, and a throwaway grid PKI (`xgfalclient.testing.pki`,
+on xrdsec's shared `xrdsec.testing.pki`) mints CAs, host certificates
+and proxies at run time. Tests against real
 servers in Docker are marked `interop` and run with `XGFAL_INTEROP=1`. See
 [the documentation](docs/index.md), [developer guide](docs/DEVELOPING.md),
 [security policy](SECURITY.md), [contribution guide](CONTRIBUTING.md) and

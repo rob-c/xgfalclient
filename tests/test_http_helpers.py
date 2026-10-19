@@ -19,9 +19,9 @@ from xgfalclient.testing.pki import PKI
 from xgfalclient.testing.webdav import WebDAVServer
 
 
-def make_server(root: Path, **kwargs: object) -> WebDAVServer:
+def make_server(root: Path, *, tls: ssl.SSLContext | None = None) -> WebDAVServer:
     (root / "data").mkdir(parents=True, exist_ok=True)
-    return WebDAVServer(root, **kwargs).start()  # type: ignore[arg-type]
+    return WebDAVServer(root, tls=tls).start()
 
 
 @pytest.fixture

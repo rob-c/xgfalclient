@@ -3,6 +3,11 @@
 The exit status is the errno of the first failure, even when later files
 are removed; a failure other than "missing" stops the command. Behaviour is
 gfal2-util's (Apache-2.0, (c) CERN), reimplemented.
+
+The status words (``DELETED``, ``MISSING``, ``FAILED``, ``RMDIR``, ``SKIP``,
+``SKIP DIR``) are what scripts grep for, so they are fixed. ``gfal-rm``'s
+:class:`~._base.Spec` starts its exit status at 0 rather than -1: an
+unexpected exception still exits 0 there, as in gfal2-util.
 """
 
 from __future__ import annotations
@@ -18,18 +23,27 @@ __all__ = ["SPECS", "read_list"]
 
 
 def read_list(path: str) -> list[str]:
-    """The non-blank lines of a ``--from-file`` list, stripped."""
+    """The non-blank lines of a ``--from-file`` list, stripped.
+
+    Used as given: unlike positional arguments, these are not passed
+    through ``surl``, so a bare local path in the file is not turned into a
+    ``file://`` URL (gfal2-util's behaviour).
+    """
     with open(path) as handle:
         return [line.strip() for line in handle if line.strip()]
 
 
 class _Remover:
+    """One ``gfal-rm`` run; the exit status accumulates on ``cmd.return_code``."""
+
     def __init__(self, cmd: Command) -> None:
+        """Bind to the invocation (options and context)."""
         self.cmd = cmd
         self.params = cmd.params
         self.context = cmd.context
 
     def propagate(self, code: int) -> None:
+        """Make ``code`` the exit status unless an earlier failure already set one."""
         if self.cmd.return_code == 0:
             self.cmd.return_code = code
 
@@ -44,6 +58,12 @@ class _Remover:
         raise exc
 
     def remove(self, url: str) -> None:
+        """Remove one URL: stat it, recurse into a directory, else ``unlink``.
+
+        ``--just-delete`` skips the ``stat`` - a pre-signed HTTP URL is
+        valid for ``DELETE`` only, so a ``HEAD``/``PROPFIND`` would be
+        refused - and therefore cannot recurse.
+        """
         output.identify("rm", url=url)
         if not self.params.just_delete:
             try:
@@ -67,6 +87,12 @@ class _Remover:
         output.record(status="succeeded")
 
     def remove_directory(self, url: str) -> None:
+        """``-r``: children depth-first, then the directory; without ``-r``, ``EISDIR``.
+
+        Children are listed once up front (``listdir``), so entries created
+        during the removal are not seen and the final ``rmdir`` fails with
+        the server's ``ENOTEMPTY``, as with gfal2-util.
+        """
         if not self.params.recursive:
             raise GError(f"Can not remove {url}, is a directory", errno.EISDIR)
         base = url if url.endswith("/") else url + "/"
@@ -87,6 +113,12 @@ class _Remover:
         output.record(status="succeeded")
 
     def bulk(self, urls: list[str]) -> None:
+        """``--bulk``: one list ``unlink`` (a single SRM ``srmRm``, say), one line per URL.
+
+        Unlike the one-by-one path, a failure here does not stop the rest:
+        the list call has already tried every file. No ``stat`` is done, so
+        directories are not recognised (``--bulk`` refuses ``-r``).
+        """
         if self.params.dry_run:
             for url in urls:
                 output.record(operation="rm", url=url, status="planned")
@@ -94,7 +126,7 @@ class _Remover:
             return
         results = self.context.unlink(urls)
         assert isinstance(results, list)
-        for url, error in zip(urls, results):
+        for url, error in zip(urls, results, strict=False):
             if error is None:
                 output.record(operation="rm", url=url, status="succeeded")
                 out(f"{url}\tDELETED\n")
@@ -105,6 +137,12 @@ class _Remover:
 
 
 def rm(cmd: Command) -> int | None:
+    """``gfal-rm [-r] [--bulk] [--dry-run] URL... | --from-file LIST``.
+
+    Conflicting or missing arguments are reported on stderr with
+    ``EINVAL`` as the status, gfal2-util's messages and all, rather than
+    through argparse's usage error.
+    """
     params = cmd.params
     if params.from_file and params.file:
         sys.stderr.write("--from-file and positional arguments can not be used at the same time\n")

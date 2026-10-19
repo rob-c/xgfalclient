@@ -20,7 +20,7 @@ import time
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -173,17 +173,25 @@ def test_definitions_client_info_and_flags(
     monkeypatch.setattr(Gfal2Context, "set_user_agent", spy)
     code, _, _ = run(
         "ls",
-        "-D", "G:INT=5",
-        "-D", "G:BOOL=yes",
-        "-D", "G:STR=hello",
-        "-D", "G:LIST=a,b",
-        "-C", "k=v",
-        "-C", "bare",
-        "-C", "x=y=z",
+        "-D",
+        "G:INT=5",
+        "-D",
+        "G:BOOL=yes",
+        "-D",
+        "G:STR=hello",
+        "-D",
+        "G:LIST=a,b",
+        "-C",
+        "k=v",
+        "-C",
+        "bare",
+        "-C",
+        "x=y=z",
         "-6",
-        "-t", "0",
+        "-t",
+        "0",
         url(tree / "a.txt"),
-    )  # fmt: skip
+    )
     assert code == 0
     group = seen["options"]["G"]
     assert group == {"INT": "5", "BOOL": "true", "STR": "hello", "LIST": "a;b;"}
@@ -669,8 +677,11 @@ def test_token(run: Run, monkeypatch: pytest.MonkeyPatch) -> None:
         return original(self, *args)
 
     monkeypatch.setattr(Gfal2Context, "token_retrieve", spy)
+
     # gfal2's mock has no token_retrieve
-    token = lambda self, *args: "mock-token"  # noqa: E731
+    def token(self: MockPlugin, *args: Any) -> str:
+        return "mock-token"
+
     monkeypatch.setattr(MockPlugin, "token_retrieve", token, raising=False)
     assert run("token", "mock://h/f") == (0, "mock-token\n", "")
     assert run("token", "-v", "-w", "--issuer", "https://i", "mock://h/f") == (
@@ -1085,7 +1096,7 @@ def test_legacy_replicas_without_catalogue(
 
 def test_legacy_replicas_preserves_the_actual_filesystem_error(run: Run, tree: Path) -> None:
     getter = getattr(os, "getxattr", None)
-    expected = errno.ENODATA  # the documented fallback without an OS getter
+    expected: int | None = errno.ENODATA  # the documented fallback without an OS getter
     if getter is not None:
         with pytest.raises(OSError) as caught:
             getter(tree / "a.txt", "user.replicas")
@@ -1128,9 +1139,9 @@ def test_legacy_register_replicas_unregister(run: Run, lfc: LFCServer) -> None:
 
 @pytest.mark.parametrize("verbose", [False, True])
 def test_unexpected_setup_failure_is_plain_unless_debug_is_requested(
-    run, monkeypatch, tree, verbose
-):
-    def broken(*args):
+    run: Run, monkeypatch: pytest.MonkeyPatch, tree: Path, verbose: bool
+) -> None:
+    def broken(*args: object) -> NoReturn:
         raise RuntimeError("internal failure")
 
     monkeypatch.setattr(base, "apply_options", broken)
@@ -1146,8 +1157,10 @@ def test_unexpected_setup_failure_is_plain_unless_debug_is_requested(
         assert "Traceback" not in error
 
 
-def test_oserror_without_a_filename_still_has_a_plain_message(run, monkeypatch):
-    def failed(path):
+def test_oserror_without_a_filename_still_has_a_plain_message(
+    run: Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed(path: str) -> NoReturn:
         raise OSError(errno.EIO, "storage unavailable")
 
     monkeypatch.setattr(tape, "read_list", failed)

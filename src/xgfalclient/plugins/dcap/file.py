@@ -58,6 +58,7 @@ import time
 import zlib
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from ...errors import GError
 from ...plugin import O_ACCMODE_MASK, O_RDWR, O_WRONLY, PluginFile
@@ -81,43 +82,65 @@ from .protocol import (
 )
 
 __all__ = [
+    "LISTING_CHUNK",
+    "MAX_BLOCK",
+    "READ_AHEAD",
     "DataChannel",
     "DcapFile",
+    "DoorSession",
     "await_data",
     "callback_listener",
     "read_listing",
-    "MAX_BLOCK",
-    "LISTING_CHUNK",
-    "READ_AHEAD",
 ]
 
-#: The largest block one write sends (the block length is a signed 32-bit int).
+#: The largest block one write sends (the block length is a signed 32-bit int,
+#: so a 1 GiB block stays well clear of its sign bit).
 MAX_BLOCK = 1 << 30
-#: Writes up to this size go out as one ``send`` together with their length.
+#: Writes up to this size go out as one ``send`` together with their length:
+#: copying a small block is cheaper than a second segment (``TCP_NODELAY`` is
+#: on, so two ``send`` calls would be two packets); a large one is sent as is.
 SMALL_WRITE = 64 * 1024
 #: How much of a directory listing one ``READ`` asks for.
 LISTING_CHUNK = 1 << 20
-#: What one request asks for once reads are sequential; two are in flight.
+#: What one request asks for once reads are sequential; two are in flight, so
+#: up to 16 MiB may have to be discarded when the reader jumps elsewhere.
 READ_AHEAD = 8 << 20
 #: The buffer outstanding read-ahead is discarded into.
 _DISCARD = 256 * 1024
 
+# Data-channel requests, all big-endian. The first int is the length of what
+# follows it, so the command word is counted: ``[24][SEEK_AND_READ][offset:q]
+# [whence:i][length:q]``, ``[16][SEEK_AND_WRITE][offset:q][whence:i]``,
+# ``[12][READ][length:q]``, and a checksummed ``[20][CLOSE][12][DATA_SUM]
+# [ADLER32][sum:I]``, where 12 is the size of the checksum block after it.
 _SEEK_READ = struct.Struct(">iiqiq")
 _SEEK_WRITE = struct.Struct(">iiqi")
 _READ = struct.Struct(">iiq")
 _CLOSE_SUM = struct.Struct(">iiiiiI")
+#: The fixed part of an ``ACK``/``FIN`` body: ``[kind][command answered][result]``.
 _REPLY = struct.Struct(">iii")
 
 _NAMES = {IOCMD_ACK: "ACK", IOCMD_FIN: "FIN", IOCMD_DATA: "DATA"}
 
 #: Failure reported by the door on the control line: ``(reply) -> GError``.
+#: The plugin supplies it (``DcapPlugin._failure``) so that the wording and
+#: ``errno`` of a door's ``failed`` line are decided in one place.
 DoorError = Callable[[Reply], GError]
 
 
 class DataChannel:
-    """A connection to a mover: exact reads, whole writes, dcap replies."""
+    """A connection to a mover: exact reads, whole writes, dcap replies.
+
+    The channel owns ``sock`` (its :meth:`close` closes it) but does no
+    locking: one thread at a time drives it, which :class:`DcapFile`
+    guarantees with its own lock. Every socket failure becomes a
+    :class:`GError` keeping the socket's ``errno`` (``ETIMEDOUT`` for the
+    timeout set on the socket), a peer hanging up mid-message is ``EIO``,
+    and a message that breaks the framing is ``EPROTO``.
+    """
 
     def __init__(self, sock: socket.socket, role: str = "mover") -> None:
+        """Wrap a connected ``sock``; ``role`` names the other end in error messages."""
         self.sock = sock
         address = sock.getpeername()
         #: What error messages call the other end: ``dcap mover 10.0.0.7:33115``.
@@ -125,6 +148,7 @@ class DataChannel:
         self._int = bytearray(4)
 
     def send(self, data: bytes | bytearray | memoryview) -> None:
+        """Send all of ``data`` (``sendall``), or fail with the socket's ``errno``."""
         try:
             self.sock.sendall(data)
         except OSError as exc:  # socket.timeout is an OSError too
@@ -143,11 +167,21 @@ class DataChannel:
             raise socket_error(exc, f"The data connection to the {self.peer} failed") from exc
 
     def recv_int(self) -> int:
+        """One big-endian signed 32-bit integer: a length, a command, a block size."""
         self.recv_into(memoryview(self._int))
         return int(INT.unpack(self._int)[0])
 
     def expect(self, code: int, command: int = 0) -> bytes:
         """Read one reply; it must be ``code`` (for ``command``) and successful.
+
+        A reply body is ``[kind][command][result][extra...]`` after its
+        length (``DCapOutputByteBuffer``). A non-zero ``result`` carries a
+        ``[uint16 length][message]`` that becomes an ``EIO`` with the mover's
+        words; a reply of the wrong kind, for the wrong command or shorter
+        than its fixed part is ``EPROTO``. ``DATA`` is the one reply with
+        nothing after its kind, and is accepted as such. Lengths over 1 MiB
+        are refused rather than allocated: no real reply comes near that, so
+        such a length means the stream is out of step.
 
         Returns the reply's extra fields (a ``SEEK``'s position, a
         ``LOCATE``'s size and position).
@@ -185,7 +219,12 @@ class DataChannel:
         return extra
 
     def receive(self, view: memoryview) -> int:
-        """The blocks of one read, into ``view``; ``-1`` ends them."""
+        """The blocks of one read, into ``view``; ``-1`` ends them.
+
+        Each block is ``[n][n bytes]``. Returns the total received, which is
+        short of ``len(view)`` at the end of the file. A mover that sends more
+        than was asked for is ``EPROTO``: there is nowhere to put it.
+        """
         got = 0
         while True:
             size = self.recv_int()
@@ -197,6 +236,7 @@ class DataChannel:
             got += size
 
     def close(self) -> None:
+        """Close the socket; the mover sees the connection end."""
         self.sock.close()
 
 
@@ -240,6 +280,11 @@ def _bind(listener: socket.socket, address: str, ports: range) -> None:
 
 
 def _atoi(text: str) -> int:
+    """C ``atoi`` for a port: leading blanks skipped, leading digits read, else 0.
+
+    No sign is accepted (a port has none), so ``"-5"`` is 0, as the range
+    logic in :func:`callback_ports` expects.
+    """
     digits = ""
     for character in text.strip():
         if not character.isdigit():
@@ -273,7 +318,14 @@ def callback_listener(conn: ControlConnection) -> tuple[socket.socket, str, int]
 
 
 def _accept(listener: socket.socket, session: int, timeout: float) -> socket.socket | None:
-    """A call from a pool for ``session``; ``None`` if it was for someone else."""
+    """A call from a pool for ``session``; ``None`` if it was for someone else.
+
+    The pool opens with ``[session][length][challenge]``. The challenge is the
+    door's to check, not the client's, so it is read and dropped; only the
+    session decides whether the call is ours. A call for another session (a
+    pool late for an abandoned open) is hung up on and the wait goes on. A
+    challenge longer than 4 KiB is ``EPROTO``: nothing real sends one.
+    """
     try:
         sock, _ = listener.accept()
     except OSError as exc:
@@ -296,7 +348,14 @@ def _accept(listener: socket.socket, session: int, timeout: float) -> socket.soc
 
 
 def _connect_pool(reply: Reply, session: int, timeout: float) -> socket.socket:
-    """Answer the door's ``connect <host> <port> <challenge>``."""
+    """Answer the door's ``connect <host> <port> <challenge>``.
+
+    The passive form: the client connects to the mover and introduces itself
+    with ``[session][length][challenge]``, the challenge sent back exactly as
+    the door gave it, which is how the mover knows which open this
+    connection belongs to. A ``connect`` without the three arguments is
+    ``EPROTO``; failing to reach the pool keeps the socket's ``errno``.
+    """
     try:
         host, port, challenge = reply.args[0], int(reply.args[1]), reply.args[2]
     except (IndexError, ValueError) as exc:
@@ -317,7 +376,17 @@ def await_data(
     timeout: float,
     failure: DoorError,
 ) -> socket.socket:
-    """Wait for the data connection of ``session``, whichever side makes it."""
+    """Wait for the data connection of ``session``, whichever side makes it.
+
+    The control line and ``listener`` are watched together until
+    ``timeout`` seconds have passed (``ETIMEDOUT``): a pool calling back is
+    accepted, a ``connect`` line is answered by connecting, ``failed`` is
+    turned into ``failure(reply)`` and ``retry`` (the door could not find a
+    pool yet) is ``EAGAIN``. Lines for other sessions and verbs this client
+    does not act on are skipped. The returned socket has the same timeout
+    and ``TCP_NODELAY``, and belongs to the caller; ``listener`` stays the
+    caller's to close.
+    """
     deadline = time.monotonic() + timeout
     while True:
         if conn.select([listener], deadline):
@@ -341,7 +410,13 @@ def await_data(
 
 
 def read_listing(channel: DataChannel) -> bytes:
-    """The whole listing a directory lister serves, then ``CLOSE``."""
+    """The whole listing a directory lister serves, then ``CLOSE``.
+
+    The lister has no size to report, so it is read in :data:`LISTING_CHUNK`
+    pieces with plain ``READ`` until one comes back empty. Each round trip is
+    ``READ``, ``ACK``, ``DATA``, blocks, ``-1``, ``FIN``. The channel stays
+    the caller's to close.
+    """
     chunks = []
     buffer = bytearray(LISTING_CHUNK)
     view = memoryview(buffer)
@@ -365,11 +440,16 @@ def read_listing(channel: DataChannel) -> bytes:
 
 
 class _Request:
-    """One ``SEEK_AND_READ`` on the wire."""
+    """One ``SEEK_AND_READ`` on the wire, and how much of its answer has arrived.
+
+    A plain mutable record (slots, no dataclass) because :meth:`DcapFile._pull`
+    updates ``got`` for every block it receives.
+    """
 
     __slots__ = ("ahead", "got", "length", "offset", "started")
 
     def __init__(self, offset: int, length: int, ahead: bool) -> None:
+        """A request for ``length`` bytes at ``offset``, just sent."""
         self.offset = offset
         self.length = length
         #: A read-ahead request, followed by the next one while it is received.
@@ -380,26 +460,49 @@ class _Request:
         self.started = False
 
 
-class DcapFile(PluginFile):
-    """A file open through a dcap door; see the module docstring for the protocol."""
+@dataclass(frozen=True, slots=True)
+class DoorSession:
+    """The control-line side of one open file, which the door answers on ``close``.
 
-    def __init__(
-        self,
-        url: str,
-        flags: int,
-        door: Door,
-        conn: ControlConnection,
-        session: int,
-        channel: DataChannel,
-        failure: DoorError,
-    ) -> None:
+    ``conn`` is held by the file for its whole life (``Door.call(...,
+    keep=True)``) and handed back to ``door``'s pool when it closes; the door
+    reports the transfer's outcome on it under ``session``, and ``failure``
+    turns a ``failed`` line into the plugin's ``GError``.
+    """
+
+    door: Door
+    conn: ControlConnection
+    session: int
+    failure: DoorError
+
+
+class DcapFile(PluginFile):
+    """A file open through a dcap door; see the module docstring for the protocol.
+
+    Every operation runs under one lock, because the data channel is a single
+    ordered stream: two threads interleaving requests would each read the
+    other's replies. A failure part-way through a request leaves the stream
+    in an unknown place, so the first ``GError`` is kept and every later call
+    fails with it (``close`` included) rather than misreading what follows.
+    """
+
+    def __init__(self, url: str, flags: int, control: DoorSession, channel: DataChannel) -> None:
+        """Take over ``channel`` and ``control`` from a successful ``open``.
+
+        From here the file owns both: ``close`` closes the channel and
+        returns the control connection. If the context refuses to register
+        the sockets for cancellation (it is already cancelled), the channel is
+        closed and that ``ECANCELED`` raised; the caller still owns the
+        control connection then, and ``Door.call`` closes it.
+        """
         super().__init__(url)
         self.writable = (flags & O_ACCMODE_MASK) in (O_WRONLY, O_RDWR)
+        door, conn = control.door, control.conn
         self._door = door
         self._conn = conn
-        self._session = session
+        self._session = control.session
         self._channel = channel
-        self._failure = failure
+        self._failure = control.failure
         self._lock = threading.Lock()
         #: Where the mover's own file pointer is.
         self._mover_position = 0
@@ -415,10 +518,18 @@ class DcapFile(PluginFile):
         self._block = 0
         #: Where the last read ended: a read starting there is sequential.
         self._read_end = -1
+        # Open, a read or write may block on the mover or the door: either
+        # is shut down by a cancel() until the file is closed.
+        try:
+            self._abort = door.register(conn.sock, channel.sock)
+        except GError:
+            channel.close()
+            raise
 
     # -- plumbing ------------------------------------------------------------------
 
     def _run(self, action: Callable[[], int]) -> int:
+        """Run ``action`` under the lock; its first ``GError`` breaks the file for good."""
         with self._lock:
             if self._broken is not None:
                 raise self._broken
@@ -440,6 +551,7 @@ class DcapFile(PluginFile):
     # -- reading -------------------------------------------------------------------
 
     def _request(self, offset: int, length: int, ahead: bool) -> None:
+        """Put a ``SEEK_AND_READ`` on the wire without waiting for its answer."""
         self._channel.send(_SEEK_READ.pack(24, IOCMD_SEEK_READ, offset, SEEK_SET, length))
         self._requests.append(_Request(offset, length, ahead))
 
@@ -478,26 +590,45 @@ class DcapFile(PluginFile):
         while self._requests:
             self._pull(scratch)
 
+    def _head(self, position: int, size: int, remaining: int) -> _Request:
+        """The request whose answer continues at ``position``, sent if need be.
+
+        ``size`` is the whole read's length (the read-ahead asks for at least
+        that much) and ``remaining`` what is still missing of it (all a
+        non-sequential request asks for). Keeps a second read-ahead request
+        queued behind the head.
+        """
+        requests = self._requests
+        if requests and requests[0].offset + requests[0].got != position:
+            self._end_read()  # a read elsewhere, or read-ahead past a short answer
+        if not requests:
+            if position == self._read_end:
+                self._request(position, max(size, READ_AHEAD), True)
+            else:
+                self._request(position, remaining, False)
+        head = requests[0]
+        # A queued request is never complete: the one that completes is retired in _read.
+        if head.ahead and len(requests) == 1:
+            self._request(head.offset + head.length, head.length, True)
+        return head
+
     def _read(self, offset: int, view: memoryview) -> int:
+        """Fill ``view`` from ``offset``; short only at the end of the file.
+
+        The read that continues the previous one (``_read_end``) starts the
+        read-ahead stream: its request asks for at least :data:`READ_AHEAD`,
+        and while one read-ahead request is being received the next is sent,
+        so two are always in flight. A read anywhere else asks for exactly
+        what it needs. Requests whose answers no longer line up with
+        ``offset`` are drained first, as is an open write stream.
+        """
         self._end_write()
         size = len(view)
         if not size:
             return 0
         total = 0
         while total < size:
-            position = offset + total
-            requests = self._requests
-            if requests and requests[0].offset + requests[0].got != position:
-                self._end_read()  # a read elsewhere, or read-ahead past a short answer
-            if not requests:
-                if position == self._read_end:
-                    self._request(position, max(size, READ_AHEAD), True)
-                else:
-                    self._request(position, size - total, False)
-            head = requests[0]
-            # A queued request is never complete: the one that completes is retired below.
-            if head.ahead and len(requests) == 1:
-                self._request(head.offset + head.length, head.length, True)
+            head = self._head(offset + total, size, size - total)
             count = self._pull(view[total:])
             total += count
             if not count:
@@ -508,9 +639,11 @@ class DcapFile(PluginFile):
         return total
 
     def readinto(self, buffer: memoryview | bytearray) -> int:
+        """Read at the cursor straight into ``buffer``; the copy engine's path."""
         view = memoryview(buffer).cast("B")
 
         def action() -> int:
+            """The read and the cursor's move, as one step under the lock."""
             count = self._read(self.position, view)
             self.position += count
             return count
@@ -518,12 +651,18 @@ class DcapFile(PluginFile):
         return self._run(action)
 
     def read(self, size: int) -> bytes:
+        """Up to ``size`` bytes at the cursor; ``b""`` at the end of the file."""
         buffer = bytearray(size)
         count = self.readinto(buffer)
         del buffer[count:]
         return bytes(buffer)
 
     def pread(self, offset: int, size: int) -> bytes:
+        """Up to ``size`` bytes at ``offset``, leaving the cursor alone.
+
+        Positional reads that follow one another still use the read-ahead
+        stream: sequential is decided by offset, not by cursor.
+        """
         buffer = bytearray(size)
         count = self._run(lambda: self._read(offset, memoryview(buffer)))
         del buffer[count:]
@@ -532,6 +671,15 @@ class DcapFile(PluginFile):
     # -- writing -------------------------------------------------------------------
 
     def _write(self, offset: int, data: bytes | bytearray | memoryview) -> int:
+        """Append ``data`` at ``offset`` to the open ``WRITE`` stream, opening one if needed.
+
+        A write that continues the stream just sends blocks. Otherwise the
+        stream is ended and a new one opened: ``WRITE`` where the mover's
+        pointer already is, ``SEEK_AND_WRITE`` anywhere else (which also
+        drops the running ADLER32, as libdcap does, since the pool could not
+        check a checksum of out-of-order data). Nothing is acknowledged per
+        block; a refused write surfaces in the ``FIN`` that ends the stream.
+        """
         view = memoryview(data).cast("B")
         if not len(view):
             return 0
@@ -563,7 +711,10 @@ class DcapFile(PluginFile):
         return len(view)
 
     def write(self, data: bytes | bytearray | memoryview) -> int:
+        """Write all of ``data`` at the cursor and advance it."""
+
         def action() -> int:
+            """The write and the cursor's move, as one step under the lock."""
             count = self._write(self.position, data)
             self.position += count
             return count
@@ -571,11 +722,13 @@ class DcapFile(PluginFile):
         return self._run(action)
 
     def pwrite(self, data: bytes | bytearray | memoryview, offset: int) -> int:
+        """Write all of ``data`` at ``offset``, leaving the cursor alone."""
         return self._run(lambda: self._write(offset, data))
 
     # -- size ----------------------------------------------------------------------
 
     def _locate(self) -> int:
+        """``LOCATE``: the mover's ``[size:q][position:q]``, once the channel is idle."""
         self._end_read()
         self._end_write()
         self._channel.send(HEADER.pack(4, IOCMD_LOCATE))
@@ -593,6 +746,12 @@ class DcapFile(PluginFile):
     # -- closing -------------------------------------------------------------------
 
     def _close(self) -> int:
+        """``CLOSE`` on the data channel, then the door's verdict on the control line.
+
+        ``CLOSE`` carries the ADLER32 while the writes were sequential from
+        the start (a reader's ``_adler`` is ``None``), and the pool compares
+        it with what it stored. Returns 0 for :meth:`_run`.
+        """
         self._end_read()
         self._end_write()
         if self._adler is not None:
@@ -621,6 +780,7 @@ class DcapFile(PluginFile):
         except GError as exc:
             error = exc
         finally:
+            self._door.unregister(self._abort)
             self._channel.close()
             self._door.release(self._conn, reusable=error is None)
         if error is not None and self.writable:

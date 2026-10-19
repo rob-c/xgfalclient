@@ -5,15 +5,40 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      xrdclient-ref:
+        description: rob-c/xrdclient candidate ref
+        default: main
+      xrdcore-ref:
+        description: rob-c/xrdcore candidate ref
+        default: main
+      xrdsec-ref:
+        description: rob-c/xrdsec candidate ref
+        default: main
+      xrdhttp-ref:
+        description: rob-c/xrdhttp candidate ref
+        default: main
+      devtools-ref:
+        description: rob-c/xrd-devtools ref whose gates and tools run
+        default: main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   FORCE_COLOR: "1"
-  # Test the coordinated candidate; publish validates the exact PyPI pin.
-  XRDCLIENT_REF: main
+  # Test the coordinated candidates (xrd-devtools' candidates action):
+  # xrdclient and the three libraries xgfalclient is built on. publish.yml
+  # validates the exact PyPI pins instead.
+  XRDCLIENT_REF: ${{ inputs.xrdclient-ref || 'main' }}
+  XRDCORE_REF: ${{ inputs.xrdcore-ref || 'main' }}
+  XRDSEC_REF: ${{ inputs.xrdsec-ref || 'main' }}
+  XRDHTTP_REF: ${{ inputs.xrdhttp-ref || 'main' }}
+  DEVTOOLS_REF: ${{ inputs.devtools-ref || 'main' }}
 
 jobs:
   portable-wheels:
@@ -21,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9.2", "3.14"]
+        python-version: ["3.11", "3.14"]
         platform:
           - manylinux_2_28_x86_64
           - manylinux_2_28_aarch64
@@ -31,18 +56,21 @@ jobs:
           - macosx_11_0_arm64
     steps:
       - uses: actions/checkout@v4
-      - name: Check out the shared-core candidate
-        uses: actions/checkout@v4
-        with:
-          repository: rob-c/xrdclient
-          ref: ${{ env.XRDCLIENT_REF }}
-          path: .dependencies/xrdclient
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Check out (and build) the release-chain candidates
+        uses: rob-c/xrd-devtools/.github/actions/candidates@main
+        with:
+          xrdclient-ref: ${{ env.XRDCLIENT_REF }}
+          xrdcore-ref: ${{ env.XRDCORE_REF }}
+          xrdsec-ref: ${{ env.XRDSEC_REF }}
+          xrdhttp-ref: ${{ env.XRDHTTP_REF }}
+          devtools-ref: ${{ env.DEVTOOLS_REF }}
+          packages: xrdcore xrdsec xrdhttp xrdclient
+          install: wheels
       - run: >-
           python -m pip install --only-binary=:all: build
-      - run: python -m build --wheel .dependencies/xrdclient
       - run: python -m build --wheel
       - name: Resolve base dependencies without source builds
         # The resolver's interpreter must match the target: pip evaluates
@@ -51,7 +79,8 @@ jobs:
           python -m pip download --only-binary=:all:
           --implementation cp --python-version ${{ matrix.python-version }}
           --platform ${{ matrix.platform }}
-          --dest wheelhouse dist/*.whl .dependencies/xrdclient/dist/*.whl
+          --find-links .dependencies/wheels
+          --dest wheelhouse dist/*.whl .dependencies/wheels/*.whl
 
   portable-install:
     runs-on: ${{ matrix.os }}
@@ -59,33 +88,36 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.9", "3.14"]
+        python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
-      - name: Check out the shared-core candidate
-        uses: actions/checkout@v4
-        with:
-          repository: rob-c/xrdclient
-          ref: ${{ env.XRDCLIENT_REF }}
-          path: .dependencies/xrdclient
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Check out (and build) the release-chain candidates
+        uses: rob-c/xrd-devtools/.github/actions/candidates@main
+        with:
+          xrdclient-ref: ${{ env.XRDCLIENT_REF }}
+          xrdcore-ref: ${{ env.XRDCORE_REF }}
+          xrdsec-ref: ${{ env.XRDSEC_REF }}
+          xrdhttp-ref: ${{ env.XRDHTTP_REF }}
+          devtools-ref: ${{ env.DEVTOOLS_REF }}
+          packages: xrdcore xrdsec xrdhttp xrdclient
+          install: wheels
       - run: >-
           python -m pip install --only-binary=:all: build
-      - run: python -m build --wheel .dependencies/xrdclient
       - run: python -m build --wheel
       - name: Install and use the wheel in a clean environment
         run: |
           python -m venv /tmp/xgfalclient-portable
-          /tmp/xgfalclient-portable/bin/python -m pip install --only-binary=:all: dist/*.whl .dependencies/xrdclient/dist/*.whl
+          /tmp/xgfalclient-portable/bin/python -m pip install --only-binary=:all: dist/*.whl .dependencies/wheels/*.whl
           /tmp/xgfalclient-portable/bin/python -m pip check
           /tmp/xgfalclient-portable/bin/python -c 'from importlib.util import find_spec; assert all(find_spec(name) is None for name in ("construct", "defusedxml", "gssapi", "krb5"))'
-          /tmp/xgfalclient-portable/bin/python -c 'import xgfalclient; from xgfalclient._xml import fromstring; assert fromstring(b"<doc/>").tag == "doc"'
+          /tmp/xgfalclient-portable/bin/python -c 'import xgfalclient, xrdcore.safexml; from xgfalclient._xml import fromstring; assert fromstring is xrdcore.safexml.fromstring and fromstring(b"<doc/>").tag == "doc"'
       - name: Native macOS Kerberos also installs from wheels
         if: runner.os == 'macOS'
         run: |
-          /tmp/xgfalclient-portable/bin/python -m pip install --only-binary=:all: 'xgfalclient[krb5]'
+          /tmp/xgfalclient-portable/bin/python -m pip install --only-binary=:all: --find-links .dependencies/wheels "$(ls dist/*.whl)[krb5]"
           /tmp/xgfalclient-portable/bin/python -m pip check
           /tmp/xgfalclient-portable/bin/python -c 'import gssapi, krb5; assert krb5.init_context() is not None'
 
@@ -97,70 +129,96 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Check out the shared-core candidate
-        uses: actions/checkout@v4
-        with:
-          repository: rob-c/xrdclient
-          ref: ${{ env.XRDCLIENT_REF }}
-          path: .dependencies/xrdclient
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check out (and install) the release-chain candidates
+        uses: rob-c/xrd-devtools/.github/actions/candidates@main
+        with:
+          xrdclient-ref: ${{ env.XRDCLIENT_REF }}
+          xrdcore-ref: ${{ env.XRDCORE_REF }}
+          xrdsec-ref: ${{ env.XRDSEC_REF }}
+          xrdhttp-ref: ${{ env.XRDHTTP_REF }}
+          devtools-ref: ${{ env.DEVTOOLS_REF }}
+          packages: xrdcore xrdsec xrdhttp xrdclient
+          install: editable
       - name: Native Kerberos source-build prerequisites
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
-      - run: python -m pip install -e .dependencies/xrdclient -e ".[dev,krb5]"
+      - run: python -m pip install -e ".[dev,krb5]"
       - run: pytest -q tests/test_native_cache.py tests/test_portable_parsers.py
 
-  lint:
+  # ruff, mypy --strict, complexipy, the take-over scorecard and the
+  # configuration conformance check.
+  static:
+    uses: rob-c/xrd-devtools/.github/workflows/static.yml@main
+    with:
+      packages: xrdcore xrdsec xrdhttp xrdclient
+      xrdclient-ref: ${{ inputs.xrdclient-ref || 'main' }}
+      xrdcore-ref: ${{ inputs.xrdcore-ref || 'main' }}
+      xrdsec-ref: ${{ inputs.xrdsec-ref || 'main' }}
+      xrdhttp-ref: ${{ inputs.xrdhttp-ref || 'main' }}
+      devtools-ref: ${{ inputs.devtools-ref || 'main' }}
+      paths: src tests benchmarks
+
+  # No function duplicated across the chain; every repository's configuration
+  # is the standard. This commit stands in for xgfalclient's main.
+  chain:
+    uses: rob-c/xrd-devtools/.github/workflows/chain.yml@main
+    with:
+      xgfalclient-ref: ${{ github.sha }}
+      devtools-ref: ${{ inputs.devtools-ref || 'main' }}
+
+  package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out the shared-core candidate
-        uses: actions/checkout@v4
-        with:
-          repository: rob-c/xrdclient
-          ref: ${{ env.XRDCLIENT_REF }}
-          path: .dependencies/xrdclient
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e .dependencies/xrdclient -e ".[dev]"
-      - name: ruff lint and security checks
-        run: ruff check src tests benchmarks
-      - name: ruff format
-        run: ruff format --check src tests benchmarks
-      - name: mypy --strict
-        run: mypy
-      - name: cognitive-complexity ratchet
-        run: |
-          complexipy --quiet
-          git diff --exit-code -- complexipy-snapshot.json
+      - name: Check out (and install) the release-chain candidates
+        uses: rob-c/xrd-devtools/.github/actions/candidates@main
+        with:
+          xrdclient-ref: ${{ env.XRDCLIENT_REF }}
+          xrdcore-ref: ${{ env.XRDCORE_REF }}
+          xrdsec-ref: ${{ env.XRDSEC_REF }}
+          xrdhttp-ref: ${{ env.XRDHTTP_REF }}
+          devtools-ref: ${{ env.DEVTOOLS_REF }}
+          packages: xrdcore xrdsec xrdhttp xrdclient
+          install: editable
+      - run: pip install -e ".[dev]"
       - name: build and inspect distributions
         run: |
-          python -m build --wheel .dependencies/xrdclient
+          python -m build --wheel --outdir .dependencies/wheels .dependencies/xrdclient
+          for library in xrdcore xrdsec xrdhttp; do
+            python -m build --wheel --outdir .dependencies/wheels ".dependencies/$library"
+          done
           python -m build
           twine check --strict dist/*
       - name: smoke-test the built wheel
         run: |
           python -m venv /tmp/xgfalclient-wheel
-          /tmp/xgfalclient-wheel/bin/python -m pip install dist/*.whl .dependencies/xrdclient/dist/*.whl
+          /tmp/xgfalclient-wheel/bin/python -m pip install dist/*.whl .dependencies/wheels/*.whl
           /tmp/xgfalclient-wheel/bin/python -c 'import importlib.metadata as m, gfal2, gfal2_util, xgfalclient; assert m.version("xgfalclient") == xgfalclient.VERSION; assert gfal2.get_version() == "2.23.5"; assert gfal2_util.__name__ == "gfal2_util"'
 
   condition-coverage:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out the shared-core candidate
-        uses: actions/checkout@v4
-        with:
-          repository: rob-c/xrdclient
-          ref: ${{ env.XRDCLIENT_REF }}
-          path: .dependencies/xrdclient
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e .dependencies/xrdclient -e ".[dev]"
+      - name: Check out (and install) the release-chain candidates
+        uses: rob-c/xrd-devtools/.github/actions/candidates@main
+        with:
+          xrdclient-ref: ${{ env.XRDCLIENT_REF }}
+          xrdcore-ref: ${{ env.XRDCORE_REF }}
+          xrdsec-ref: ${{ env.XRDSEC_REF }}
+          xrdhttp-ref: ${{ env.XRDHTTP_REF }}
+          devtools-ref: ${{ env.DEVTOOLS_REF }}
+          packages: xrdcore xrdsec xrdhttp xrdclient
+          install: editable
+      - run: pip install -e ".[dev]"
       # Every short-circuit operand, conditional expression and comprehension
       # filter must be observed both ways. This complements line/branch coverage.
       - name: condition coverage
@@ -168,51 +226,41 @@ jobs:
           XGFAL_CONDCOV: "1"
         run: pytest -q -p no:cacheprovider -n auto -m "not interop" --timeout=300
 
+  # xrdclient owns root:// transport and xrdcore/xrdsec/xrdhttp the shared
+  # code; the interop tests want real grid servers in docker and skip
+  # themselves. Coverage is reported, not gated: pyproject's 100% holds for
+  # the full run with XGFAL_INTEROP=1, and each OS alone leaves the other's
+  # platform branches (and the interop-only lines) unvisited.
   test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
-        include:
-          - os: macos-latest
-            python-version: "3.12"
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check out the shared-core candidate
-        uses: actions/checkout@v4
-        with:
-          repository: rob-c/xrdclient
-          ref: ${{ env.XRDCLIENT_REF }}
-          path: .dependencies/xrdclient
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      # The required sibling owns both the shared core and root:// transport;
-      # the interop tests want real grid servers in docker and skip themselves.
-      - run: pip install -e .dependencies/xrdclient -e ".[dev]"
-      # Coverage is reported, not gated: pyproject's 100% holds for the full
-      # run with XGFAL_INTEROP=1, and each OS alone leaves the other's
-      # platform branches (and the interop-only lines) unvisited.
-      - name: pytest
-        run: >-
-          pytest -q -p no:cacheprovider -n auto --timeout=300
-          --cov --cov-report=term-missing --cov-fail-under=0
+    uses: rob-c/xrd-devtools/.github/workflows/tests.yml@main
+    with:
+      packages: xrdcore xrdsec xrdhttp xrdclient
+      xrdclient-ref: ${{ inputs.xrdclient-ref || 'main' }}
+      xrdcore-ref: ${{ inputs.xrdcore-ref || 'main' }}
+      xrdsec-ref: ${{ inputs.xrdsec-ref || 'main' }}
+      xrdhttp-ref: ${{ inputs.xrdhttp-ref || 'main' }}
+      devtools-ref: ${{ inputs.devtools-ref || 'main' }}
+      os: '["ubuntu-latest"]'
+      include: '[{"os": "macos-latest", "python-version": "3.12"}]'
+      pytest-args: --timeout=300 --cov --cov-report=term-missing --cov-fail-under=0
 
   docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out the shared-core candidate
-        uses: actions/checkout@v4
-        with:
-          repository: rob-c/xrdclient
-          ref: ${{ env.XRDCLIENT_REF }}
-          path: .dependencies/xrdclient
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e .dependencies/xrdclient -e ".[docs]"
+      - name: Check out (and install) the release-chain candidates
+        uses: rob-c/xrd-devtools/.github/actions/candidates@main
+        with:
+          xrdclient-ref: ${{ env.XRDCLIENT_REF }}
+          xrdcore-ref: ${{ env.XRDCORE_REF }}
+          xrdsec-ref: ${{ env.XRDSEC_REF }}
+          xrdhttp-ref: ${{ env.XRDHTTP_REF }}
+          devtools-ref: ${{ env.DEVTOOLS_REF }}
+          packages: xrdcore xrdsec xrdhttp xrdclient
+          install: editable
+      - run: pip install -e ".[docs]"
       - name: build documentation without warnings
         run: mkdocs build --strict

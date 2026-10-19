@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -12,8 +12,10 @@ import pytest
 import xgfalclient
 from xgfalclient.errors import GError
 from xgfalclient.plugins.srm import client as srm_client
+from xgfalclient.plugins.srm.plugin import SRMFile
 from xgfalclient.testing.pki import PKI
 from xgfalclient.testing.srm import Space, SRMServer
+from xgfalclient.types import Dirent, Stat
 
 GROUP = "SRM PLUGIN"
 
@@ -55,9 +57,9 @@ def sctx(ctx: xgfalclient.Gfal2Context) -> xgfalclient.Gfal2Context:
     return ctx
 
 
-def fails(code: int, function: object, *args: object) -> GError:
+def fails(code: int, function: Callable[..., object], *args: object) -> GError:
     with pytest.raises(GError) as caught:
-        function(*args)  # type: ignore[operator]
+        function(*args)
     assert caught.value.code == code, caught.value
     return caught.value
 
@@ -103,9 +105,13 @@ def test_listdir_and_opendir(sctx: xgfalclient.Gfal2Context, srm: SRMServer) -> 
     fails(errno.ENOENT, sctx.listdir, srm.url("/nope"))
 
 
-def _readpp(ctx: xgfalclient.Gfal2Context, url: str) -> list[tuple[object, object]]:
+def _readpp(ctx: xgfalclient.Gfal2Context, url: str) -> list[tuple[Dirent, Stat]]:
     handle = ctx.opendir(url)
-    return list(iter(handle.readpp, (None, None)))
+    found = []
+    for entry, info in iter(handle.readpp, (None, None)):
+        assert entry is not None and info is not None
+        found.append((entry, info))
+    return found
 
 
 def test_listing_in_chunks(
@@ -215,6 +221,7 @@ def test_unlink_bulk(sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Path)
     assert srm.operations() == ["srmRm"]  # one request for the endpoint
     srm.inject("srmRm", srm.status_reply("srmRm", "SRM_AUTHORIZATION_FAILURE"))
     results = sctx.unlink([srm.url("/a"), srm.url("/b")])
+    assert isinstance(results, list)
     assert [result.code for result in results if result is not None] == [errno.EACCES] * 2
     srm.inject("srmRm", srm.status_reply("srmRm", "SRM_SUCCESS"))
     assert sctx.unlink([srm.url("/data/sub/a")]) == [None]
@@ -471,7 +478,9 @@ def test_write_with_a_size(sctx: xgfalclient.Gfal2Context, srm: SRMServer, root:
 
 def test_write_failures(sctx: xgfalclient.Gfal2Context, srm: SRMServer, root: Path) -> None:
     handle = sctx.open(srm.url("/data/new"), "w")
-    inner = handle._file.inner  # type: ignore[attr-defined]
+    remote = handle._file
+    assert isinstance(remote, SRMFile)
+    inner = remote.inner
     inner.close()  # the TURL goes away under us
     fails(errno.EINVAL, handle.write, "x")  # the file plugin's ValueError, as the context maps it
     handle.close()

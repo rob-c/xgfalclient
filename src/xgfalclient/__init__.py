@@ -1,6 +1,8 @@
-"""xgfalclient: gfal2, in pure Python.
+"""xgfalclient: gfal2, in Python 3.
 
-A drop-in for the ``gfal2`` Python bindings, with no C library underneath::
+A drop-in for the ``gfal2`` Python bindings, with no gfal2, davix, Globus or
+XRootD C library underneath - only ``xrdclient`` and a small set of maintained
+general-purpose libraries installed from wheels::
 
     import xgfalclient as gfal2
 
@@ -11,7 +13,7 @@ A drop-in for the ``gfal2`` Python bindings, with no C library underneath::
 The protocols are plugins, as in gfal2: ``http``/``https``/``dav``/``davs``
 (WebDAV, HTTP third-party copy, the WLCG tape REST API), ``s3``/``s3s`` and
 ``gcloud``/``gclouds`` (object stores), ``root``/``roots`` (XRootD, through
-``xrdclient``, itself pure Python), ``gsiftp``/``ftp`` (GridFTP with GSI),
+``xrdclient``, the sibling Python client), ``gsiftp``/``ftp`` (GridFTP with GSI),
 ``srm`` (SRM v2.2), ``sftp``, ``dcap``/``gsidcap``/``kdcap`` (dCache),
 ``lfc`` (the LCG File Catalog), ``file`` and ``mock``.
 
@@ -21,6 +23,18 @@ bindings' ``__version__`` (``1.13.1``) and gfal2's ``get_version()``
 (``2.23.5``). Where a real python3-gfal2 would win on ``sys.path``,
 :func:`install_as_gfal2` installs that same module object explicitly.
 This package's own version is :data:`VERSION`.
+
+Package map, for a new reader: :mod:`.context` (the ``Gfal2Context`` and
+dispatch), :mod:`.plugin` (the plugin contract) and :mod:`.plugins` (which
+plugin serves which scheme), :mod:`.transfer` (the copy sequence),
+:mod:`.options`/:mod:`.creds` (configuration and credentials),
+:mod:`.types`/:mod:`.enums`/:mod:`.errors`/:mod:`.events` (the bindings'
+records), :mod:`.cli` (the ``gfal-*`` commands) and :mod:`.crypto`.
+
+Importing this package is cheap by contract: no plugin, no TLS and no
+xrdclient module is imported until a URL needs it
+(``tests/test_import_cost.py``). Keep new top-level imports here to modules
+that are themselves import-light.
 """
 
 from __future__ import annotations
@@ -40,16 +54,18 @@ from .transfer import TransferParameters
 from .types import Dirent, Stat
 
 __all__ = [
-    "GError",
-    "Gfal2Context",
+    "VERSION",
     "Credential",
     "DirectoryType",
     "Dirent",
     "FileType",
+    "GError",
+    "Gfal2Context",
     "GfaltEvent",
     "NullHandler",
     "Stat",
     "TransferParameters",
+    "__version__",
     "checksum_mode",
     "creat_context",
     "cred_clean",
@@ -60,8 +76,6 @@ __all__ = [
     "install_as_gfal2",
     "set_verbose",
     "verbose_level",
-    "__version__",
-    "VERSION",
 ]
 
 #: xgfalclient's own release (``gfal2.__version__`` is the bindings' it replaces).
@@ -73,32 +87,49 @@ NullHandler = logging.NullHandler
 
 
 def get_version() -> str:
-    """The gfal2 release this reproduces, as ``gfal2.get_version()`` reports."""
+    """The gfal2 release this reproduces, as ``gfal2.get_version()`` reports.
+
+    The C library's version, not the bindings' (``gfal2.__version__``) nor
+    this package's (:data:`VERSION`): programs gate features on it.
+    """
     return GFAL2_VERSION
 
 
 def set_verbose(level: int) -> int:
-    """Set how much gfal2 logs to the ``gfal2`` logger; its level is left alone."""
+    """Set how much gfal2 logs to the ``gfal2`` logger; its level is left alone.
+
+    ``gfal2.set_verbose``: ``level`` is a :class:`verbose_level` (or its
+    int). An unknown value lets everything through (DEBUG). Process-wide,
+    like gfal2's: there is one ``gfal2`` logger.
+    """
     _log.set_threshold(_log.LEVELS.get(int(level), logging.DEBUG))
     return 0
 
 
 def _deprecated(replacement: str) -> None:
-    # The bindings print this to stderr rather than warn.
+    """Print python3-gfal2's deprecation notice for a module-level credential call.
+
+    To stderr rather than as a ``DeprecationWarning``: that is what
+    python3-gfal2 does, and scripts that filter warnings would otherwise
+    see a difference.
+    """
     sys.stderr.write(f"Deprecated: Please use context.{replacement}() instead!\n")
 
 
 def cred_new(type: str, value: str) -> Credential:
+    """python3-gfal2's deprecated ``gfal2.cred_new``, mirrored: a :class:`Credential`."""
     _deprecated("cred_new")
     return Credential(type, value)
 
 
 def cred_set(context: Gfal2Context, prefix: str, credential: Credential) -> int:
+    """python3-gfal2's deprecated ``gfal2.cred_set(ctx, ...)``, mirrored: ``ctx.cred_set``."""
     _deprecated("cred_set")
     return context.cred_set(prefix, credential)
 
 
 def cred_clean(context: Gfal2Context) -> int:
+    """python3-gfal2's deprecated ``gfal2.cred_clean(ctx)``, mirrored: ``ctx.cred_clean``."""
     _deprecated("cred_clean")
     return context.cred_clean()
 
@@ -113,6 +144,10 @@ def _gfal2_module(module: ModuleType | None = None) -> ModuleType:
 
     ``src/gfal2/__init__.py`` passes itself in to be filled; otherwise a
     module is made. Either way the first one is the one, from then on.
+
+    One object matters because exception classes and enum members are
+    compared by identity: ``except gfal2.GError`` must catch what
+    ``xgfalclient`` raises, whichever way ``gfal2`` was imported.
     """
     global _GFAL2
     if _GFAL2 is None:
@@ -120,14 +155,18 @@ def _gfal2_module(module: ModuleType | None = None) -> ModuleType:
         for name in __all__:
             if name not in ("install_as_gfal2", "VERSION", "__version__"):
                 setattr(_GFAL2, name, globals()[name])
-        _GFAL2.__version__ = GFAL2_PYTHON_VERSION  # type: ignore[attr-defined]
+        vars(_GFAL2)["__version__"] = GFAL2_PYTHON_VERSION
         # Tracebacks print ``gfal2.GError``, and pickles name it so.
         GError.__module__ = "gfal2"
     return _GFAL2
 
 
 def install_as_gfal2() -> ModuleType:
-    """Make ``import gfal2`` load this API, even with a real python3-gfal2 installed."""
+    """Make ``import gfal2`` load this API, even with a real python3-gfal2 installed.
+
+    Call it before anything imports ``gfal2``; a module that already did
+    keeps whatever it got. Answers the installed module.
+    """
     module = _gfal2_module()
     sys.modules["gfal2"] = module
     return module

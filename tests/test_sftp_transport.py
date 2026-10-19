@@ -5,12 +5,15 @@ from __future__ import annotations
 import errno
 import os
 import socket
+import threading
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from xgfalclient.crypto import ciphers
-from xgfalclient.crypto.sshkeys import KnownHosts, PrivateKey, load_private
+from xgfalclient.crypto.sshkeys import KnownHosts, PrivateKey, load_private, string, uint32
 from xgfalclient.errors import GError
 from xgfalclient.plugins.sftp import ssh
 from xgfalclient.plugins.sftp.client import SFTPClient
@@ -31,19 +34,31 @@ def sftp_root(tmp_path: Path) -> Path:
 
 
 def _endpoint(tmp_path: Path, **kw: object) -> Endpoint:
-    defaults: dict[str, object] = dict(
-        host="testhost",
-        port=22,
-        user="alice",
-        known_hosts=str(tmp_path / "known_hosts"),
-        strict_host_keys="accept-new",
-    )
+    defaults: dict[str, Any] = {
+        "host": "testhost",
+        "port": 22,
+        "user": "alice",
+        "known_hosts": str(tmp_path / "known_hosts"),
+        "strict_host_keys": "accept-new",
+    }
     defaults.update(kw)
-    return Endpoint(**defaults)  # type: ignore[arg-type]
+    return Endpoint(**defaults)
 
 
-def _dial(server: SSHServer, endpoint: Endpoint, auth: ssh.Auth, **kw: object) -> SFTPClient:
-    transport = ssh.connect(endpoint, auth, sock=server.pair(), **kw)  # type: ignore[arg-type]
+def _rsa_user_key() -> PrivateKey:
+    """The test RSA user key, as a signing key."""
+    rsa = load_private(KEY_0).rsa
+    assert rsa is not None
+    return PrivateKey.from_rsa(rsa)
+
+
+def _dial(server: SSHServer, endpoint: Endpoint, auth: ssh.Auth, **kw: Any) -> SFTPClient:
+    sock = server.pair()
+    try:
+        transport = ssh.connect(endpoint, auth, sock=sock, **kw)
+    except BaseException:
+        sock.close()  # a caller's socket is the caller's to close on failure
+        raise
     client = SFTPClient(transport)
     client.handshake()
     return client
@@ -59,14 +74,17 @@ def test_password_auth_end_to_end(sftp_root: Path, hostkey: PrivateKey) -> None:
     assert (sftp_root / "known_hosts").exists()
 
 
-@pytest.mark.parametrize("kind", ["ed25519", "rsa", "ecdsa"])
+@pytest.mark.parametrize(
+    "kind",
+    ["ed25519", "rsa", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"],
+)
 def test_host_key_types(sftp_root: Path, kind: str) -> None:
     if kind == "ed25519":
         hostkey = PrivateKey.from_ed25519_seed(os.urandom(32))
     elif kind == "rsa":
         hostkey = load_private(KEY_0)
     else:
-        hostkey = PrivateKey.from_ecdsa(0x1234567890ABCDEF1234567890ABCDEF)
+        hostkey = PrivateKey.from_ecdsa(0x1234567890ABCDEF1234567890ABCDEF, kind=kind)
     server = SSHServer(SFTPServer(sftp_root), hostkey, username="alice", password="pw")
     endpoint = _endpoint(sftp_root, password="pw")
     client = _dial(server, endpoint, ssh.Auth(username="alice", password="pw"))
@@ -86,7 +104,7 @@ def test_public_key_auth(sftp_root: Path, hostkey: PrivateKey) -> None:
 
 
 def test_rsa_public_key_with_ext_info(sftp_root: Path, hostkey: PrivateKey) -> None:
-    userkey = PrivateKey.from_rsa(load_private(KEY_0).rsa)  # type: ignore[arg-type]
+    userkey = _rsa_user_key()
     server = SSHServer(
         SFTPServer(sftp_root),
         hostkey,
@@ -147,7 +165,11 @@ def test_password_offered_to_a_key_only_server(sftp_root: Path, hostkey: Private
     ],
 )
 def test_kex_and_mac_matrix(
-    sftp_root: Path, hostkey: PrivateKey, monkeypatch: pytest.MonkeyPatch, kex: tuple, macs: tuple
+    sftp_root: Path,
+    hostkey: PrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    kex: tuple[str, ...],
+    macs: tuple[str, ...],
 ) -> None:
     monkeypatch.setattr(ssh, "_KEX_ALGS", kex)
     monkeypatch.setattr(ssh, "_MACS", macs)
@@ -169,11 +191,19 @@ def test_aes_ctr_via_pure_backend(sftp_root: Path, hostkey: PrivateKey) -> None:
     client.close()
 
 
-def test_bulk_transfer_and_rekey(tmp_path: Path, hostkey: PrivateKey) -> None:
+@pytest.mark.parametrize("strict", [True, False])
+def test_bulk_transfer_and_rekey(tmp_path: Path, hostkey: PrivateKey, strict: bool) -> None:
+    # Strict KEX resets the sequence numbers at the rekey's NEWKEYS too; were
+    # the two sides to disagree on that, the first MAC after it would fail.
     payload = os.urandom(3_000_000)
     (tmp_path / "big.bin").write_bytes(payload)
     server = SSHServer(
-        SFTPServer(tmp_path), hostkey, username="alice", password="pw", rekey_after=3
+        SFTPServer(tmp_path),
+        hostkey,
+        username="alice",
+        password="pw",
+        rekey_after=3,
+        strict_kex=strict,
     )
     endpoint = _endpoint(tmp_path, password="pw")
     from xgfalclient.plugins.sftp import protocol as fx
@@ -374,7 +404,7 @@ def test_server_refuses_other_channel_requests(
     sftp_root: Path, hostkey: PrivateKey, monkeypatch: pytest.MonkeyPatch, ours: str, theirs: str
 ) -> None:
     # The test server grants only "subsystem sftp": ask for anything else.
-    real = ssh.string
+    real = string
     monkeypatch.setattr(ssh, "string", lambda v: real(theirs if v == ours else v))
     server = SSHServer(SFTPServer(sftp_root), hostkey, username="alice", password="pw")
     endpoint = _endpoint(sftp_root, password="pw")
@@ -384,7 +414,7 @@ def test_server_refuses_other_channel_requests(
 
 def test_rsa_key_without_ext_info(sftp_root: Path, hostkey: PrivateKey) -> None:
     # No server-sig-algs: the RSA algorithm falls back to the key's default.
-    userkey = PrivateKey.from_rsa(load_private(KEY_0).rsa)  # type: ignore[arg-type]
+    userkey = _rsa_user_key()
     server = SSHServer(
         SFTPServer(sftp_root), hostkey, username="alice", authorized_keys=(userkey.public,)
     )
@@ -420,8 +450,6 @@ def test_handshake_faults(sftp_root: Path, hostkey: PrivateKey, fault: str, matc
 @pytest.mark.parametrize(
     "fault",
     [
-        "ignore_before_kexinit",
-        "ignore_before_ecdh",
         "ignore_before_subsystem",
         "ignore_before_open",
         "ignore_pre_auth",
@@ -446,6 +474,146 @@ def test_tolerated_noise(sftp_root: Path, hostkey: PrivateKey, fault: str) -> No
     client.close()
 
 
+@pytest.mark.parametrize(
+    "fault", ["ignore_before_kexinit", "ignore_before_ecdh", "ignore_before_newkeys"]
+)
+def test_kex_noise_tolerated_without_strict_kex(
+    sftp_root: Path, hostkey: PrivateKey, fault: str
+) -> None:
+    # A pre-9.6 server (no kex-strict-s marker): IGNORE may appear anywhere
+    # in the clear handshake (RFC 4253 11.2), so the client skips it.
+    server = SSHServer(
+        SFTPServer(sftp_root),
+        hostkey,
+        username="alice",
+        password="pw",
+        fault=fault,
+        strict_kex=False,
+    )
+    client = _dial(server, _fault_endpoint(sftp_root), ssh.Auth(username="alice", password="pw"))
+    assert client.stat(b"/hello.txt").size == 12
+    client.close()
+    assert server.strict_negotiated == [False]
+
+
+@pytest.mark.parametrize(
+    ("fault", "match"),
+    [
+        ("ignore_before_kexinit", "KEXINIT was not the first packet"),
+        ("ignore_before_ecdh", "unexpected message 2 during the initial key exchange"),
+        ("ignore_before_newkeys", "unexpected message 2 during the initial key exchange"),
+    ],
+)
+def test_strict_kex_rejects_injected_messages(
+    sftp_root: Path, hostkey: PrivateKey, fault: str, match: str
+) -> None:
+    # The Terrapin attack (CVE-2023-48795) injects an IGNORE into the clear
+    # handshake to shift the client's receive sequence number, then deletes
+    # the first encrypted packet. Under strict KEX that IGNORE is fatal.
+    server = SSHServer(SFTPServer(sftp_root), hostkey, username="alice", password="pw", fault=fault)
+    with pytest.raises(GError, match=f"strict KEX violation: {match}") as caught:
+        _dial(server, _fault_endpoint(sftp_root), ssh.Auth(username="alice", password="pw"))
+    assert caught.value.code == errno.EPROTO
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_strict_kex_resets_sequence_numbers(
+    sftp_root: Path, hostkey: PrivateKey, strict: bool
+) -> None:
+    server = SSHServer(
+        SFTPServer(sftp_root), hostkey, username="alice", password="pw", strict_kex=strict
+    )
+    transport = ssh.connect(
+        _fault_endpoint(sftp_root), ssh.Auth(username="alice", password="pw"), sock=server.pair()
+    )
+    try:
+        # Each side has sent four packets since NEWKEYS (SERVICE_REQUEST,
+        # USERAUTH_REQUEST, CHANNEL_OPEN, CHANNEL_REQUEST; and their four
+        # answers) and nothing more until the SFTP handshake. Without strict
+        # KEX the numbers also count the three clear handshake packets
+        # (KEXINIT, the ECDH message, NEWKEYS) each way.
+        assert transport._strict_kex is strict
+        expected = 4 if strict else 7
+        assert (transport._out_seq, transport._in_seq) == (expected, expected)
+        client = SFTPClient(transport)
+        client.handshake()
+        assert client.stat(b"/hello.txt").size == 12
+    finally:
+        transport.close()
+    assert server.strict_negotiated == [strict]
+
+
+def test_strict_kex_marker_only_in_the_first_kexinit() -> None:
+    transport = ssh.SSHTransport(Endpoint(host="h"), ssh.Auth(username="a"), socket.socket())
+    try:
+        initial = ssh.SSHTransport._parse_kexinit(transport._build_kexinit(True))[0]
+        rekey = ssh.SSHTransport._parse_kexinit(transport._build_kexinit(False))[0]
+    finally:
+        transport._sock.close()
+    assert ssh.STRICT_KEX_CLIENT in initial
+    assert ssh.STRICT_KEX_CLIENT not in rekey
+
+
+def test_changed_host_key_caught_on_a_non_default_port(
+    sftp_root: Path, hostkey: PrivateKey
+) -> None:
+    # accept-new records "[testhost]:2222 ..."; the next connection must find
+    # that entry - one record, not one per connection - and a different key
+    # behind the same host and port is refused as changed.
+    endpoint = _fault_endpoint(sftp_root, port=2222)
+    auth = ssh.Auth(username="alice", password="pw")
+    for _ in range(2):
+        server = SSHServer(SFTPServer(sftp_root), hostkey, username="alice", password="pw")
+        _dial(server, endpoint, auth).close()
+    assert (sftp_root / "known_hosts").read_text().count("[testhost]:2222 ") == 1
+    imposter = PrivateKey.from_ed25519_seed(os.urandom(32))
+    server = SSHServer(SFTPServer(sftp_root), imposter, username="alice", password="pw")
+    with pytest.raises(GError, match="HAS CHANGED"):
+        _dial(server, endpoint, auth)
+
+
+def test_strict_server_serves_a_client_without_strict_kex(
+    sftp_root: Path, hostkey: PrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A pre-strict client (no kex-strict-c marker, blind to the server's):
+    # strict KEX takes both markers, so the session runs in the old mode.
+    real_build = ssh.SSHTransport._build_kexinit
+    monkeypatch.setattr(
+        ssh.SSHTransport, "_build_kexinit", lambda self, initial: real_build(self, False)
+    )
+    monkeypatch.setattr(ssh.SSHTransport, "_begin_strict_kex", lambda self, algs: None)
+    server = SSHServer(SFTPServer(sftp_root), hostkey, username="alice", password="pw")
+    client = _dial(server, _fault_endpoint(sftp_root), ssh.Auth(username="alice", password="pw"))
+    assert client.stat(b"/hello.txt").size == 12
+    client.close()
+    assert server.strict_negotiated == [False]
+
+
+@pytest.mark.parametrize("where", ["before_kexinit", "before_ecdh"])
+def test_strict_kex_server_rejects_a_client_out_of_order(
+    sftp_root: Path, hostkey: PrivateKey, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    # The test server enforces PROTOCOL 1.10 on its side too: a client that
+    # puts anything ahead of its KEXINIT, or between KEXINIT and the ECDH
+    # message, is cut off (here our client, made to misbehave).
+    real_send = ssh.SSHTransport._send_packet
+    trigger = ssh.MSG_KEXINIT if where == "before_kexinit" else ssh.MSG_KEX_ECDH_INIT
+
+    def send(self: ssh.SSHTransport, *parts: bytes) -> None:
+        if bytes(parts[0][:1]) == bytes([trigger]) and self._session_id == b"":
+            real_send(self, bytes([ssh.MSG_IGNORE]) + string(b"stray"))
+        real_send(self, *parts)
+
+    monkeypatch.setattr(ssh.SSHTransport, "_send_packet", send)
+    server = SSHServer(SFTPServer(sftp_root), hostkey, username="alice", password="pw")
+    with pytest.raises(GError) as caught:
+        _dial(server, _fault_endpoint(sftp_root), ssh.Auth(username="alice", password="pw"))
+    # The server hangs up; the client sees that as EOF or a failed write,
+    # depending on which it was doing when the connection went.
+    assert caught.value.code in (errno.ECONNRESET, errno.EPIPE)
+    assert server.strict_negotiated == []
+
+
 def test_auth_unexpected_message(sftp_root: Path, hostkey: PrivateKey) -> None:
     server = SSHServer(
         SFTPServer(sftp_root), hostkey, username="alice", password="pw", fault="auth_unexpected"
@@ -467,7 +635,7 @@ def test_auth_banner_without_callback(sftp_root: Path, hostkey: PrivateKey) -> N
 def test_rsa_algorithm_fallback(sftp_root: Path, hostkey: PrivateKey) -> None:
     # The server advertises only non-RSA signature algorithms, so the RSA key
     # falls back to its own default rather than a negotiated one.
-    userkey = PrivateKey.from_rsa(load_private(KEY_0).rsa)  # type: ignore[arg-type]
+    userkey = _rsa_user_key()
     server = SSHServer(
         SFTPServer(sftp_root),
         hostkey,
@@ -563,7 +731,7 @@ def test_connect_cleanup_close_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom() -> None:
         raise OSError("close failed")
 
-    sock.close = boom  # type: ignore[method-assign]
+    monkeypatch.setattr(sock, "close", boom)
     monkeypatch.setattr(ssh, "_open_socket", lambda endpoint: sock)
     with pytest.raises(GError, match="unsupported server version"):
         ssh.connect(Endpoint(host="h", port=22, user="a"), ssh.Auth(username="a"))
@@ -654,3 +822,90 @@ def test_server_refuses_data_beyond_its_window(tmp_path: Path, hostkey: PrivateK
     transport.send(b"x" * 40_000)  # one packet over the server's 32 KiB maximum
     with pytest.raises(GError):
         client.stat(b"/")
+
+
+# -- malformed input after the handshake, bad key-exchange values, ~/.ssh ------
+
+
+def test_truncated_control_message_fails_waiters(
+    sftp_root: Path, hostkey: PrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A WINDOW_ADJUST cut short after its channel number: the reader thread
+    # must not die silently, leaving recv_into() waiting for ever.
+    from xgfalclient.testing._sftp import ssh as server_ssh
+
+    def truncated(conn: server_ssh._SSHServerConn) -> None:
+        conn.send_packet(bytes([ssh.MSG_CHANNEL_WINDOW_ADJUST]) + uint32(conn.remote_channel))
+
+    monkeypatch.setattr(server_ssh._SSHServerConn, "_emit_channel_faults", truncated)
+    server = SSHServer(SFTPServer(sftp_root), hostkey, username="alice", password="pw")
+    transport = ssh.connect(
+        _fault_endpoint(sftp_root), ssh.Auth(username="alice", password="pw"), sock=server.pair()
+    )
+    outcome: list[BaseException | int] = []
+
+    def wait() -> None:
+        try:
+            outcome.append(transport.recv_into(memoryview(bytearray(16))))
+        except BaseException as exc:  # recorded for the assertion below
+            outcome.append(exc)
+
+    waiter = threading.Thread(target=wait, daemon=True)
+    waiter.start()
+    waiter.join(5)
+    hung = waiter.is_alive()
+    transport.close()  # (wakes a hung waiter with end-of-stream)
+    waiter.join(5)
+    assert not hung, "recv_into was never woken"
+    (error,) = outcome
+    assert isinstance(error, GError) and error.code == errno.EPROTO
+    assert "SSH protocol error" in error.message
+
+
+@pytest.mark.parametrize(
+    ("server_public", "why"),
+    [(bytes(32), "all-zero"), (b"\x09" * 31, "32 bytes")],
+    ids=["low-order-point", "short"],
+)
+def test_bad_x25519_public_value_is_a_protocol_error(
+    sftp_root: Path,
+    hostkey: PrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    server_public: bytes,
+    why: str,
+) -> None:
+    # The server's Q_S is a low-order point (the shared secret comes out all
+    # zero, RFC 8731 section 3) or not 32 bytes: EPROTO, never a raw ValueError.
+    from xgfalclient.crypto import x25519
+    from xgfalclient.testing._sftp import transport as server_transport
+
+    def generate() -> tuple[bytes, bytes]:
+        private, _public = x25519.generate()
+        return private, server_public
+
+    fake = SimpleNamespace(generate=generate, x25519=x25519.x25519)
+    monkeypatch.setattr(server_transport, "_x25519", fake)
+    server = SSHServer(SFTPServer(sftp_root), hostkey, username="alice", password="pw")
+    with pytest.raises(GError) as caught:
+        _dial(server, _fault_endpoint(sftp_root), ssh.Auth(username="alice", password="pw"))
+    assert caught.value.code == errno.EPROTO
+    assert why in caught.value.message
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions")
+def test_created_ssh_directory_is_private(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, hostkey: PrivateKey
+) -> None:
+    # OpenSSH creates ~/.ssh 0700 and so must we when recording a first host key,
+    # whatever the umask; an existing directory's mode is left alone.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    old = os.umask(0o022)
+    try:
+        endpoint = Endpoint(host="h", port=22, user="alice", strict_host_keys="accept-new")
+        ssh._record_host_key(ssh._known_hosts_paths(endpoint), endpoint, hostkey.public)
+    finally:
+        os.umask(old)
+    assert ((home / ".ssh").stat().st_mode & 0o777) == 0o700
+    assert (home / ".ssh" / "known_hosts").read_text().startswith("h ")

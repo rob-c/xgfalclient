@@ -17,6 +17,21 @@ of the protocol:
   is an ``EOF`` block whose *offset* field carries the number of ``EOD``
   blocks to expect, one per data connection; globus folds ``EOF`` and
   ``EOD`` into one ``0x48`` block on the last connection.
+
+The client (:mod:`.control`, :mod:`.data`, :mod:`._base` and friends) and
+the test server (:mod:`xgfalclient.testing.gridftp`) both import from here,
+so a change of reading changes both sides at once - which is the point, and
+also why a wire bug here can hide from the in-tree tests: only
+``tests/test_gridftp_interop.py`` (a real globus server) can catch one.
+
+What a maintainer must not break:
+
+* :data:`_TEXT_ERRNO` is an ordered scan copied from gfal2; the first
+  needle that matches wins, so reordering it changes the ``errno`` returned.
+* The error *text* (:func:`reply_error`) is gfal2's byte for byte, double
+  spaces and trailing space included; the tests pin it.
+* Nothing here may do I/O or keep state: the data threads call these
+  functions concurrently.
 """
 
 from __future__ import annotations
@@ -33,40 +48,60 @@ from ...errors import ECOMM, GError
 from ...types import Stat
 
 __all__ = [
-    "Reply",
-    "errno_for_reply",
-    "reply_error",
-    "parse_pasv",
-    "parse_epsv",
-    "parse_spas",
-    "format_port",
-    "format_eprt",
-    "parse_facts",
-    "stat_from_facts",
-    "format_mdtm",
-    "parse_mdtm",
-    "parse_perf_marker",
     "BLOCK_HEADER",
+    "DESC_CLOSE",
     "DESC_EOD",
     "DESC_EOF",
-    "DESC_CLOSE",
+    "Reply",
     "check_path",
+    "errno_for_reply",
+    "format_eprt",
+    "format_mdtm",
+    "format_port",
+    "parse_epsv",
+    "parse_facts",
+    "parse_mdtm",
+    "parse_pasv",
+    "parse_perf_marker",
+    "parse_spas",
     "passive_address",
+    "reply_error",
+    "stat_from_facts",
 ]
 
-#: ``MODE E`` block header: descriptor, count, offset - all big-endian.
+#: ``MODE E`` block header (GFD.20): a one-byte descriptor, then the
+#: payload's byte count and its file offset as unsigned 64-bit integers, all
+#: big-endian - 17 bytes. The payload follows at once; there is no padding.
 BLOCK_HEADER = struct.Struct(">BQQ")
+#: Descriptor bit 64: the transfer's last block. Its *offset* field is not an
+#: offset but the number of ``EOD`` blocks the receiver must see in total.
 DESC_EOF = 0x40
+#: Descriptor bit 8: nothing more will come on *this* connection.
 DESC_EOD = 0x08
+#: Descriptor bit 4: the sender will close this connection rather than keep
+#: it cached for the next transfer. Neither side here caches data channels
+#: or sets this bit; the name is kept for readers of the descriptor.
 DESC_CLOSE = 0x04
 
 
 class Reply:
-    """One (possibly multi-line) FTP reply."""
+    """One (possibly multi-line) FTP reply (RFC 959 §4.2).
+
+    ``lines`` are kept exactly as the server sent them, code prefixes and
+    all, because gfal2's error messages quote a multi-line reply whole. On a
+    GSI session they are the *unwrapped* lines: :class:`~.control.Control`
+    decodes the ``631``/``632``/``633`` envelopes before a reply is built.
+    Code meaning by first digit (RFC 959 §4.2.1): ``1`` preliminary (``150``
+    opening data, ``111``/``112`` GridFTP markers, ``127`` delayed passive),
+    ``2`` done, ``3`` more input needed (``331`` after ``USER``, ``335``/
+    ``334`` during ``ADAT``, ``350`` after ``REST``), ``4`` transient and
+    ``5`` permanent failure.
+    """
 
     __slots__ = ("code", "lines")
 
     def __init__(self, code: int, lines: list[str]) -> None:
+        """Wrap a reply already split into lines; nothing is parsed or checked here."""
         self.code = code
         self.lines = lines
 
@@ -86,13 +121,17 @@ class Reply:
         return "\n".join(part for part in out if part)
 
     def __str__(self) -> str:
+        """``code text`` on one logical line set, as debug logs and events show it."""
         return f"{self.code} {self.text}"
 
     def __repr__(self) -> str:
+        """The raw lines, for test failure output."""
         return f"Reply({self.code}, {self.lines!r})"
 
 
 #: Reply text to ``errno``: gfal2's ``scan_errstring``, in its order and case.
+#: The needles are substrings, matched case-sensitively, first match wins.
+#: ``isk quota`` catches both "Disk quota" and "disk quota".
 _TEXT_ERRNO = (
     ("No such file", errno.ENOENT),
     ("not found", errno.ENOENT),
@@ -148,11 +187,19 @@ _EPSV = re.compile(r"\((.)(\d?)\1([^|()]*)\1(\d+)\1\)")
 
 
 def _protocol_error(what: str, text: str) -> GError:
+    """``EPROTO`` for a reply that does not carry the address it must."""
     return GError(f"Could not parse the {what} reply: {text!r}", errno.EPROTO)
 
 
 def parse_pasv(text: str) -> tuple[str, int]:
-    """``227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)`` to ``(host, port)``."""
+    """``227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)`` to ``(host, port)``.
+
+    RFC 1123 §4.1.2.6 tells clients to scan the reply for the six numbers
+    rather than expect a fixed format, so they are searched for, not anchored. The
+    port is ``p1 * 256 + p2``. Also reads globus's delayed ``127`` reply and
+    each line of a ``SPAS`` reply, which use the same six-number form.
+    ``EPROTO`` when there are no six numbers.
+    """
     found = _PASV.search(text)
     if found is None:
         raise _protocol_error("PASV", text)
@@ -161,7 +208,15 @@ def parse_pasv(text: str) -> tuple[str, int]:
 
 
 def parse_epsv(text: str) -> tuple[str, int]:
-    """``229 ... (|||port|)`` or ``(|2|::1|port|)`` to ``(host or "", port)``."""
+    """``229 ... (|||port|)`` or ``(|2|::1|port|)`` to ``(host or "", port)``.
+
+    RFC 2428 §3 says the reply carries only the port and the client connects
+    back to the control connection's peer; some servers fill the protocol
+    and address fields anyway, so both are accepted. The delimiter is
+    whatever character follows ``(`` (RFC 2428 recommends ``|`` but allows
+    any in the range 33-126), captured and back-referenced by :data:`_EPSV`.
+    An empty host is the caller's to replace (:func:`~.data.routable`).
+    """
     found = _EPSV.search(text)
     if found is None:
         raise _protocol_error("EPSV", text)
@@ -169,13 +224,23 @@ def parse_epsv(text: str) -> tuple[str, int]:
 
 
 def parse_spas(lines: list[str]) -> list[tuple[str, int]]:
-    """The stripes of a ``229-`` multi-line ``SPAS`` reply, in order."""
+    """The stripes of a ``229-`` multi-line ``SPAS`` reply, in order.
+
+    GFD.20's striped passive answer puts one ``h1,h2,h3,h4,p1,p2`` per
+    continuation line between ``229-Entering Striped Passive Mode`` and
+    ``229 End``; lines without six numbers are framing and are skipped. The
+    order matters: ``SPOR`` must name the stripes in the order the server
+    gave them. ``EPROTO`` if no line names a stripe.
+    """
     found = [parse_pasv(line) for line in lines if _PASV.search(line)]
     if not found:
         raise _protocol_error("SPAS", "\n".join(lines))
     return found
 
 
+# The PASV-plugin event readers follow gfal2's PASV plugin patterns rather
+# than the parsers above, so an event reports what gfal2 would report (except
+# the ``229`` misreading noted in :func:`passive_address`).
 _EVENT_27 = re.compile(
     r"[12]27 [^\[0-9]+\(?([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+)\)?", re.IGNORECASE
 )
@@ -184,6 +249,7 @@ _EVENT_29_V4 = re.compile(r"([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+
 
 
 def _dotted(found: re.Match[str]) -> tuple[str, int]:
+    """Six captured decimal groups to ``("h1.h2.h3.h4", p1 * 256 + p2)``."""
     parts = [int(value) for value in found.groups()]
     return ".".join(str(part) for part in parts[:4]), parts[4] * 256 + parts[5]
 
@@ -217,12 +283,20 @@ def passive_address(reply: Reply) -> tuple[str, int, bool] | None:
 
 
 def format_port(host: str, port: int) -> str:
-    """``PORT``'s argument: ``h1,h2,h3,h4,p1,p2``."""
+    """``PORT``'s argument (RFC 959 §4.1.2): ``h1,h2,h3,h4,p1,p2``.
+
+    ``host`` must be dotted IPv4; IPv6 goes through :func:`format_eprt`. A
+    ``SPOR`` command is these, space-separated, one per stripe.
+    """
     return ",".join([*host.split("."), str(port // 256), str(port % 256)])
 
 
 def format_eprt(host: str, port: int) -> str:
-    """``EPRT``'s argument: ``|1|host|port|`` or ``|2|host|port|``."""
+    """``EPRT``'s argument (RFC 2428 §2): ``|1|host|port|`` or ``|2|host|port|``.
+
+    The address family number is 1 for IPv4 and 2 for IPv6; ``host`` must be
+    a numeric address (``ValueError`` otherwise), never a name.
+    """
     family = 2 if ipaddress.ip_address(host).version == 6 else 1
     return f"|{family}|{host}|{port}|"
 
@@ -235,8 +309,10 @@ def format_eprt(host: str, port: int) -> str:
 def parse_facts(line: str) -> tuple[dict[str, str], str]:
     """``type=file;size=3; name`` to ``({"type": "file", ...}, "name")``.
 
-    Fact names are case-insensitive (RFC 3659 §7.5), so they are lowered.
-    A line with no facts is just a name.
+    Fact names are case-insensitive (RFC 3659 §7.5), so they are lowered;
+    values are kept as sent. The facts end at the first space and the name
+    is everything after that one space, so a name may itself contain spaces
+    or semicolons. A line with no facts is just a name.
     """
     head, sep, name = line.partition(" ")
     if not sep or "=" not in head:
@@ -250,7 +326,12 @@ def parse_facts(line: str) -> tuple[dict[str, str], str]:
 
 
 def parse_mdtm(value: str) -> int:
-    """``YYYYMMDDHHMMSS[.sss]`` (UTC) to a Unix time; 0 if unreadable."""
+    """``YYYYMMDDHHMMSS[.sss]`` (UTC) to a Unix time; 0 if unreadable.
+
+    RFC 3659 §2.3's ``time-val``, as ``MDTM`` and the ``modify`` fact carry
+    it. Fractions of a second are dropped, as gfal2's ``struct stat`` holds
+    whole seconds; 0 matches gfal2 leaving ``st_mtime`` unset.
+    """
     digits = value.strip().split(".")[0]
     try:
         return calendar.timegm(time.strptime(digits, "%Y%m%d%H%M%S"))
@@ -259,10 +340,12 @@ def parse_mdtm(value: str) -> int:
 
 
 def format_mdtm(when: float) -> str:
+    """A Unix time as RFC 3659's ``YYYYMMDDHHMMSS`` in UTC (the test server's ``MDTM``)."""
     return time.strftime("%Y%m%d%H%M%S", time.gmtime(when))
 
 
 def _integer(value: str, base: int = 10) -> int:
+    """``int(value, base)``, or 0 for junk: a bad fact must not fail a whole listing."""
     try:
         return int(value, base)
     except ValueError:
@@ -273,6 +356,12 @@ def stat_from_facts(facts: dict[str, str]) -> Stat:
     """What gfal2 fills from MLST facts: type, size, mtime, mode, owner.
 
     Like gfal2, ``atime``, ``ctime`` and ``ino`` stay zero and ``nlink`` is 1.
+    ``type`` is RFC 3659's (``file``, ``dir``, and ``cdir``/``pdir`` for the
+    listed directory and its parent); globus reports links as
+    ``OS.unix=slink:target`` and some servers spell it ``symlink``. The
+    ``unix.mode``/``unix.uid``/``unix.gid`` facts are globus's (octal mode).
+    A missing mode leaves the permission bits zero, which
+    :meth:`~._base._GridFTPBase._stat_facts` reports as "not known".
     """
     kind = facts.get("type", "").lower()
     if kind in ("dir", "cdir", "pdir"):
@@ -298,7 +387,22 @@ def stat_from_facts(facts: dict[str, str]) -> Stat:
 
 
 def parse_perf_marker(reply: Reply) -> tuple[int, int] | None:
-    """``(stripe index, bytes)`` from a ``112`` performance marker."""
+    """``(stripe index, bytes)`` from a ``112`` performance marker.
+
+    GFD.20 markers are multi-line ``key: value`` replies sent by the
+    receiving server during a ``MODE E`` transfer::
+
+        112-Perf Marker
+         Timestamp:  1111111111.1
+         Stripe Index: 0
+         Stripe Bytes Transferred: 4194304
+         Total Stripe Count: 1
+        112 End.
+
+    The byte count is cumulative per stripe, so callers keep the latest per
+    index and sum them (:func:`~.data.perf_bytes`). ``None`` for any other
+    reply, or a ``112`` without a byte count.
+    """
     if reply.code != 112:
         return None
     index, count = 0, None
@@ -313,7 +417,13 @@ def parse_perf_marker(reply: Reply) -> tuple[int, int] | None:
 
 
 def check_path(path: str) -> str:
-    """Refuse a path that would smuggle a second command onto the control line."""
+    """Refuse a path that would smuggle a second command onto the control line.
+
+    FTP commands end at CRLF (RFC 959 §4.1), so a path holding either byte
+    could inject a command such as ``DELE`` after the intended one. Every
+    command goes through here in :meth:`~.control.Control.send`, so the
+    check holds for paths built anywhere.
+    """
     if "\r" in path or "\n" in path:
         raise GError(f"Invalid path {path!r}", errno.EINVAL)
     return path
