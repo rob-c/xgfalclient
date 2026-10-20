@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import os
 import socket
-from collections.abc import Iterator
+import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -140,14 +141,29 @@ def pytest_configure(config: pytest.Config) -> None:
         config.pluginmanager.register(condcov.Plugin(config), "condcov")
 
 
+#: Whether a bound socket that never listens refuses connections at once.
+#: Linux answers a SYN to it with a reset; macOS drops the SYN, so a connect
+#: there waits for its timeout instead of being refused.
+BOUND_PORT_REFUSES = sys.platform.startswith("linux")
+
+
 @pytest.fixture
 def refused_port() -> Iterator[int]:
     """A loopback port that refuses connections for the whole test.
 
-    Bound and never listening: a connection is refused at once, and - unlike
-    a probe socket closed straight away - no other xdist worker can take the
-    port while the test still means it to be dead.
+    On Linux the port stays bound and never listens: a connection is refused
+    at once, and - unlike a probe socket closed straight away - no other
+    xdist worker can take the port while the test still means it to be
+    dead. Elsewhere (:data:`BOUND_PORT_REFUSES`) the probe is closed before
+    the test, the only way to have the port refuse there.
     """
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
-        yield probe.getsockname()[1]
+        port: int = probe.getsockname()[1]
+        release: Callable[[], None] = _keep if BOUND_PORT_REFUSES else probe.close
+        release()
+        yield port
+
+
+def _keep() -> None:
+    """Leave the probe bound (see :func:`refused_port`)."""

@@ -193,13 +193,13 @@ def test_required_dependencies_are_portable() -> None:
 
 
 def test_the_libraries_are_pinned_to_their_minor_release() -> None:
-    """xrdcore, xrdsec and xrdhttp follow semantic versioning: any 0.4.x, never 0.5."""
+    """xrdcore, xrdsec and xrdhttp follow semantic versioning: 0.4.1 or later 0.4.x, never 0.5."""
     libraries = {
         requirement.name: str(requirement.specifier)
         for requirement in _requirements()
         if requirement.name in ("xrdcore", "xrdsec", "xrdhttp")
     }
-    assert libraries == dict.fromkeys(("xrdcore", "xrdsec", "xrdhttp"), "<0.5,>=0.4.0")
+    assert libraries == dict.fromkeys(("xrdcore", "xrdsec", "xrdhttp"), "<0.5,>=0.4.1")
 
 
 def test_shared_client_dependency_is_exactly_pinned() -> None:

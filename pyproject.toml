@@ -33,9 +33,9 @@ dependencies = [
   # The shared libraries: core (XML guard, checksums, pipeline, report),
   # grid security (X.509, proxies, VOMS, tokens, discovery, TLS) and the HTTP
   # protocol pieces (botocore, for S3, comes with xrdhttp's ``s3`` extra).
-  "xrdcore>=0.4.0,<0.5",
+  "xrdcore>=0.4.1,<0.5",
   "xrdsec>=0.4.1,<0.5",
-  "xrdhttp[s3]>=0.4.0,<0.5",
+  "xrdhttp[s3]>=0.4.1,<0.5",
   "bcrypt>=4",
   "cryptography>=45",
 ]
@@ -51,7 +51,7 @@ Changelog = "https://github.com/rob-c/xgfalclient/blob/main/CHANGELOG.md"
 # GSS-API Kerberos (kdcap, LFC's Csec KRB5) is xrdsec's, through
 # python-gssapi; native bindings need system headers when no wheel is
 # available. Cache diagnostics need nothing: xrdsec reads caches in Python.
-krb5 = ["xrdsec[krb5]>=0.4.0,<0.5"]
+krb5 = ["xrdsec[krb5]>=0.4.1,<0.5"]
 # The preferred in-process SSH transport for sftp:// (3.4 added strict KEX,
 # the Terrapin fix); without it the deprecated built-in transport is used.
 sftp = ["paramiko>=3.4"]
