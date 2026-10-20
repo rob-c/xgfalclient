@@ -40,7 +40,10 @@ class _Commands(_SessionBase):
         if self.server.gsi is None or arg.upper() != "GSSAPI":
             raise _Reply("504 Authentication type not supported.")
         self.adat = GlobusContext(
-            self.server.gsi, server_side=True, delegation_key=self.server.delegation_key
+            self.server.gsi,
+            server_side=True,
+            delegation_key=self.server.delegation_key,
+            turn=self.server.globus_turn,
         )
         raise _Reply("334 Using authentication type; ADAT must follow.")
 

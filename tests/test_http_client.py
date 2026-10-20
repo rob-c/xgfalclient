@@ -454,7 +454,10 @@ def test_targets() -> None:
     )
 
 
-def test_invalid_urls_through_the_context(hctx: xgfalclient.Gfal2Context) -> None:
+def test_invalid_urls_through_the_context(
+    hctx: xgfalclient.Gfal2Context, refused_port: int
+) -> None:
+    port = refused_port
     with pytest.raises(GError) as caught:
         hctx.stat("https://[::1/x")
     assert (caught.value.code, caught.value.message) == (
@@ -480,9 +483,6 @@ def test_invalid_urls_through_the_context(hctx: xgfalclient.Gfal2Context) -> Non
         "DavPosix::unlink  Result  https://h:bad/x is not a valid HTTP or Webdav URL"
         " after 1 attempts"
     )
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
     with pytest.raises(GError) as caught:
         hctx.unlink(f"http://127.0.0.1:{port}/x")
     assert (caught.value.code, caught.value.message) == (

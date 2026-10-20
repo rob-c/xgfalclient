@@ -374,13 +374,9 @@ def test_record_host_key_survives_readonly(monkeypatch: pytest.MonkeyPatch, tmp_
 # -- connection-level errors --------------------------------------------------
 
 
-def test_connect_refused() -> None:
-    # A closed loopback port refuses immediately.
-    probe = socket.socket()
-    probe.bind(("127.0.0.1", 0))
-    port = probe.getsockname()[1]
-    probe.close()
-    endpoint = Endpoint(host="127.0.0.1", port=port, user="a", timeout=5)
+def test_connect_refused(refused_port: int) -> None:
+    # A bound loopback port that never listens refuses immediately.
+    endpoint = Endpoint(host="127.0.0.1", port=refused_port, user="a", timeout=5)
     with pytest.raises(GError) as caught:
         ssh.connect(endpoint, ssh.Auth(username="a"))
     assert caught.value.code in (errno.ECONNREFUSED, errno.ECONNRESET)

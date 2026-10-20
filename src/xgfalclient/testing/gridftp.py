@@ -194,6 +194,10 @@ class GridFTPServer:
         self.advertise = advertise
         #: Whether ``SITE SETNETSTACK udt`` is accepted (globus whitelists it).
         self.udt = False
+        #: Whether the GSI handshake hands the TLS 1.3 turn back, as a globus
+        #: acceptor does; ``False`` is dCache's GridFTP door, which sends
+        #: session tickets only and waits for the delegation flag.
+        self.globus_turn = True
         #: A fixed reply to ``SITE USAGE``; ``None`` reports the root's disk.
         self.usage: str | None = None
         #: Verb to a reply, ``close``, ``hang`` or ``raw:<line>``, sent instead of answering.

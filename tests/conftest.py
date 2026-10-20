@@ -13,6 +13,7 @@ sets them itself.
 from __future__ import annotations
 
 import os
+import socket
 from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -137,3 +138,16 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     if condcov.ENABLED:
         config.pluginmanager.register(condcov.Plugin(config), "condcov")
+
+
+@pytest.fixture
+def refused_port() -> Iterator[int]:
+    """A loopback port that refuses connections for the whole test.
+
+    Bound and never listening: a connection is refused at once, and - unlike
+    a probe socket closed straight away - no other xdist worker can take the
+    port while the test still means it to be dead.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        yield probe.getsockname()[1]

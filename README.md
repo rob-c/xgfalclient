@@ -44,7 +44,7 @@ and use that interpreter. Runtime dependencies are `bcrypt`, `cryptography`,
 the shared libraries [xrdcore](https://github.com/rob-c/xrdcore),
 [xrdsec](https://github.com/rob-c/xrdsec) and
 [xrdhttp](https://github.com/rob-c/xrdhttp) (`>=0.4.0,<0.5`) and the
-exact-pinned `xrdclient==0.4.0`; `asn1crypto` arrives through xrdsec and
+exact-pinned `xrdclient==0.4.1`; `asn1crypto` arrives through xrdsec and
 `botocore` through xrdhttp. The current 0.4.0 candidates are unreleased; see
 [platform status](docs/platforms.md).
 XRootD support is included in the base install. xgfalclient, xrdclient and

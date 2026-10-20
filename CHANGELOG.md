@@ -4,6 +4,27 @@ Notable user-visible changes are recorded here. The `xgfalclient` version is
 independent of the gfal2 and python3-gfal2 compatibility versions reported by
 the replacement API.
 
+## [0.4.1] - Unreleased
+
+Fixes found moving data between the LHCb Tier-1 and Tier-2 storage elements
+(2026-10-20). Requires xrdclient 0.4.1 and xrdsec 0.4.1.
+
+### Fixed
+
+- GridFTP's GFD.47 `GET`/`PUT` name the file with `path=`, as Globus's client
+  does; `file=` drew `501 Missing path` from dCache, so no write to SARA's
+  GridFTP door could succeed. The fake server now refuses a command without
+  `path=` the same way, and can play a dCache door without the TLS 1.3 turn
+  (`GridFTPServer.globus_turn = False`).
+- GridFTP logins to dCache doors complete (xrdsec 0.4.1's GSS turn fix).
+
+### Tests
+
+- Every test that needs a refused connection holds its port with the new
+  `refused_port` fixture for the whole test; a probe socket closed straight
+  away left the port free for another xdist worker, and the test then met a
+  live server now and then.
+
 ## [0.4.0] - 2026-10-19
 
 ### Code health
@@ -723,6 +744,7 @@ xgfalclient now depends on the three shared libraries directly
 - Failed copies consistently preserve the primary error and apply requested
   destination cleanup.
 
+[0.4.1]: https://github.com/rob-c/xgfalclient/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rob-c/xgfalclient/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/rob-c/xgfalclient/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/rob-c/xgfalclient/compare/v0.3.0...v0.3.1

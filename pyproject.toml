@@ -29,12 +29,12 @@ classifiers = [
 # Maintained libraries provide reusable parsing, transport and security primitives.
 dependencies = [
   # The XRootD client the root:// plugin drives, released with this package.
-  "xrdclient==0.4.0",
+  "xrdclient==0.4.1",
   # The shared libraries: core (XML guard, checksums, pipeline, report),
   # grid security (X.509, proxies, VOMS, tokens, discovery, TLS) and the HTTP
   # protocol pieces (botocore, for S3, comes with xrdhttp's ``s3`` extra).
   "xrdcore>=0.4.0,<0.5",
-  "xrdsec>=0.4.0,<0.5",
+  "xrdsec>=0.4.1,<0.5",
   "xrdhttp[s3]>=0.4.0,<0.5",
   "bcrypt>=4",
   "cryptography>=45",

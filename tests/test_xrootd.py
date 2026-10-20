@@ -416,11 +416,11 @@ def test_a_bad_url_is_einval(ctx: xgfalclient.Gfal2Context) -> None:
     assert failure.code == errno.EINVAL and failure.message.startswith("Failed to stat file")
 
 
-def test_an_unreachable_server_is_econnrefused(ctx: xgfalclient.Gfal2Context) -> None:
+def test_an_unreachable_server_is_econnrefused(
+    ctx: xgfalclient.Gfal2Context, refused_port: int
+) -> None:
+    port = refused_port
     ctx.set_opt_integer("XROOTD PLUGIN", "OPERATION_TIMEOUT", 2)
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
     failure = _gerror(ctx.stat, f"root://127.0.0.1:{port}//f")
     assert failure.code == errno.ECONNREFUSED
     assert failure.message == f"Failed to stat file ({os.strerror(errno.ECONNREFUSED)})"
@@ -597,11 +597,11 @@ def test_link_errors_are_worded_like_the_rest(
     )
 
 
-def test_link_operations_on_an_unreachable_server(ctx: xgfalclient.Gfal2Context) -> None:
+def test_link_operations_on_an_unreachable_server(
+    ctx: xgfalclient.Gfal2Context, refused_port: int
+) -> None:
+    port = refused_port
     ctx.set_opt_integer("XROOTD PLUGIN", "OPERATION_TIMEOUT", 2)
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
     failure = _gerror(ctx.readlink, f"root://127.0.0.1:{port}//l")
     assert failure.code == errno.ECONNREFUSED
     assert failure.message.startswith("Failed to read link")
@@ -1015,10 +1015,10 @@ def test_a_poll_the_server_refuses(
     )
 
 
-def test_a_poll_that_cannot_connect_is_ecomm(ctx: xgfalclient.Gfal2Context) -> None:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+def test_a_poll_that_cannot_connect_is_ecomm(
+    ctx: xgfalclient.Gfal2Context, refused_port: int
+) -> None:
+    port = refused_port
     results = ctx.archive_poll([f"root://127.0.0.1:{port}//f"])
     assert results[0].code == xgfalclient.errors.ECOMM
 
@@ -2027,11 +2027,9 @@ def test_a_destination_that_refuses_the_pulls_open(
 
 
 def test_a_destination_that_cannot_be_reached(
-    ctx: xgfalclient.Gfal2Context, server: FakeServer
+    ctx: xgfalclient.Gfal2Context, server: FakeServer, refused_port: int
 ) -> None:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    port = refused_port
     server.config_values["tpc"] = "1\n"
     params = ctx.transfer_parameters()
     params.transfer_cleanup = False

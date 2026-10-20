@@ -694,12 +694,8 @@ def test_dead_pooled_connection_is_retried(lctx: xgfalclient.Gfal2Context, lfc: 
     assert lfc.connections == 2
 
 
-def test_connection_refused(lctx: xgfalclient.Gfal2Context) -> None:
-    import socket
-
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+def test_connection_refused(lctx: xgfalclient.Gfal2Context, refused_port: int) -> None:
+    port = refused_port
     with pytest.raises(GError) as info:
         lctx.stat(f"lfc://127.0.0.1:{port}/grid")
     assert info.value.code == errno.ECONNREFUSED
@@ -711,16 +707,15 @@ def test_unresolvable_host(lctx: xgfalclient.Gfal2Context) -> None:
     assert info.value.code == errno.EHOSTUNREACH
 
 
-def test_connect_retries(lctx: xgfalclient.Gfal2Context, monkeypatch: pytest.MonkeyPatch) -> None:
-    import socket
+def test_connect_retries(
+    lctx: xgfalclient.Gfal2Context, monkeypatch: pytest.MonkeyPatch, refused_port: int
+) -> None:
+    port = refused_port
 
     monkeypatch.setenv("LFC_CONRETRY", "2")
     monkeypatch.setenv("LFC_CONRETRYINT", "0")
     slept: list[float] = []
     monkeypatch.setattr("xgfalclient.plugins.lfc.client.time.sleep", slept.append)
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
     with pytest.raises(GError):
         lctx.stat(f"lfc://127.0.0.1:{port}/grid")
     assert slept == [0.0, 0.0]

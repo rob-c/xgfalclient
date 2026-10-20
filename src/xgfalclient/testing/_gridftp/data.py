@@ -432,17 +432,22 @@ class _DataChannel(_SessionBase):
         """Set up a GridFTP v2 ``GET``/``PUT``'s data channel; the file it names.
 
         GFD.47 folds data-channel set-up into the transfer command:
-        ``GET file=<path>;pasv;`` makes the server listen and announce the
+        ``GET path=<path>;pasv;`` makes the server listen and announce the
         address as a ``127 PORT (...)`` reply; ``port=h1,...,p2;`` makes it
         connect out. With neither, an earlier ``PASV``/``PORT`` still applies.
+        The file is named by ``path=``, as Globus's client writes it; a
+        command without one is refused the way dCache refuses it, before any
+        data channel is set up.
         """
         options = dict(item.partition("=")[::2] for item in arg.split(";") if item)
+        if not options.get("path"):
+            raise _Reply("501 Missing path")
         if "port" in options:
             self.close_passive()
             self.active = [parse_pasv(options["port"])]
         elif "pasv" in options:
             self.reply(f"127 PORT ({self.pasv()})")
-        return options.get("file", "")
+        return options["path"]
 
     def do_GET(self, arg: str) -> None:
         """GFD.47 ``GET``: ``RETR`` of the whole file, with its own data-channel options.

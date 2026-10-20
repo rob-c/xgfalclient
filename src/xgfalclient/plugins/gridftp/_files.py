@@ -136,7 +136,7 @@ class _ReadFile(PluginFile):
         if self.position:
             control.command(f"REST {self.position}", ok=(3,))
         getput = not self.position and self.plugin._getput(control)
-        command = f"GET file={self.path};pasv;" if getput else f"RETR {self.path}"
+        command = f"GET path={self.path};pasv;" if getput else f"RETR {self.path}"
         self._conn = _stream_open(self.plugin, session, command, self.url, getput)
         self._stream_at = self.position
 
@@ -268,7 +268,7 @@ class _WriteFile(PluginFile):
             getput = command is None and plugin._getput(control)
             if command is None:
                 path = _path(parsed)
-                command = f"PUT file={path};pasv;" if getput else f"STOR {path}"
+                command = f"PUT path={path};pasv;" if getput else f"STOR {path}"
             self._conn: DataConn | None = _stream_open(plugin, self._session, command, url, getput)
         except BaseException:
             self._session.control.broken = True

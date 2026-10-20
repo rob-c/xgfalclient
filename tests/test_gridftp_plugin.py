@@ -346,6 +346,25 @@ def test_client_info_names_the_application(gctx: Ctx, ftp: GridFTPServer) -> Non
     )
 
 
+@pytest.mark.parametrize("delegation", [True, False])
+def test_a_dcache_door_without_the_turn_is_logged_in_to(
+    gctx: Ctx, gsi: GridFTPServer, tmp_path: Path, delegation: bool
+) -> None:
+    """dCache's GridFTP door sends no TLS 1.3 turn; a write then needs ``PUT path=``.
+
+    Both were met at SARA on 2026-10-20: the login waited for a turn that
+    never came, and ``PUT file=`` drew ``501 Missing path``.
+    """
+    gsi.globus_turn = False
+    gctx.set_opt_boolean(GROUP, "DELEGATION", delegation)
+    source = write(tmp_path / "up.bin", b"payload")
+    params = gctx.transfer_parameters()
+    params.overwrite = True
+    gctx.filecopy(params, f"file://{source}", gsi.url("/up.bin"))
+    assert (root_of(gsi) / "up.bin").read_bytes() == b"payload"
+    assert gctx.stat(gsi.url("/up.bin")).st_size == len(b"payload")
+
+
 def test_gsi_without_credentials(
     gctx: Ctx, gsi: GridFTPServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1343,11 +1362,11 @@ def test_gridftp_v2_get_and_put(gctx: Ctx, tmp_path: Path) -> None:
     ):
         gctx.filecopy(_params(gctx), one.url("/src"), two.url("/dst"))
         assert (tmp_path / "b" / "dst").read_bytes() == b"abc"
-        assert "PUT file=/dst;pasv;" in two.log
-        assert any(line.startswith("GET file=/src;port=") for line in one.log)
+        assert "PUT path=/dst;pasv;" in two.log
+        assert any(line.startswith("GET path=/src;port=") for line in one.log)
         with gctx.open(one.url("/src"), "r") as handle:
             assert handle.read_bytes(10) == b"abc"
-        assert "GET file=/src;pasv;" in one.log
+        assert "GET path=/src;pasv;" in one.log
         with gctx.open(one.url("/new"), "w") as handle:
             handle.write(b"xyz")
         assert (tmp_path / "a" / "new").read_bytes() == b"xyz"
@@ -1355,7 +1374,7 @@ def test_gridftp_v2_get_and_put(gctx: Ctx, tmp_path: Path) -> None:
         gctx.filecopy(_params(gctx), one.url("/new"), "file://" + str(target))
         assert target.read_bytes() == b"xyz"
         gctx.filecopy(_params(gctx), "file://" + str(target), one.url("/up"))
-        assert "PUT file=/up;pasv;" in one.log
+        assert "PUT path=/up;pasv;" in one.log
         for option, verb in (("SPAS", "SPOR "), ("IPV6", "EPRT ")):  # not with GET/PUT
             gctx.set_opt_boolean(GROUP, option, True)
             gctx.filecopy(_params(gctx), one.url("/src"), two.url(f"/{option}"))

@@ -281,7 +281,7 @@ class _CopyMixin(_GridFTPBase):
                     self._move(
                         session,
                         transfer,
-                        f"GET file={path};pasv;" if getput else f"RETR {path}",
+                        f"GET path={path};pasv;" if getput else f"RETR {path}",
                         1,
                         lambda conn, _: recv_stream(conn, write, size, transfer.add),
                         getput=getput,
@@ -339,7 +339,7 @@ class _CopyMixin(_GridFTPBase):
 
                 control.command(f"ALLO {info.st_size}", ok=(2, 4, 5))
                 # GridFTP v2 PUT is for MODE S only; MODE E stays on STOR.
-                command = f"PUT file={path};pasv;" if getput else f"STOR {path}"
+                command = f"PUT path={path};pasv;" if getput else f"STOR {path}"
                 self._move(session, transfer, command, max(streams, 1), worker, getput=getput)
         finally:
             os.close(fd)
@@ -847,12 +847,12 @@ class _ThirdParty:
             addresses = [] if getput else passive(dst, self.options)
             if size is not None:
                 dst.command(f"ALLO {size}", ok=(2, 4, 5))
-            dst.send(f"PUT file={target_path};pasv;" if getput else f"STOR {target_path}")
+            dst.send(f"PUT path={target_path};pasv;" if getput else f"STOR {target_path}")
             # Delayed passive or PUT: the address is the 127 reply to STOR/PUT.
             if not addresses:
                 addresses = [self._delayed_address()]
             if getput:
-                src.send(f"GET file={source_path};port={format_port(*addresses[0])};")
+                src.send(f"GET path={source_path};port={format_port(*addresses[0])};")
             else:
                 self._connect_source(addresses)
                 src.send(f"RETR {source_path}")

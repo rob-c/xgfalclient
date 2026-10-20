@@ -355,5 +355,8 @@ def test_partial_and_v2_commands(ftp: GridFTPServer) -> None:
     assert answer(control, "ESTO B 0 /f").startswith("501 Unsupported ESTO module")
     assert answer(control, "SITE SETNETSTACK default").startswith("200")
     assert answer(control, "SITE SETNETSTACK udt").startswith("500")
-    assert answer(control, "GET file=/f;").startswith("425")  # no data channel asked for
+    assert answer(control, "GET path=/f;").startswith("425")  # no data channel asked for
+    # GFD.47 names the file with ``path=``; dCache refuses anything else so.
+    assert answer(control, "GET file=/f;pasv;") == "501 Missing path"
+    assert answer(control, "PUT pasv;").startswith("501 Missing path")
     assert answer(control, "MLSD /f").startswith("451")  # not a directory
