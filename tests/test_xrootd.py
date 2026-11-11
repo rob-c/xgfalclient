@@ -1895,6 +1895,50 @@ def test_a_delegated_pull_is_tpc_lite(
     assert (2, "xroot", "TRANSFER:TYPE", "3rd pull") in seen
 
 
+def test_the_keyed_source_open_registers_on_the_connection_it_landed_on(
+    ctx: xgfalclient.Gfal2Context,
+    server: FakeServer,
+    target: FakeServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key is registered where the placement landed, carrying its capability.
+
+    EOS answers a placement open with a redirect to a disk server and signs it
+    (``cap.sym``/``cap.msg``); its disk server refuses an open without those
+    fields as "capability illegal". Registering on a *fresh* file therefore
+    either failed outright or - worse - succeeded only after a login, by which
+    time the destination was already pulling on a data server EOS had chosen
+    afresh (two copies in ten failed that way). Re-opening the placement's own
+    file keeps its connection: one round trip, and the capability comes with it.
+    """
+    logins = Logins(monkeypatch)
+    with FakeServer(files={"/data/a.txt": HELLO}) as data:
+        Puller(data, target)  # classic: the client must open the source again
+        # Every open at the source is answered with a redirect to its disk
+        # server, signed with a token - as EOS answers, for the placement open
+        # and for the keyed one alike.
+        from xrdclient.testing.server import _frame
+
+        def redirect(conn: Any, sid: int, params: bytes, body: bytes) -> Any:
+            # EOS's spelling: a "?" and then a token that starts with "&"
+            where = f"{data.address[0]}?&cap.sym=SIG&cap.msg=MSG".encode()
+            yield _frame(sid, c.kXR_redirect, struct.pack(">i", data.address[1]) + where + b"\x00")
+
+        server.handlers[c.kXR_open] = redirect
+        ctx.filecopy(
+            ctx.transfer_parameters(), _url(server) + "/data/a.txt", _url(target) + "/pulled"
+        )
+    assert target.contents("/pulled") == HELLO
+    # The keyed open went to the disk server the placement landed on, with the
+    # capability the redirect signed for it: that server refuses it otherwise.
+    (keyed,) = [raw for raw in data.opened if "tpc.key=" in raw]
+    assert "cap.sym=SIG" in keyed and "cap.msg=MSG" in keyed
+    # The placement's stage gives way to the copy's - one stage, not two.
+    assert "tpc.stage=copy" in keyed and "tpc.stage=placement" not in keyed
+    # And no second file was opened for it: no new login, no new connection.
+    assert [url for url, _ in logins.made if "tpc.dst=" in url] == []
+
+
 def test_without_delegation_the_pull_is_classic(
     ctx: xgfalclient.Gfal2Context,
     server: FakeServer,
@@ -1914,8 +1958,9 @@ def test_without_delegation_the_pull_is_classic(
     assert len(key) == 24
     (keyed,) = _opened(server, "tpc.key=")
     assert keyed == f"/data/a.txt?authz=t&tpc.key={key}&tpc.dst=127.0.0.1&tpc.stage=copy"
-    # XrdCl sets XrdSecGSIDELEGPROXY=0 for the destination; the source keeps the environment.
-    assert logins.to(target) == [False] and logins.to(server) == [True, True]
+    # XrdCl sets XrdSecGSIDELEGPROXY=0 for the destination; the source keeps the
+    # environment, and logs in *once* - the key's open reuses that connection.
+    assert logins.to(target) == [False] and logins.to(server) == [True]
 
 
 def test_a_delegated_pull_to_a_destination_without_tpcdlg_is_classic(

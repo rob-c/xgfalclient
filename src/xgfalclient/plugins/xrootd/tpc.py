@@ -140,7 +140,7 @@ class Rendezvous:
     def run(self, timeout: float | None) -> int:
         """The whole job; the size of the source, as far as the job knew it."""
         source_config, target_config = self._configs(timeout)
-        size, where = self._place(source_config)
+        size, where, placed = self._place(source_config)
         origin = where or self.source  # tpcSource
         # The rendezvous key both ends quote: the destination arms the pull
         # under it, the source admits only the destination that knows it.
@@ -159,15 +159,25 @@ class Rendezvous:
         lite = self._settle(
             pull, End(puller, target_config), End(origin, source_config), where is not None
         )
-        _step(pull.sync, "destination", pull)
         ends = [(pull, "destination")]
-        if not lite:
-            keyed = xrdclient.File(
-                opaque(origin, {"tpc.key": key, "tpc.dst": puller.host, "tpc.stage": "copy"}),
-                source_config,
+        if lite or placed is None:
+            if placed is not None:
+                _quietly(placed.close)  # a lite pull asks nothing more of the source
+        else:
+            # The registration goes on the *placement's own connection*
+            # (:meth:`xrdclient.File.reopen`), which carries the capability the
+            # manager signed for the data server it landed on, and reaches it
+            # in one round trip - so the key is known at the source by the time
+            # the sync below starts the pull. Opening a fresh file instead (as
+            # this did) may have to log in first, and EOS picks the pull's data
+            # server per open: that is what failed two copies in ten.
+            _step(
+                lambda: placed.reopen(f"tpc.key={key}&tpc.dst={puller.host}&tpc.stage=copy"),
+                "source",
+                pull,
             )
-            _step(lambda: keyed.open(_READ), "source", pull)
-            ends.insert(0, (keyed, "source"))
+            ends.insert(0, (placed, "source"))
+        _step(pull.sync, "destination", pull)
         _step(lambda: self._await(pull), "", *(handle for handle, _ in ends))
         # Both ends are closed even when the first close fails, and the
         # first failure, source before destination, is the one raised.
@@ -204,8 +214,17 @@ class Rendezvous:
             self.target_config.evolve(request_timeout=timeout + package.TPC_CANCEL_WAIT),
         )
 
-    def _place(self, config: Config) -> tuple[int, XRootDURL | None]:
-        """The size and landing place of the source, or ``None`` for one that cannot be opened."""
+    def _place(self, config: Config) -> tuple[int, XRootDURL | None, File | None]:
+        """The size, the landing place, and the placement handle still open.
+
+        The handle comes back open on purpose: the key that registers the pull
+        is opened again *on it* (:meth:`xrdclient.File.reopen`), so the
+        registration travels on the connection the placement landed on, with
+        the capability its redirect signed, in one round trip. Closing it here
+        and opening a fresh file instead is what made copies fail
+        intermittently - a fresh open may pay a login while the destination has
+        already started pulling, and EOS may have chosen another data server.
+        """
         placed = xrdclient.File(opaque(self.source, {"tpc.stage": "placement"}), config)
         try:
             placed.open(_READ)
@@ -213,9 +232,8 @@ class Rendezvous:
         except Exception as exc:
             if not self.delegate:
                 raise CopyError(describe(exc), "") from exc
-            return -1, None
-        _quietly(placed.close)
-        return size, landed(self.source, placed.endpoint)
+            return -1, None, None
+        return size, landed(self.source, placed.endpoint), placed
 
     def _fields(
         self, key: str, origin: XRootDURL, size: int, where: XRootDURL | None

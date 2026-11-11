@@ -27,6 +27,29 @@ def options(interval: int | None = None) -> SimpleNamespace:
     )
 
 
+class _FailingOs:
+    """``os`` as one module sees it, with one function raising ``OSError``.
+
+    The patch is put on the module's own ``os`` name rather than on the ``os``
+    module itself: pytest's capture machinery calls ``os.fstat`` on its own
+    temporary file once the test body returns (``CaptureFixture.snap``), so a
+    process-wide ``fstat`` that always fails reports an unrelated error after
+    the test has passed, and with ``filterwarnings = ["error"]`` that is a
+    failure.
+    """
+
+    def __init__(self, failing: str, message: str, calls: list[Any] | None = None) -> None:
+        def failed(*args: object) -> NoReturn:
+            if calls is not None:
+                calls.extend(args)
+            raise OSError(errno.EIO, message)
+
+        setattr(self, failing, failed)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(os, name)
+
+
 @pytest.mark.parametrize("interval,expected", [(None, 0.1), (0, None), (2, 2.0)])
 def test_local_retry_pause_policy(
     monkeypatch: pytest.MonkeyPatch, interval: int | None, expected: float | None
@@ -90,13 +113,12 @@ def test_local_reopen_rejects_errors_and_changed_generation(
     path.write_bytes(b"data")
     handle = local.LocalFile(path.as_uri(), str(path), os.O_RDONLY, 0o600, options(0))
 
-    def failed(*args: object) -> NoReturn:
-        raise OSError(errno.EIO, "unavailable")
-
     if failure == "changed":
         handle._identity = (0, 0, 0, 0, 0)
     else:
-        monkeypatch.setattr(os, "open" if failure == "open" else "fstat", failed)
+        monkeypatch.setattr(
+            local, "os", _FailingOs("open" if failure == "open" else "fstat", "unavailable")
+        )
     try:
         with pytest.raises(GError) as caught:
             handle._reopen_read(1, GError("stale descriptor", errno.ESTALE))
@@ -113,11 +135,7 @@ def test_local_constructor_closes_descriptor_when_stat_fails(
     descriptor: list[int] = []
     original = os.fstat
 
-    def failed(fd: int) -> NoReturn:
-        descriptor.append(fd)
-        raise OSError(errno.EIO, "stat failed")
-
-    monkeypatch.setattr(os, "fstat", failed)
+    monkeypatch.setattr(local, "os", _FailingOs("fstat", "stat failed", descriptor))
     with pytest.raises(OSError, match="stat failed"):
         local.LocalFile(path.as_uri(), str(path), os.O_RDONLY, 0o600)
     with pytest.raises(OSError) as caught:

@@ -11,6 +11,37 @@ Fixes found moving data between the LHCb Tier-1 and Tier-2 storage elements
 
 ### Fixed
 
+- Third-party copies between `root://` endpoints no longer fail
+  intermittently with `[3012] sync - TPC open failed`. The key that registers
+  the pull is now opened on the placement's own connection
+  (`xrdclient.File.reopen`), so it carries the capability EOS signed for the
+  data server it landed on and arrives in a single round trip; before, a fresh
+  file could log in first while the destination was already pulling, and EOS
+  picks the pull's data server per open. Ten copies out of ten against CERN
+  EOS failed at first, two after the capability fix, none now. The
+  `root://`-to-`root://` case also no longer needs the source to answer two
+  independent opens.
+
+### Added
+
+- A mis-typed option or command is answered with the one that was meant
+  (`did you mean '-valid'?`), from xrdcore 0.4.1's `xrdcore.suggest`: the
+  parser every command here builds asks it, so nothing extra is configured and
+  the suggestion also appears in the `--json`/`--xml` error record.
+
+### Fixed
+
+- `gfal-copy` between two `root://` URLs works against EOS again. The
+  rendezvous's second open of the source ("`cgiC2Src`") addressed the data
+  server the placement had been redirected to, bypassing the manager that
+  signs each redirect with the capability its disk server demands
+  (`cap.sym`/`cap.msg`) - so every root-to-root copy ended in
+  `[3000] Unable to open - capability illegal ... (source)`. It now
+  addresses the source URL the user gave, exactly as XrdCl does, and the
+  manager's redirect carries the capability. Verified against CERN EOS with
+  an LHCb proxy: `gfal-copy root://… root://…` and `--copy-mode pull` both
+  copy, with identical adler32 at both ends.
+
 - GridFTP's GFD.47 `GET`/`PUT` name the file with `path=`, as Globus's client
   does; `file=` drew `501 Missing path` from dCache, so no write to SARA's
   GridFTP door could succeed. The fake server now refuses a command without
