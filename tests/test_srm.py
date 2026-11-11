@@ -37,6 +37,9 @@ def root(tmp_path: Path) -> Path:
     base = tmp_path / "root"
     (base / "data" / "sub").mkdir(parents=True)
     (base / "data" / "f").write_bytes(b"hello world\n")
+    # `chmod` sends owner and other bits and leaves group alone, and the assertions
+    # below name exact modes: a known mode here keeps them out of the ambient umask.
+    (base / "data" / "f").chmod(0o644)
     (base / "data" / "sub" / "a").write_bytes(b"a")
     return base
 
