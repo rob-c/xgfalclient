@@ -6,6 +6,13 @@ the replacement API.
 
 ## [0.4.1] - Unreleased
 
+### Tested
+
+- `gfal-copy` is exercised end to end on **macOS** (Apple Silicon) with X.509
+  authentication: `davs://`, `root://` and cross-protocol copies, HTTP
+  third-party copy into a Tier-1, and multi-GB transfers with checksum
+  verification.
+
 Fixes found moving data between the LHCb Tier-1 and Tier-2 storage elements
 (2026-10-20). Requires xrdclient 0.4.1 and xrdsec 0.4.1.
 
